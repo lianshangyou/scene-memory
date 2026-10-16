@@ -1,0 +1,398 @@
+"""Run reflexio services (backend + docs)."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import reflexio
+from reflexio.cli.env_loader import load_reflexio_env
+from reflexio.cli.utils import ServiceConfig, get_env_port, run_services
+
+logger = logging.getLogger(__name__)
+
+_PACKAGE_DIR = Path(reflexio.__file__).resolve().parent
+# Editable installs lay out as `…/open_source/reflexio/reflexio/__init__.py`,
+# so the repo root is one level above the package dir. PyPI/wheel installs
+# resolve to `…/site-packages/`, where DOCS_DIR will not exist and the
+# docs service is silently skipped (see execute()).
+_EDITABLE_REPO_ROOT = _PACKAGE_DIR.parent
+DOCS_DIR = _EDITABLE_REPO_ROOT / "docs"
+
+# Default local ports for the OSS launcher. OSS occupies the 806* range so it
+# never collides with claude-smart / openclaw-smart (807*), enterprise self-host
+# (808*), or enterprise platform (809*). Embedding sits in the *9 slot to mirror
+# the enterprise convention (8089 self-host, 8099 platform). Override per service
+# with the matching CLI flag or {BACKEND,DOCS,EMBEDDING}_PORT env var.
+DEFAULT_OSS_PORTS: dict[str, int] = {"backend": 8061, "docs": 8062, "embedding": 8069}
+
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add run-services arguments to the parser.
+
+    Args:
+        parser (argparse.ArgumentParser): The parser to populate with
+            run-services flags. Mutated in-place.
+    """
+    parser.add_argument(
+        "--backend-host",
+        default="127.0.0.1",
+        help="Backend bind address (default: 127.0.0.1; network access requires REFLEXIO_API_KEY)",
+    )
+    parser.add_argument(
+        "--backend-port",
+        type=int,
+        default=None,
+        help="Backend port (default: 8061, env: BACKEND_PORT)",
+    )
+    parser.add_argument(
+        "--docs-port",
+        type=int,
+        default=None,
+        help="Docs port (default: 8062, env: DOCS_PORT)",
+    )
+    parser.add_argument(
+        "--embedding-port",
+        type=int,
+        default=None,
+        help="Embedding service port (default: 8069, env: EMBEDDING_PORT)",
+    )
+    parser.add_argument(
+        "--only",
+        type=str,
+        default=None,
+        help="Comma-separated list of services to start: backend,docs,embedding",
+    )
+    parser.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Disable uvicorn auto-reload",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help=(
+            "Number of backend worker processes (daemon mode only). "
+            "Default 2 enables zero-downtime worker recycling. "
+            "Forced to 1 when --reload is on."
+        ),
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=10000,
+        help="Worker recycles after this many requests. 0 disables. Default 10000.",
+    )
+    parser.add_argument(
+        "--max-requests-jitter",
+        type=int,
+        default=1000,
+        help="Random 0..jitter per worker. Default 1000.",
+    )
+    parser.add_argument(
+        "--graceful-shutdown-sec",
+        type=int,
+        default=30,
+        help="Drain window on shutdown. Default 30.",
+    )
+
+
+def _build_run_services_parser() -> argparse.ArgumentParser:
+    """Build the standalone run_services CLI parser.
+
+    The parent ``reflexio`` CLI normally builds the parser and calls
+    :func:`add_arguments` to populate it. This helper exists so tests (and
+    any ad-hoc ``python -m reflexio.cli.run_services``-style invocation)
+    can construct a self-contained parser with all run-services flags.
+
+    Returns:
+        argparse.ArgumentParser: Parser populated with all run_services
+        flags via :func:`add_arguments`.
+    """
+    parser = argparse.ArgumentParser(prog="reflexio.cli.run_services")
+    add_arguments(parser)
+    return parser
+
+
+def _warn_if_sqlite_multi_worker(*, storage_backend: str, workers: int) -> None:
+    """Emit a warning when SQLite is paired with multi-worker mode.
+
+    SQLite supports concurrent reads but serializes writes (even in WAL
+    mode). Multi-worker deployments will see increased write latency and
+    occasional "database is locked" errors under contention. Operators are
+    not blocked — just notified — so they can switch to Postgres/Supabase
+    if they hit issues.
+
+    Args:
+        storage_backend (str): One of "sqlite", "postgres", "supabase".
+        workers (int): Configured worker count.
+    """
+    if storage_backend == "sqlite" and workers > 1:
+        logger.warning(
+            "SQLite has limited concurrent write throughput; consider "
+            "--workers 1 or switching to Postgres/Supabase. (workers=%d)",
+            workers,
+        )
+
+
+def resolve_ports(
+    args: argparse.Namespace,
+    defaults: dict[str, int],
+) -> dict[str, int]:
+    """Resolve service ports from CLI args, env vars, or defaults.
+
+    Priority: CLI arg > env var > default value.
+
+    Args:
+        args: Parsed CLI arguments (looks for `{name}_port` attributes)
+        defaults: Map of service name to default port number
+
+    Returns:
+        dict[str, int]: Resolved ports keyed by service name
+    """
+    ports = {}
+    for name, default in defaults.items():
+        arg_val = getattr(args, f"{name}_port", None)
+        ports[name] = (
+            arg_val
+            if arg_val is not None
+            else get_env_port(f"{name.upper()}_PORT", default)
+        )
+    return ports
+
+
+def build_backend_service(
+    ports: dict[str, int],
+    *,
+    app_module: str = "reflexio.server.api:app",
+    host: str | None = None,
+    reload: bool = True,
+    reload_includes: list[str] | None = None,
+    workers: int = 2,
+    max_requests: int = 10000,
+    max_requests_jitter: int = 1000,
+    graceful_shutdown_sec: int = 30,
+) -> ServiceConfig:
+    """Build a ServiceConfig describing how to spawn the backend.
+
+    Args:
+        ports (dict[str, int]): Resolved port map (must contain "backend").
+        app_module (str): ASGI app path; defaults to the production app
+            factory.
+        host (str | None): Bind address. Standalone OSS defaults to loopback;
+            custom authenticated host applications retain their existing bind.
+        reload (bool): When True, enables uvicorn autoreload (single
+            worker forced). When False, daemon mode with multi-worker
+            request-count recycling is used.
+        reload_includes (list[str] | None): Additional glob patterns for
+            reload watching. Only used when ``reload`` is True.
+        workers (int): Number of uvicorn worker processes. Must be 1
+            when ``reload`` is True (validated). Default 2.
+        max_requests (int): Daemon-mode worker recycles after this many
+            requests. Set to 0 to disable. Default 10000.
+        max_requests_jitter (int): Random 0..jitter added to
+            ``max_requests`` per worker. Default 1000.
+        graceful_shutdown_sec (int): Drain window on shutdown. Default 30.
+
+    Returns:
+        ServiceConfig: Backend service configuration ready to spawn.
+
+    Raises:
+        ValueError: When ``reload=True`` and ``workers > 1``.
+    """
+    if reload and workers > 1:
+        raise ValueError(
+            "--workers N (N>1) is incompatible with --reload; "
+            "pass --no-reload or set --workers 1"
+        )
+    # Launch via our own ``python -m reflexio.server`` entrypoint rather
+    # than the ``uvicorn`` CLI so the log config in
+    # :mod:`reflexio.server.uvicorn_logging` is applied upfront via
+    # uvicorn's native ``log_config`` parameter.
+    cmd = [
+        sys.executable,
+        "-m",
+        "reflexio.server",
+        "--app",
+        app_module,
+        "--host",
+        host or ("127.0.0.1" if app_module == "reflexio.server.api:app" else "0.0.0.0"),  # noqa: S104
+        "--port",
+        str(ports["backend"]),
+    ]
+    if reload:
+        for pattern in reload_includes or []:
+            cmd.extend(["--reload-include", pattern])
+        cmd.append("--reload")
+        # Dev mode is always single-worker; reload + multi-worker is
+        # rejected above.
+        cmd.extend(["--workers", "1"])
+    else:
+        cmd.extend(["--workers", str(workers)])
+        cmd.extend(["--max-requests", str(max_requests)])
+        cmd.extend(["--max-requests-jitter", str(max_requests_jitter)])
+        cmd.extend(["--graceful-shutdown-sec", str(graceful_shutdown_sec)])
+    return ServiceConfig(name="backend", command=cmd)
+
+
+def build_nextjs_service(
+    name: str,
+    ports: dict[str, int],
+    *,
+    cwd: str,
+) -> ServiceConfig:
+    """Build a Next.js dev server ServiceConfig.
+
+    Args:
+        name: Service name (e.g., "docs", "frontend")
+        ports: Resolved port map (must contain key matching name)
+        cwd: Working directory for the Next.js project
+
+    Returns:
+        ServiceConfig: Next.js service configuration
+    """
+    return ServiceConfig(
+        name=name,
+        command=["npx", "next", "dev", "-H", "127.0.0.1", "-p", str(ports[name])],
+        cwd=cwd,
+    )
+
+
+def build_embedding_service(
+    ports: dict[str, int],
+    *,
+    app_module: str = "reflexio.server.llm.embedding_service:app",
+) -> ServiceConfig:
+    """Build the local embedding daemon service configuration."""
+    return ServiceConfig(
+        name="embedding",
+        command=[
+            sys.executable,
+            "-m",
+            "uvicorn",
+            app_module,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(ports["embedding"]),
+        ],
+        env={"REFLEXIO_EMBEDDING_DAEMON": "1"},
+    )
+
+
+def parse_only_flag(only: str | None, default_services: set[str]) -> set[str]:
+    """Parse the --only flag into a set of service names.
+
+    Args:
+        only: Comma-separated service names, or None for all defaults
+        default_services: Set of services to start when --only is not specified
+
+    Returns:
+        set[str]: Services to start
+    """
+    if only:
+        return {s.strip() for s in only.split(",")}
+    return default_services
+
+
+def should_start_local_embedding_service() -> bool:
+    """Return True unless inference is explicitly routed to a remote service."""
+    remote_url = os.environ.get("REFLEXIO_EMBEDDING_SERVICE_URL", "").strip()
+    return not remote_url
+
+
+def _ensure_nextjs_dependencies(project_dir: Path) -> bool:
+    """Install Next.js project dependencies when node_modules is missing."""
+    if (project_dir / "node_modules").exists():
+        return True
+
+    print(f"Installing {project_dir.name} dependencies...")
+    result = subprocess.run(["npm", "install"], cwd=str(project_dir), check=False)
+    if result.returncode != 0:
+        print(f"Error: npm install failed in {project_dir}.")
+        return False
+    return True
+
+
+def execute(args: argparse.Namespace) -> None:
+    """Execute the run-services command."""
+    load_reflexio_env()
+
+    # Banner so any captured stdout (e.g. ~/.reflexio/logs/server.log via the
+    # Claude Code session-start hook) clearly marks the start of a new server
+    # lifetime instead of blurring into output from a previous run.
+    bar = "=" * 64
+    ts = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"\n{bar}\n=== NEW REFLEXIO SERVER START — {ts} ===\n{bar}\n")
+
+    ports = resolve_ports(args, defaults=DEFAULT_OSS_PORTS)
+    os.environ["API_BACKEND_URL"] = os.environ.get(
+        "API_BACKEND_URL", f"http://localhost:{ports['backend']}"
+    )
+    os.environ["EMBEDDING_PORT"] = str(ports["embedding"])
+
+    only = parse_only_flag(args.only, {"backend", "docs"})
+    if "backend" in only and should_start_local_embedding_service():
+        only.add("embedding")
+        os.environ["REFLEXIO_EMBEDDING_PROVIDER"] = os.environ.get(
+            "REFLEXIO_EMBEDDING_PROVIDER", "local_service"
+        )
+    docs_explicit = args.only is not None and "docs" in only
+    services: list[ServiceConfig] = []
+
+    if "embedding" in only:
+        services.append(build_embedding_service(ports))
+
+    if "backend" in only:
+        reload = not args.no_reload
+        # Dev mode (--reload) is always single-worker; coerce silently so
+        # users running with default flags (reload on, workers default 2)
+        # don't hit the reload+multi-worker rejection in build_backend_service.
+        workers = 1 if reload else getattr(args, "workers", 2)
+        max_requests = getattr(args, "max_requests", 10000)
+        max_requests_jitter = getattr(args, "max_requests_jitter", 1000)
+        graceful_shutdown_sec = getattr(args, "graceful_shutdown_sec", 30)
+        storage_backend = os.environ.get("REFLEXIO_STORAGE", "sqlite").lower()
+        _warn_if_sqlite_multi_worker(storage_backend=storage_backend, workers=workers)
+        services.append(
+            build_backend_service(
+                ports,
+                host=getattr(args, "backend_host", "127.0.0.1"),
+                reload=reload,
+                reload_includes=["reflexio/server/site_var/site_var_sources/*.json"],
+                workers=workers,
+                max_requests=max_requests,
+                max_requests_jitter=max_requests_jitter,
+                graceful_shutdown_sec=graceful_shutdown_sec,
+            )
+        )
+
+    if "docs" in only:
+        if DOCS_DIR.is_dir():
+            if not _ensure_nextjs_dependencies(DOCS_DIR):
+                sys.exit(1)
+            services.append(build_nextjs_service("docs", ports, cwd=str(DOCS_DIR)))
+        elif docs_explicit:
+            print(
+                f"Cannot start docs: {DOCS_DIR} not found. "
+                "The docs site is only available in source/editable installs."
+            )
+        else:
+            print(
+                f"Skipping docs: {DOCS_DIR} not found "
+                "(docs site is not shipped with the PyPI package)."
+            )
+
+    if not services:
+        print("No services selected. Available: backend, docs, embedding")
+        return
+
+    started_ports = {s.name: ports[s.name] for s in services}
+    print(f"Starting services: {', '.join(s.name for s in services)}")
+    run_services(services, started_ports)

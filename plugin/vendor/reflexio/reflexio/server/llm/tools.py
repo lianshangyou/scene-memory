@@ -1,0 +1,848 @@
+"""Tool-calling primitives shared by agentic extraction and search pipelines."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+
+logger = logging.getLogger(__name__)
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from reflexio.server.llm._litellm_types import (
+    ModelProvenance,
+    ProviderRequestGuardError,
+    completion_metadata,
+)
+from reflexio.server.llm._model_compat import ensure_model_capabilities
+from reflexio.server.llm.llm_utils import (
+    assert_provider_safe_schema,
+    make_strict_json_schema,
+)
+from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
+
+if TYPE_CHECKING:
+    from reflexio.server.llm.litellm_client import LiteLLMClient
+
+
+@dataclass(frozen=True)
+class AsyncRequestSpec:
+    """Pre-persistence request produced by an asynchronous information tool."""
+
+    tool_name: str
+    dedup_key: str
+    scope: dict[str, Any]
+    question_text: str
+    answer_format: str | None = None
+    args: dict[str, Any] = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    cache_until_seconds: int = 300
+    valid_until_seconds: int = 2_592_000
+
+
+@dataclass(frozen=True)
+class Completed:
+    """Synchronous tool result."""
+
+    result: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AsyncAccepted:
+    """Accepted asynchronous tool request returned as a normal tool result."""
+
+    pending_tool_call_id: str
+    result: dict[str, Any]
+
+
+ToolOutcome = Completed | AsyncAccepted
+ToolHandlerResult = dict[str, Any] | ToolOutcome
+
+
+class Tool(BaseModel):
+    """A single LLM-callable tool.
+
+    Arguments are defined by a Pydantic model (its schema goes to the LLM,
+    its docstring becomes the tool description). The handler takes a
+    validated args instance plus a caller-supplied context object and
+    returns a JSON-serialisable dict that is fed back as the tool result.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    name: str
+    args_model: type[BaseModel]
+    handler: Callable[[BaseModel, Any], ToolHandlerResult]
+    strict: bool = True
+
+    def openai_spec(self) -> dict:
+        parameters = self.args_model.model_json_schema()
+        # Boundary guard: tool-arg schemas bypass the response_format path and the
+        # registry contract test, so enforce provider-safety here too (raises under
+        # tests, warns in prod). Checked on the native schema to catch a model that
+        # forgot StrictStructuredOutput even when ``strict`` would later fold it.
+        assert_provider_safe_schema(parameters, name=self.args_model.__name__)
+        if self.strict:
+            parameters = make_strict_json_schema(parameters)
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": (self.args_model.__doc__ or "").strip(),
+                "parameters": parameters,
+                "strict": self.strict,
+            },
+        }
+
+
+class AsyncInfoTool(Tool):
+    """Marker type for tools that register async work and continue the loop."""
+
+
+def _coerce_tool_outcome(value: ToolHandlerResult) -> ToolOutcome:
+    if isinstance(value, Completed | AsyncAccepted):
+        return value
+    return Completed(result=value)
+
+
+def _tool_result_from_outcome(
+    outcome: ToolOutcome,
+    pending_tool_call_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    if isinstance(outcome, AsyncAccepted):
+        if pending_tool_call_ids is not None:
+            pending_tool_call_ids.append(outcome.pending_tool_call_id)
+        return outcome.result
+    return outcome.result
+
+
+class ToolRegistry:
+    def __init__(self, tools: list[Tool] | None = None) -> None:
+        self._tools: dict[str, Tool] = {}
+        for t in tools or []:
+            self.register(t)
+
+    def register(self, tool: Tool) -> None:
+        self._tools[tool.name] = tool
+
+    def openai_specs(self) -> list[dict]:
+        return [t.openai_spec() for t in self._tools.values()]
+
+    def handle_outcome(self, name: str, args_json: str, ctx: Any) -> ToolOutcome:
+        tool = self._tools.get(name)
+        if tool is None:
+            return Completed(result={"error": f"unknown tool: {name}"})
+        try:
+            raw = json.loads(args_json or "{}")
+            args = tool.args_model.model_validate(raw)
+        except (ValidationError, json.JSONDecodeError) as e:
+            return Completed(result={"error": f"invalid args for {name}: {e}"})
+        try:
+            return _coerce_tool_outcome(tool.handler(args, ctx))
+        except ProviderRequestGuardError:
+            raise
+        except Exception as e:  # handler errors are recoverable tool-turn errors
+            logger.exception("tool handler %s failed", name)
+            return Completed(result={"error": f"handler error: {type(e).__name__}"})
+
+    def handle(self, name: str, args_json: str, ctx: Any) -> dict:
+        return _tool_result_from_outcome(self.handle_outcome(name, args_json, ctx))
+
+
+class ToolLoopTurn(BaseModel):
+    """A single tool call turn in a tool-loop trace."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    tool_name: str
+    args: dict[str, Any]
+    result: dict[str, Any]
+    latency_ms: int
+    # Populated from the LLM response's ``usage`` object when available
+    # (native tool-call mode). All None in capability-fallback mode and
+    # when the provider doesn't report usage.
+    model: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    cost_usd: float | None = None
+
+
+class ToolLoopTrace(BaseModel):
+    """Full trace of a tool-loop execution."""
+
+    turns: list[ToolLoopTurn] = []
+    finished: bool = False
+
+
+class ToolLoopResult(BaseModel):
+    """Outcome of ``run_tool_loop``: final ``ctx``, trace, and terminator reason."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    ctx: Any
+    trace: ToolLoopTrace
+    finished_reason: Literal[
+        "finish_tool", "structured_output", "no_tool_call", "max_steps", "error"
+    ]
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    pending_tool_call_ids: list[str] = Field(default_factory=list)
+    max_steps_remaining: int = 0
+    # Set when finished_reason == "structured_output": the model ended the turn
+    # with a plain response parsed into the caller's ``response_format`` schema
+    # (the structured-output terminus, used by the extraction agent instead of a
+    # finish-sentinel tool call).
+    structured_output: BaseModel | None = None
+    # Runtime-only attribution for the final accepted LLM turn. Persistence is
+    # explicit at the lineage boundary; this must not leak into API payloads.
+    provenance: ModelProvenance | None = Field(default=None, exclude=True)
+
+
+# Models we know support function calling per vendor docs but that litellm's
+# model_cost registry hasn't catalogued yet. When litellm returns False
+# (without raising) for one of the exact models or model-family prefixes below,
+# treat that as a registry gap rather than an actual capability gap.
+#
+# Each entry must be justified by (a) the vendor docs and (b) a confirmed
+# round-trip tool call against the live API. Update this list when litellm
+# upstreams the registration so the override becomes redundant.
+_TOOL_CALLING_EXACT_OVERRIDES: frozenset[str] = frozenset(
+    {
+        # https://docs.z.ai/guides/tools/function-calling documents the
+        # OpenAI-compatible tools protocol. Verified against the coding endpoint
+        # with three consecutive dependent sequences: get_weather tool call, tool
+        # result, convert_temperature tool call, tool result, structured terminus.
+        # LiteLLM 1.82.2 still reports supports_function_calling=False.
+        "zai/glm-5.2",
+    }
+)
+
+_TOOL_CALLING_OVERRIDES: tuple[str, ...] = (
+    # https://platform.minimax.io/docs/guides/text-m2-function-call says
+    # MiniMax-M2.7 supports tool use + interleaved thinking via OpenAI-compatible
+    # tools format. Verified by a live `litellm.completion(model='minimax/MiniMax-M2.7',
+    # tools=[...])` round-trip that returned a proper tool_call message.
+    # litellm 1.80.x has 'minimax/MiniMax-M2' in model_cost but not 'MiniMax-M2.7'.
+    "minimax/MiniMax-M2",
+    # MiniMax-M3 supports OpenAI-compatible tools the same way the M2 family
+    # does, but litellm 1.80.x has no 'minimax/MiniMax-M3' model_cost entry so
+    # supports_function_calling returns False. Verified by a live
+    # `litellm.completion(model='minimax/MiniMax-M3', tools=[...])` round-trip
+    # that returned a proper tool_call message (finish_reason='tool_calls').
+    "minimax/MiniMax-M3",
+    # claude-code/* models route through our local CLI provider
+    # (see providers/claude_code_provider.py). litellm has no registry
+    # entry for them, so it returns False. The provider handles tool
+    # calling explicitly by rendering tool specs into the system prompt
+    # and parsing the model's JSON output back into ChatCompletionMessageToolCall
+    # blocks. Verified end-to-end against the resumable extraction tool loop.
+    "claude-code/",
+)
+
+
+def supports_tool_calling(model: str) -> bool:
+    """Return True when litellm reports native function-calling support.
+
+    Wrapped so tests can monkeypatch the probe without touching litellm.
+    On any internal error we optimistically assume support — cheaper to
+    attempt a real call than to wrongly fall back. When litellm returns
+    False (without raising) for a model in the exact or prefix overrides, we
+    override to True — see the constants for the rationale.
+
+    Args:
+        model (str): Fully-qualified model name.
+
+    Returns:
+        bool: True if litellm advertises function-calling for ``model``,
+            or the model name matches a known-good override.
+    """
+    try:
+        import litellm
+
+        ensure_model_capabilities(model)
+        if bool(litellm.supports_function_calling(model=model)):
+            return True
+        if model in _TOOL_CALLING_EXACT_OVERRIDES or any(
+            model.startswith(prefix) for prefix in _TOOL_CALLING_OVERRIDES
+        ):
+            logger.debug(
+                "litellm.supports_function_calling returned False for %s; "
+                "applying override (see _TOOL_CALLING_OVERRIDES)",
+                model,
+            )
+            return True
+        return False
+    except Exception as e:
+        logger.warning(
+            "supports_function_calling probe failed for %s: %s: %s — assuming True",
+            model,
+            type(e).__name__,
+            e,
+        )
+        return True
+
+
+# Cap on tool-result payload size injected back into the message history
+# in multi-stage mode. Without this, a single fat search response could
+# blow the model's context window in two or three turns.
+_MULTI_STAGE_RESULT_CHAR_CAP = 4000
+
+
+def _serialize_tool_result_for_history(result: dict[str, Any]) -> str:
+    """Render a tool result dict as a JSON string capped at a fixed size.
+
+    Args:
+        result (dict[str, Any]): The tool handler's return value.
+
+    Returns:
+        str: A JSON string truncated to ``_MULTI_STAGE_RESULT_CHAR_CAP``
+            characters with a ``... [truncated]`` marker on overflow.
+    """
+    payload = json.dumps(result, default=str)
+    if len(payload) <= _MULTI_STAGE_RESULT_CHAR_CAP:
+        return payload
+    return f"{payload[:_MULTI_STAGE_RESULT_CHAR_CAP]}... [truncated]"
+
+
+def _normalize_tool_call_for_history(tool_call: Any) -> dict[str, Any]:
+    """Return an OpenAI-compatible plain dict for assistant tool-call history."""
+
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function") or {}
+        if not isinstance(function, dict):
+            function = {
+                "name": getattr(function, "name", None),
+                "arguments": getattr(function, "arguments", None),
+            }
+        return {
+            "id": tool_call.get("id"),
+            "type": tool_call.get("type") or "function",
+            "function": {
+                "name": function.get("name"),
+                "arguments": function.get("arguments") or "{}",
+            },
+        }
+
+    function = getattr(tool_call, "function", None)
+    return {
+        "id": getattr(tool_call, "id", None),
+        "type": getattr(tool_call, "type", None) or "function",
+        "function": {
+            "name": getattr(function, "name", None),
+            "arguments": getattr(function, "arguments", None) or "{}",
+        },
+    }
+
+
+def _run_multi_stage_fallback(
+    *,
+    client: LiteLLMClient,
+    messages: list[dict[str, Any]],
+    registry: ToolRegistry,
+    model_role: ModelRole,
+    max_steps: int,
+    ctx: Any,
+    finish_tool_name: str,
+    multi_stage_schema: type[BaseModel],
+    log_label: str | None,
+    trace: ToolLoopTrace,
+    pending_tool_call_ids: list[str],
+) -> ToolLoopResult:
+    """Drive a multi-turn tool loop using one structured-output call per turn.
+
+    Used when the configured model lacks native tool-calling but the
+    caller wants observe-decide-act semantics (e.g. the search agent on
+    ``minimax/MiniMax-M2.7``). Each turn:
+
+    1. Asks the model for a ``multi_stage_schema`` instance whose
+       ``next_call`` field carries a discriminator literal naming the
+       desired tool.
+    2. Dispatches that call against the registry.
+    3. Appends the agent's plan as an assistant message and the tool
+       result as a user message, so the next turn's model call sees both.
+
+    Loop terminates when ``next_call.tool == finish_tool_name`` or
+    ``max_steps`` is exhausted.
+
+    Args:
+        client (LiteLLMClient): Configured client.
+        messages (list[dict]): Seed message list; extended in place.
+        registry (ToolRegistry): Tools exposed to the LLM.
+        model_role (ModelRole): Role used to resolve the target model.
+        max_steps (int): Cap on tool-calling turns.
+        ctx (Any): Per-run context passed to each tool handler.
+        finish_tool_name (str): Sentinel literal that ends the loop.
+        multi_stage_schema (type[BaseModel]): Schema with a ``next_call``
+            discriminated-union field.
+        log_label (str | None): Optional llm_io.log label.
+        trace (ToolLoopTrace): Trace to extend with per-turn entries.
+
+    Returns:
+        ToolLoopResult: ``ctx``, trace, and the terminator reason.
+    """
+    if log_label:
+        from reflexio.server.services.service_utils import (
+            log_llm_messages,
+            log_model_response,
+        )
+
+    latest_provenance: ModelProvenance | None = None
+    for turn_idx in range(max_steps):
+        turn_label = f"(multi-stage turn {turn_idx + 1})"
+        if log_label:
+            log_llm_messages(logger, f"{log_label} {turn_label}", messages)
+        tool_t0 = time.monotonic()
+        completion = client.generate_chat_response_with_provenance(
+            messages=messages,
+            response_format=multi_stage_schema,
+            model_role=model_role,
+        )
+        parsed = completion.value
+        latest_provenance = completion.provenance
+        if log_label:
+            log_model_response(logger, f"{log_label} {turn_label}", parsed)
+        if not isinstance(parsed, BaseModel):
+            raise RuntimeError(
+                f"Multi-stage structured call returned unexpected type {type(parsed)}"
+            )
+
+        next_call = getattr(parsed, "next_call", None)
+        if next_call is None:
+            raise RuntimeError(
+                "Multi-stage schema must expose a 'next_call' field; "
+                f"got {type(parsed).__name__}"
+            )
+        tool_name = getattr(next_call, "tool", None)
+        if not isinstance(tool_name, str):
+            raise RuntimeError(
+                "Multi-stage next_call must carry a 'tool' discriminator literal; "
+                f"got {type(next_call).__name__}"
+            )
+
+        reasoning = getattr(parsed, "reasoning", "") or ""
+        args_dict = next_call.model_dump(exclude={"tool"})
+        args_json = next_call.model_dump_json(exclude={"tool"})
+
+        # Echo the agent's plan back into history so subsequent turns can
+        # reason about what was tried already.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"Reasoning: {reasoning}\nNext call: {tool_name}({args_json})"
+                ),
+            }
+        )
+
+        if tool_name == finish_tool_name:
+            # Dispatch finish through the registry so any ctx-side
+            # bookkeeping (e.g. stashing the answer) still runs.
+            outcome = registry.handle_outcome(tool_name, args_json, ctx)
+            result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
+            trace.turns.append(
+                ToolLoopTurn(
+                    tool_name=tool_name,
+                    args=args_dict,
+                    result=result,
+                    latency_ms=int((time.monotonic() - tool_t0) * 1000),
+                )
+            )
+            trace.finished = True
+            return ToolLoopResult(
+                ctx=ctx,
+                trace=trace,
+                finished_reason="finish_tool",
+                messages=messages,
+                pending_tool_call_ids=pending_tool_call_ids,
+                max_steps_remaining=max_steps - turn_idx - 1,
+                provenance=latest_provenance,
+            )
+
+        outcome = registry.handle_outcome(tool_name, args_json, ctx)
+        result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
+        trace.turns.append(
+            ToolLoopTurn(
+                tool_name=tool_name,
+                args=args_dict,
+                result=result,
+                latency_ms=int((time.monotonic() - tool_t0) * 1000),
+            )
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Tool {tool_name} returned: "
+                    f"{_serialize_tool_result_for_history(result)}"
+                ),
+            }
+        )
+
+    trace.finished = False
+    return ToolLoopResult(
+        ctx=ctx,
+        trace=trace,
+        finished_reason="max_steps",
+        messages=messages,
+        pending_tool_call_ids=pending_tool_call_ids,
+        max_steps_remaining=0,
+        provenance=latest_provenance,
+    )
+
+
+def _log_tool_loop_error(error: Exception) -> None:
+    from reflexio.server.llm.litellm_client import LiteLLMClientError
+
+    if isinstance(error, ProviderRequestGuardError):
+        # These are admission, lease and suspension decisions, not model errors.
+        raise error
+    if isinstance(error, LiteLLMClientError):
+        logger.warning("event=tool_loop_llm_error error=%s", error)
+    else:
+        logger.exception("Tool loop raised an unexpected exception")
+
+
+def run_tool_loop(
+    client: LiteLLMClient,
+    messages: list[dict[str, Any]],
+    registry: ToolRegistry,
+    model_role: ModelRole,
+    *,
+    max_steps: int = 8,
+    ctx: Any = None,
+    finish_tool_name: str = "finish",
+    fallback_schema: type[BaseModel] | None = None,
+    fallback_tool_name: str | None = None,
+    multi_stage_schema: type[BaseModel] | None = None,
+    response_format: type[BaseModel] | None = None,
+    structured_output_validator: Callable[[BaseModel], Sequence[str]] | None = None,
+    tool_choice: str | dict[str, Any] = "auto",
+    log_label: str | None = None,
+) -> ToolLoopResult:
+    """Drive an LLM through a tool-calling loop until ``finish_tool_name`` or ``max_steps``.
+
+    For providers that lack native tool-calling there are two fallback
+    modes (in priority order):
+
+    1. **Multi-stage** (``multi_stage_schema`` set): one structured-output
+       call per turn whose parsed schema carries a ``next_call``
+       discriminated-union. The server dispatches ``next_call`` against
+       the registry, appends the result to the message history, and asks
+       for the next turn — preserving observe-decide-act semantics.
+    2. **Single-shot** (``fallback_schema`` + ``fallback_tool_name``):
+       one structured-output call whose parsed list is converted into
+       synthetic tool calls dispatched against ``fallback_tool_name``.
+       All calls are planned upfront so the agent never observes any
+       tool result.
+
+    Args:
+        client (LiteLLMClient): Configured client — ``generate_chat_response``
+            is invoked with ``tools=`` in native mode and with
+            ``response_format=`` in either fallback mode.
+        messages (list[dict]): Seed message list; extended in place per turn.
+        registry (ToolRegistry): Tools exposed to the LLM.
+        model_role (ModelRole): Role used to resolve the target model.
+        max_steps (int): Cap on tool-calling turns.
+        ctx (Any): Caller-supplied context object passed to each tool handler.
+        finish_tool_name (str): Name of the sentinel tool that terminates the loop.
+        fallback_schema (type[BaseModel] | None): Pydantic schema for the
+            single-shot fallback path. Used only if ``multi_stage_schema``
+            is None.
+        fallback_tool_name (str | None): Name of the tool each single-shot
+            fallback item is dispatched against.
+        multi_stage_schema (type[BaseModel] | None): Pydantic schema for
+            the multi-stage fallback path. The schema must expose a
+            ``next_call`` field whose value is a Pydantic model carrying a
+            ``tool`` discriminator literal — that literal names the tool
+            to dispatch, all other fields become its args. Takes priority
+            over ``fallback_schema``.
+        response_format (type[BaseModel] | None): When set, the native tool loop
+            requests this schema as the model's structured response and treats a
+            turn with no tool call as the SUCCESS terminus — the parsed result is
+            returned on ``ToolLoopResult.structured_output`` with
+            ``finished_reason="structured_output"``. This is how the extraction
+            agent finishes (a direct structured answer) while still letting the
+            model call intermediate tools such as ``ask_human``. Leave unset for
+            finish-sentinel-tool loops.
+        structured_output_validator: Optional validator that opts structured
+            responses into one corrective same-model repair turn. Returning an
+            empty sequence accepts any response that satisfies the schema.
+        tool_choice (str | dict): Forwarded to each native tool-calling turn.
+            Defaults to ``"auto"``. Pass an OpenAI tool-choice dict (e.g.
+            ``{"type": "function", "function": {"name": "finish"}}``) to force a
+            specific tool — used to make a single-tool loop behave like a forced
+            structured-output call.
+        log_label (str | None): When set, each LLM call in the loop is
+            mirrored into ``~/.reflexio/logs/llm_io.log`` using this label
+            (suffixed with ``(turn N)``, ``(fallback)``, or
+            ``(multi-stage turn N)``). Matches classic per-call logging
+            parity. Leave unset (default) to suppress file-level logging
+            for tool-loop callers like unit tests.
+
+    Returns:
+        ToolLoopResult: ``ctx``, trace, and the terminator reason.
+
+    Raises:
+        RuntimeError: If the model lacks tool-calling AND no fallback
+            (multi-stage or single-shot) is provided.
+    """
+    model = resolve_model_name(
+        role=model_role,
+        site_var_value=None,
+        config_override=None,
+        api_key_config=getattr(client.config, "api_key_config", None),
+    )
+    trace = ToolLoopTrace()
+    pending_tool_call_ids: list[str] = []
+
+    # Lazily import the llm_io helpers only when logging is requested —
+    # matches classic's per-call lazy-import pattern in profile/components/consolidator.py.
+    if log_label:
+        from reflexio.server.services.service_utils import (
+            log_llm_messages,
+            log_model_response,
+        )
+
+    # ---- Capability fallback ------------------------------------------
+    if not supports_tool_calling(model):
+        if multi_stage_schema is not None:
+            return _run_multi_stage_fallback(
+                client=client,
+                messages=messages,
+                registry=registry,
+                model_role=model_role,
+                max_steps=max_steps,
+                ctx=ctx,
+                finish_tool_name=finish_tool_name,
+                multi_stage_schema=multi_stage_schema,
+                log_label=log_label,
+                trace=trace,
+                pending_tool_call_ids=pending_tool_call_ids,
+            )
+        if fallback_schema is None or fallback_tool_name is None:
+            raise RuntimeError(
+                f"Model {model} lacks tool-calling and no fallback_schema provided"
+            )
+        if log_label:
+            log_llm_messages(logger, f"{log_label} (fallback)", messages)
+        completion = client.generate_chat_response_with_provenance(
+            messages=messages,
+            response_format=fallback_schema,
+            model_role=model_role,
+        )
+        parsed = completion.value
+        provenance = completion.provenance
+        if log_label:
+            log_model_response(logger, f"{log_label} (fallback)", parsed)
+        # The fallback path always passes response_format so the client
+        # returns a parsed BaseModel instance. Narrow the type so pyright
+        # can see model_fields is available.
+        if not isinstance(parsed, BaseModel):
+            raise RuntimeError(
+                f"Fallback structured call returned unexpected type {type(parsed)}"
+            )
+        # Expect the schema's first field to be a list of items whose
+        # ``model_dump_json()`` matches the fallback tool's args model.
+        items = getattr(parsed, next(iter(type(parsed).model_fields)))
+        # Respect the configured max_steps budget even on the fallback path
+        # — otherwise a non-tool-calling provider could blow past the loop
+        # cap when the structured response includes more items than expected.
+        bounded_items = items[:max_steps]
+        for item in bounded_items:
+            tool_t0 = time.monotonic()
+            outcome = registry.handle_outcome(
+                fallback_tool_name,
+                item.model_dump_json(),
+                ctx,
+            )
+            res = _tool_result_from_outcome(outcome, pending_tool_call_ids)
+            trace.turns.append(
+                ToolLoopTurn(
+                    tool_name=fallback_tool_name,
+                    args=item.model_dump(),
+                    result=res,
+                    latency_ms=int((time.monotonic() - tool_t0) * 1000),
+                )
+            )
+        exceeded = len(items) > max_steps
+        trace.finished = not exceeded
+        return ToolLoopResult(
+            ctx=ctx,
+            trace=trace,
+            finished_reason="max_steps" if exceeded else "finish_tool",
+            messages=messages,
+            pending_tool_call_ids=pending_tool_call_ids,
+            max_steps_remaining=0 if exceeded else max_steps - len(bounded_items),
+            provenance=provenance,
+        )
+
+    # ---- Native tool loop ---------------------------------------------
+    # Local import keeps litellm_client a type-only dependency of this module.
+
+    local_msgs = list(messages)
+    provenance: ModelProvenance | None = None
+    try:
+        tool_specs = registry.openai_specs()
+        for _step in range(max_steps):
+            if log_label:
+                log_llm_messages(logger, f"{log_label} (turn {_step + 1})", local_msgs)
+            completion = client.generate_chat_response_with_provenance(
+                messages=local_msgs,
+                tools=tool_specs or None,
+                tool_choice=tool_choice if tool_specs else None,
+                model_role=model_role,
+                response_format=response_format,
+                structured_output_validator=structured_output_validator,
+            )
+            resp = completion.value
+            provenance = completion.provenance
+            if log_label:
+                log_model_response(logger, f"{log_label} (turn {_step + 1})", resp)
+
+            # Extract per-turn usage from the response (populated by LiteLLMClient
+            # when the provider reports it; None otherwise).
+            turn_usage = getattr(resp, "usage", None)
+            turn_prompt_tokens = (
+                getattr(turn_usage, "prompt_tokens", None) if turn_usage else None
+            )
+            turn_completion_tokens = (
+                getattr(turn_usage, "completion_tokens", None) if turn_usage else None
+            )
+            turn_total_tokens = (
+                getattr(turn_usage, "total_tokens", None) if turn_usage else None
+            )
+            turn_cost_usd = getattr(resp, "cost_usd", None)
+
+            tool_calls = getattr(resp, "tool_calls", None)
+            if not tool_calls:
+                # No tool call this turn. When response_format was requested, this
+                # is the SUCCESS terminus: the model returned the final answer
+                # directly and the client parsed it into the schema (on the
+                # no-tools path the client returns the parsed BaseModel itself;
+                # with tools present it sets ``parsed_output``). This is the
+                # structured-output equivalent of a finish-sentinel tool call and
+                # is how the extraction agent commits its result.
+                if response_format is not None:
+                    structured = (
+                        resp
+                        if isinstance(resp, BaseModel)
+                        else getattr(resp, "parsed_output", None)
+                    )
+                    if isinstance(structured, BaseModel):
+                        trace.finished = True
+                        return ToolLoopResult(
+                            ctx=ctx,
+                            trace=trace,
+                            finished_reason="structured_output",
+                            structured_output=structured,
+                            messages=local_msgs,
+                            # The structured answer is committed on this turn —
+                            # one LLM call consumed, mirroring the finish_tool path.
+                            max_steps_remaining=max_steps - _step - 1,
+                            provenance=provenance,
+                        )
+                # No response_format requested (or nothing parseable): the finish
+                # handler did NOT run, so no structured output was committed.
+                # Report a distinct reason so callers (and logs) don't conflate
+                # this with an actual finish tool call. Callers that require
+                # output already gate success on committed output, so this
+                # surfaces accurately as a non-finish termination.
+                trace.finished = True
+                return ToolLoopResult(
+                    ctx=ctx,
+                    trace=trace,
+                    finished_reason="no_tool_call",
+                    messages=local_msgs,
+                    pending_tool_call_ids=pending_tool_call_ids,
+                    max_steps_remaining=max_steps - _step,
+                    provenance=provenance,
+                )
+            normalized_tool_calls = [
+                _normalize_tool_call_for_history(tc) for tc in tool_calls
+            ]
+            # Emit ONE assistant message carrying ALL tool_calls from this turn.
+            # OpenAI/Anthropic strict mode requires this shape.
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": getattr(resp, "content", None),
+                "tool_calls": normalized_tool_calls,
+            }
+            assistant_message.update(completion_metadata(resp))
+            local_msgs.append(assistant_message)
+            # Process every tool call and append per-call tool result messages.
+            # A single response's usage is attached to every turn it produced —
+            # the summary helpers dedup by (model, prompt_tokens, completion_tokens).
+            for tc in normalized_tool_calls:
+                # Time each tool individually — using the turn-start clock
+                # would inflate later tools' latencies with model time and
+                # earlier tools' work, masking the actual per-tool cost.
+                tool_t0 = time.monotonic()
+                name = tc["function"]["name"]
+                args_json = tc["function"]["arguments"]
+                outcome = registry.handle_outcome(name, args_json, ctx)
+                result = _tool_result_from_outcome(outcome, pending_tool_call_ids)
+                try:
+                    args_dict = json.loads(args_json or "{}")
+                except json.JSONDecodeError:
+                    args_dict = {}
+                trace.turns.append(
+                    ToolLoopTurn(
+                        tool_name=name,
+                        args=args_dict,
+                        result=result,
+                        latency_ms=int((time.monotonic() - tool_t0) * 1000),
+                        model=model,
+                        prompt_tokens=turn_prompt_tokens,
+                        completion_tokens=turn_completion_tokens,
+                        total_tokens=turn_total_tokens,
+                        cost_usd=turn_cost_usd,
+                    )
+                )
+                local_msgs.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(result),
+                    }
+                )
+            # After processing ALL tool calls, check whether the finish sentinel
+            # appeared in this turn (may be alongside sibling calls).
+            if any(
+                tc["function"]["name"] == finish_tool_name
+                for tc in normalized_tool_calls
+            ):
+                trace.finished = True
+                return ToolLoopResult(
+                    ctx=ctx,
+                    trace=trace,
+                    finished_reason="finish_tool",
+                    messages=local_msgs,
+                    pending_tool_call_ids=pending_tool_call_ids,
+                    max_steps_remaining=max_steps - _step - 1,
+                    provenance=provenance,
+                )
+    except Exception as error:
+        _log_tool_loop_error(error)
+        trace.finished = False
+        return ToolLoopResult(
+            ctx=ctx,
+            trace=trace,
+            finished_reason="error",
+            messages=local_msgs,
+            pending_tool_call_ids=pending_tool_call_ids,
+            max_steps_remaining=0,
+        )
+
+    return ToolLoopResult(
+        ctx=ctx,
+        trace=trace,
+        finished_reason="max_steps",
+        messages=local_msgs,
+        pending_tool_call_ids=pending_tool_call_ids,
+        max_steps_remaining=0,
+        provenance=provenance,
+    )

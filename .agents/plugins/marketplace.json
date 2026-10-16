@@ -1,0 +1,20 @@
+{
+  "name": "reflexioai",
+  "interface": {
+    "displayName": "工作偏好管理 · hyz"
+  },
+  "plugins": [
+    {
+      "name": "claude-smart",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

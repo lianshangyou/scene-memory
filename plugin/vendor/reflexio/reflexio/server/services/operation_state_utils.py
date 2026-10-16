@@ -1,0 +1,1054 @@
+"""Centralized manager for all _operation_state table interactions.
+
+Consolidates 5 use cases:
+1. Progress tracking (rerun + manual batch operations)
+2. Concurrency lock (atomic lock with request queuing)
+3. Extractor bookmark (track last-processed interactions per extractor)
+4. Aggregator bookmark (track last-processed user_playbook_id per aggregator)
+5. Simple lock (non-queuing lock for cleanup operations)
+"""
+
+import logging
+import time
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
+from reflexio.models.api_schema.service_schemas import Interaction, OperationStatus
+from reflexio.server.services.storage.error import StorageError
+from reflexio.server.services.storage.storage_base import BaseStorage
+
+logger = logging.getLogger(__name__)
+
+# Stale lock timeout - if generation started > 5 min ago and still "in_progress", assume it crashed
+GENERATION_STALE_LOCK_SECONDS = 300
+
+# Stale batch progress timeout - if batch operation started > 10 min ago and still IN_PROGRESS, auto-recover
+BATCH_STALE_PROGRESS_SECONDS = 600
+
+
+class OperationStateManager:
+    """Centralized manager for all _operation_state table interactions.
+
+    Provides methods for progress tracking, concurrency locks, extractor bookmarks,
+    aggregator bookmarks, and simple locks.
+
+    Args:
+        storage: Storage instance with operation state methods
+        org_id: Organization identifier
+        service_name: Name of the service (e.g., "profile_generation", "playbook_extractor")
+    """
+
+    def __init__(self, storage: BaseStorage, org_id: str, service_name: str):
+        self.storage = storage
+        self.org_id = org_id
+        self.service_name = service_name
+        self._simple_lock_token: str | None = None
+        self.operation_id: str | None = None
+
+    # ── Key Builders (private) ──
+
+    def _progress_key(self) -> str:
+        """Build progress tracking key.
+
+        Returns:
+            str: Key in format '{service_name}::{org_id}::progress'
+        """
+        return f"{self.service_name}::{self.org_id}::progress"
+
+    def _cancellation_key(self) -> str:
+        """Build cancellation flag key.
+
+        Uses a separate row from progress to avoid lost-update race conditions
+        where progress updates overwrite the cancellation flag.
+
+        Returns:
+            str: Key in format '{service_name}::{org_id}::cancellation'
+        """
+        suffix = f"::{self.operation_id}" if self.operation_id else ""
+        return f"{self.service_name}::{self.org_id}::cancellation{suffix}"
+
+    def _lock_key(self, scope_id: str | None = None) -> str:
+        """Build concurrency lock key.
+
+        Args:
+            scope_id: Optional scope identifier (e.g., user_id for profile generation)
+
+        Returns:
+            str: Key in format '{service_name}::{org_id}[::scope_id]::lock'
+        """
+        if scope_id:
+            return f"{self.service_name}::{self.org_id}::{scope_id}::lock"
+        return f"{self.service_name}::{self.org_id}::lock"
+
+    def _bookmark_key(
+        self,
+        name: str,
+        scope_id: str | None = None,
+        version: str | None = None,
+    ) -> str:
+        """Build bookmark key for extractor/aggregator state.
+
+        Args:
+            name: Extractor or aggregator name
+            scope_id: Optional scope identifier (e.g., user_id)
+            version: Optional version identifier (for aggregator)
+
+        Returns:
+            str: Key in format '{service_name}::{org_id}[::scope_id]::{name}[::version]'
+        """
+        parts = [self.service_name, self.org_id]
+        if scope_id:
+            parts.append(scope_id)
+        parts.append(name)
+        if version:
+            parts.append(version)
+        return "::".join(parts)
+
+    def _normalize_lock_request_id(
+        self,
+        lock_request_id: str | None,
+        *,
+        request_id: str | None = None,
+    ) -> str:
+        """Accept legacy ``request_id`` callers while keeping local lock naming."""
+        if lock_request_id is not None:
+            if request_id is not None and request_id != lock_request_id:
+                raise TypeError(
+                    "lock_request_id and request_id must match when both are provided"
+                )
+            return lock_request_id
+        if request_id is not None:
+            return request_id
+        raise TypeError("lock_request_id is required")
+
+    # ── Use Case 1: Progress Tracking ──
+    # (Batch operations: rerun + manual)
+
+    def claim_progress(self, request_params: dict) -> bool:
+        """Reserve one batch before acknowledgement, using the existing atomic claim.
+
+        Rejected claim tokens are contention markers, as with acquire_simple_lock;
+        this progress slot never drains them. Owned writes discard the markers.
+        """
+        if self.operation_id is not None:
+            state = self.get_progress()
+            return bool(
+                state
+                and state.get("current_request_id") == self.operation_id
+                and state.get("status") == OperationStatus.IN_PROGRESS.value
+            )
+        self.operation_id = str(uuid.uuid4())
+        try:
+            result = self.storage.try_acquire_in_progress_lock(
+                self._progress_key(),
+                self.operation_id,
+                stale_lock_seconds=BATCH_STALE_PROGRESS_SECONDS,
+            )
+        except StorageError as error:
+            cause = error.__cause__
+            diagnostic = getattr(cause, "diag", None)
+            # A cold PostgreSQL slot can race in the existing RPC's initial INSERT.
+            # Retry this claim once after its transaction unwinds, never generation
+            # or an RPC inside an already-aborted outer transaction.
+            if (
+                getattr(cause, "pgcode", None) != "23505"
+                or getattr(diagnostic, "table_name", None) != "_operation_state"
+                or getattr(diagnostic, "constraint_name", None)
+                != "_operation_state_pkey"
+                or getattr(self.storage, "_scope_conn", None) is not None
+                or not self.get_progress()
+            ):
+                raise
+            result = self.storage.try_acquire_in_progress_lock(
+                self._progress_key(),
+                self.operation_id,
+                stale_lock_seconds=BATCH_STALE_PROGRESS_SECONDS,
+            )
+        if not result.get("acquired"):
+            return False
+        self.initialize_progress(total_users=0, request_params=request_params)
+        return True
+
+    def _write_progress(self, state: dict) -> None:
+        """Condition replacements on the admitted owner, including terminal writes."""
+        if self.operation_id is not None:
+            if state.get("current_request_id") != self.operation_id:
+                raise RuntimeError("Generation attempt no longer owns progress")
+            state["in_progress"] = (
+                state.get("status") == OperationStatus.IN_PROGRESS.value
+            )
+            state["pending_request_queue"] = []
+            # This storage primitive conditionally replaces the supplied state;
+            # it does not force in_progress=False, so it also fences progress writes.
+            if not self.storage.clear_in_progress_lock_if_owner(
+                self._progress_key(),
+                self.operation_id,
+                state,
+            ):
+                raise RuntimeError("Generation attempt no longer owns progress")
+        elif state.get("current_request_id"):
+            raise RuntimeError("Cannot overwrite another generation attempt")
+        else:
+            self.storage.update_operation_state(self._progress_key(), state)
+
+    def _clear_attempt_cancellation(self) -> None:
+        if self.operation_id is not None:
+            self.storage.delete_operation_state(self._cancellation_key())
+
+    def check_in_progress(self) -> str | None:
+        """Check if there's an existing in-progress operation.
+
+        If the operation has been in progress for longer than BATCH_STALE_PROGRESS_SECONDS,
+        auto-marks it as FAILED and returns None to allow new operations to proceed.
+
+        Returns:
+            Error message if operation is in progress, None otherwise
+        """
+        key = self._progress_key()
+        existing_state_entry = self.storage.get_operation_state(key)
+        if existing_state_entry:
+            existing_state = existing_state_entry.get(
+                "operation_state", existing_state_entry
+            )
+            if (
+                self.operation_id is not None
+                and existing_state.get("current_request_id") == self.operation_id
+                and existing_state.get("status") == OperationStatus.IN_PROGRESS.value
+            ):
+                return None
+            if existing_state.get(
+                "status"
+            ) == OperationStatus.IN_PROGRESS.value or existing_state.get("in_progress"):
+                # Check if the operation is stale
+                started_at = existing_state.get("started_at")
+                if started_at is None:
+                    # Legacy state without started_at — treat as legitimately in-progress
+                    return (
+                        f"A {self.service_name} operation is already in progress. "
+                        "Please wait for it to complete."
+                    )
+                current_time = int(datetime.now(UTC).timestamp())
+                elapsed = current_time - started_at
+
+                if elapsed > BATCH_STALE_PROGRESS_SECONDS:
+                    logger.warning(
+                        "Stale %s batch operation detected (started %d seconds ago), "
+                        "auto-marking as FAILED to allow recovery",
+                        self.service_name,
+                        elapsed,
+                    )
+                    existing_state["status"] = OperationStatus.FAILED.value
+                    existing_state["completed_at"] = current_time
+                    existing_state["error_message"] = (
+                        f"Auto-recovered: operation was stuck IN_PROGRESS for {elapsed}s "
+                        f"(threshold: {BATCH_STALE_PROGRESS_SECONDS}s)"
+                    )
+                    owner = existing_state.get("current_request_id")
+                    if owner:
+                        existing_state["in_progress"] = False
+                        self.storage.clear_in_progress_lock_if_owner(
+                            key, owner, existing_state
+                        )
+                    else:
+                        self.storage.update_operation_state(key, existing_state)
+                    return None
+
+                return (
+                    f"A {self.service_name} operation is already in progress. "
+                    "Please wait for it to complete."
+                )
+        return None
+
+    def initialize_progress(
+        self,
+        total_users: int,
+        request_params: dict,
+        extra_stats: dict | None = None,
+    ) -> None:
+        """Initialize operation state with IN_PROGRESS status.
+
+        Args:
+            total_users: Total number of users to process
+            request_params: Original request parameters for reference
+            extra_stats: Optional additional stats fields to include
+        """
+        if self.operation_id is not None:
+            existing = self.get_progress()
+            if not existing or existing.get("current_request_id") != self.operation_id:
+                raise RuntimeError("Generation attempt no longer owns progress")
+            if "stats" in existing:
+                existing["total_users"] = total_users
+                existing["request_params"] = {
+                    **request_params,
+                    "operation_id": self.operation_id,
+                }
+                self._write_progress(existing)
+                return
+        stats = {
+            "total_interactions_processed": 0,
+            "total_generated": 0,
+        }
+        if extra_stats:
+            stats.update(extra_stats)
+
+        key = self._progress_key()
+        initial_state = {
+            "service_name": self.service_name,
+            "status": OperationStatus.IN_PROGRESS.value,
+            "started_at": int(datetime.now(UTC).timestamp()),
+            "completed_at": None,
+            "total_users": total_users,
+            "processed_users": 0,
+            "failed_users": 0,
+            "current_user_id": None,
+            "processed_user_ids": [],
+            "failed_user_ids": [],
+            "request_params": request_params,
+            "stats": stats,
+            "error_message": None,
+            "progress_percentage": 0.0,
+        }
+        if self.operation_id is not None:
+            # Reset before exposing IN_PROGRESS, so admission-time cancellation
+            # cannot be cleared after it has been accepted.
+            self.storage.upsert_operation_state(
+                self._cancellation_key(), {"cancellation_requested": False}
+            )
+            initial_state["current_request_id"] = self.operation_id
+            initial_state["request_params"]["operation_id"] = self.operation_id
+            self._write_progress(initial_state)
+        else:
+            self.storage.upsert_operation_state(key, initial_state)
+
+        # Legacy managers do not have an attempt-scoped cancellation row.
+        if self.operation_id is None:
+            self.storage.upsert_operation_state(
+                self._cancellation_key(), {"cancellation_requested": False}
+            )
+
+    def set_current_item(self, item_id: str) -> None:
+        """Set the current item being processed.
+
+        Args:
+            item_id: Item ID currently being processed
+        """
+        key = self._progress_key()
+        state_entry = self.storage.get_operation_state(key)
+        current_state = (
+            state_entry.get("operation_state", state_entry) if state_entry else {}
+        )
+        current_state["current_user_id"] = item_id
+        self._write_progress(current_state)
+
+    def update_progress(
+        self,
+        item_id: str,
+        count: int,
+        success: bool,
+        total_users: int,
+        error: str | None = None,
+    ) -> None:
+        """Update operation state after processing a user.
+
+        Args:
+            item_id: User ID that was processed
+            count: Number of interactions processed for this user
+            success: Whether processing succeeded
+            total_users: Total users being processed (for percentage calculation)
+            error: Error message if processing failed
+        """
+        key = self._progress_key()
+        state_entry = self.storage.get_operation_state(key)
+        current_state = (
+            state_entry.get("operation_state", state_entry) if state_entry else {}
+        )
+
+        if success:
+            current_state["processed_users"] += 1
+            current_state["processed_user_ids"].append(item_id)
+            current_state["stats"]["total_interactions_processed"] += count
+        else:
+            current_state["failed_users"] += 1
+            current_state["failed_user_ids"].append(
+                {"user_id": item_id, "error": error}
+            )
+
+        current_state["current_user_id"] = None
+        current_state["progress_percentage"] = (
+            current_state["processed_users"] / total_users
+        ) * 100
+
+        self._write_progress(current_state)
+
+    def finalize_progress(self, total_processed: int, total_generated: int = 0) -> None:
+        """Finalize statistics without hiding failed users or cancellation.
+
+        Args:
+            total_processed: Total number of items processed
+            total_generated: Total number of profiles or playbooks generated
+        """
+        key = self._progress_key()
+        state_entry = self.storage.get_operation_state(key)
+        final_state = (
+            state_entry.get("operation_state", state_entry) if state_entry else {}
+        )
+        if final_state.get("status") != OperationStatus.CANCELLED.value:
+            failed_users = final_state.get("failed_users", 0)
+            final_state["status"] = (
+                OperationStatus.FAILED.value
+                if failed_users
+                else OperationStatus.COMPLETED.value
+            )
+            if failed_users:
+                final_state["error_message"] = (
+                    f"Generation failed for {failed_users} user(s)"
+                )
+        final_state["completed_at"] = int(datetime.now(UTC).timestamp())
+        if final_state["status"] != OperationStatus.CANCELLED.value:
+            final_state["progress_percentage"] = 100.0
+        final_state["stats"]["total_interactions_processed"] = total_processed
+        final_state["stats"]["total_generated"] = total_generated
+        self._write_progress(final_state)
+        self._clear_attempt_cancellation()
+
+    def mark_progress_failed(self, error_message: str) -> None:
+        """Mark operation as FAILED with error message.
+
+        Args:
+            error_message: Error description
+        """
+        try:
+            key = self._progress_key()
+            state_entry = self.storage.get_operation_state(key)
+            if state_entry:
+                failed_state = state_entry.get("operation_state", state_entry)
+                failed_state["status"] = OperationStatus.FAILED.value
+                failed_state["completed_at"] = int(datetime.now(UTC).timestamp())
+                failed_state["error_message"] = error_message
+                self._write_progress(failed_state)
+                self._clear_attempt_cancellation()
+        except Exception:  # noqa: S110
+            pass  # Ignore errors updating state during exception handling
+
+    def get_progress(self) -> dict | None:
+        """Get the current progress state.
+
+        Returns:
+            The progress state dict, or None if no state exists
+        """
+        key = self._progress_key()
+        state_entry = self.storage.get_operation_state(key)
+        if state_entry:
+            return state_entry.get("operation_state", state_entry)
+        return None
+
+    def request_cancellation(self) -> bool:
+        """Request cancellation of an in-progress operation.
+
+        Writes the cancellation flag to a separate DB row from the progress state
+        to avoid lost-update race conditions where concurrent progress updates
+        overwrite the flag.
+
+        Returns:
+            bool: True if cancellation was requested (operation was in progress), False otherwise
+        """
+        # Verify the operation is actually in progress
+        progress_key = self._progress_key()
+        state_entry = self.storage.get_operation_state(progress_key)
+        if not state_entry:
+            return False
+
+        state = state_entry.get("operation_state", state_entry)
+        if state.get("status") != OperationStatus.IN_PROGRESS.value:
+            return False
+
+        # Write cancellation flag to a separate row to avoid race conditions
+        owner = state.get("current_request_id")
+        if self.operation_id is not None and owner != self.operation_id:
+            return False
+        cancel_key = self._cancellation_key()
+        if owner and self.operation_id is None:
+            cancel_key += f"::{owner}"
+        self.storage.upsert_operation_state(
+            cancel_key, {"cancellation_requested": True}
+        )
+        if owner:
+            current = self.get_progress()
+            if (
+                not current
+                or current.get("current_request_id") != owner
+                or current.get("status") != OperationStatus.IN_PROGRESS.value
+            ):
+                self.storage.delete_operation_state(cancel_key)
+                return False
+        logger.info(
+            "Cancellation requested for %s (org=%s)", self.service_name, self.org_id
+        )
+        return True
+
+    def is_cancellation_requested(self) -> bool:
+        """Check if cancellation has been requested for the current operation.
+
+        Reads from a separate cancellation row to avoid race conditions with
+        progress updates.
+
+        Returns:
+            bool: True if cancellation was requested
+        """
+        cancel_key = self._cancellation_key()
+        cancel_entry = self.storage.get_operation_state(cancel_key)
+        if not cancel_entry:
+            return False
+        cancel_state = cancel_entry.get("operation_state", cancel_entry)
+        return cancel_state.get("cancellation_requested", False)
+
+    def mark_cancelled(self) -> None:
+        """Mark the current operation as CANCELLED.
+
+        Sets status to CANCELLED in the progress row and clears the separate
+        cancellation flag row.
+        """
+        # Update progress state to CANCELLED
+        key = self._progress_key()
+        state_entry = self.storage.get_operation_state(key)
+        if not state_entry:
+            return
+
+        state = state_entry.get("operation_state", state_entry)
+        state["status"] = OperationStatus.CANCELLED.value
+        state["completed_at"] = int(datetime.now(UTC).timestamp())
+        self._write_progress(state)
+
+        # Clear the separate cancellation flag
+        cancel_key = self._cancellation_key()
+        self.storage.upsert_operation_state(
+            cancel_key, {"cancellation_requested": False}
+        )
+        logger.info(
+            "Operation marked as cancelled for %s (org=%s)",
+            self.service_name,
+            self.org_id,
+        )
+
+    # ── Use Case 2: Concurrency Lock ──
+    # (Atomic lock with request queuing for generation services)
+
+    def acquire_lock(
+        self,
+        lock_request_id: str | None = None,
+        scope_id: str | None = None,
+        stale_seconds: int = GENERATION_STALE_LOCK_SECONDS,
+        payload: dict | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Atomically check and acquire in-progress lock.
+
+        Uses a single atomic database operation to prevent race conditions where
+        multiple requests could both acquire the lock simultaneously.
+
+        If a valid in-progress operation exists, appends the request to the
+        ``pending_request_queue`` (along with its ``payload``) so the running
+        operation drains queued requests one at a time after it completes. If
+        no valid lock exists or the lock is stale, acquires the lock.
+
+        Args:
+            lock_request_id: Request ID for the current lock holder
+            scope_id: Optional scope identifier (e.g., user_id)
+            stale_seconds: Seconds after which a lock is considered stale
+            payload: Optional serialized request payload to enqueue with this
+                request when the lock is held by someone else. Required for the
+                rerun loop to operate on the SAME interactions the original
+                publish enqueued, not whatever the bookmark currently points at
+                (R2).
+            request_id: Legacy alias for ``lock_request_id``. When both are
+                provided they must match.
+
+        Returns:
+            bool: True if lock acquired (proceed with generation), False if skipped
+        """
+        lock_request_id = self._normalize_lock_request_id(
+            lock_request_id, request_id=request_id
+        )
+        state_key = self._lock_key(scope_id)
+        # Pass ``payload`` as a kwarg so storage backends that haven't been
+        # updated to the new signature still error loudly rather than silently
+        # dropping it on the floor.
+        result = self.storage.try_acquire_in_progress_lock(
+            state_key,
+            lock_request_id,
+            stale_seconds,
+            payload=payload,
+        )
+
+        acquired = result.get("acquired", False)
+
+        if acquired:
+            logger.info(
+                "Acquired in-progress lock for %s: state_key=%s, lock_request_id=%s",
+                self.service_name,
+                state_key,
+                lock_request_id,
+            )
+        else:
+            logger.info(
+                "Skipping %s - another operation is in progress (state_key=%s). "
+                "Enqueued lock_request_id=%s for drain on release",
+                self.service_name,
+                state_key,
+                lock_request_id,
+            )
+        return acquired
+
+    def release_lock(
+        self,
+        lock_request_id: str | None = None,
+        scope_id: str | None = None,
+        request_id: str | None = None,
+    ) -> str | None:
+        """Release the in-progress lock and check if a new request came in.
+
+        If a pending request exists (different from current), returns its ID so
+        the caller can re-run. Otherwise clears the lock.
+
+        Args:
+            lock_request_id: Request ID for the current lock holder
+            scope_id: Optional scope identifier (e.g., user_id)
+            request_id: Legacy alias for ``lock_request_id``. When both are
+                provided they must match.
+
+        Returns:
+            Optional[str]: pending_request_id if a new request needs processing, None otherwise
+        """
+        lock_request_id = self._normalize_lock_request_id(
+            lock_request_id, request_id=request_id
+        )
+        state_key = self._lock_key(scope_id)
+        state_record = self.storage.get_operation_state(state_key)
+
+        if not state_record:
+            return None
+
+        # Extract operation_state from the record (storage returns nested structure)
+        state = (
+            state_record.get("operation_state", {})
+            if isinstance(state_record.get("operation_state"), dict)
+            else state_record
+        )
+
+        pending_request_id = state.get("pending_request_id")
+        # Backward compatibility for locks written before current_request_id was introduced.
+        current_request_id = state.get("current_request_id") or state.get("request_id")
+
+        # Only process if we still own the lock
+        if current_request_id == lock_request_id:
+            if pending_request_id and pending_request_id != lock_request_id:
+                # Another request came in, transfer ownership and signal re-run
+                self.storage.upsert_operation_state(
+                    state_key,
+                    {
+                        "in_progress": True,
+                        "started_at": int(time.time()),
+                        "current_request_id": pending_request_id,
+                        "pending_request_id": None,
+                    },
+                )
+                logger.info(
+                    "New request %s came in during %s, will re-run (state_key=%s)",
+                    pending_request_id,
+                    self.service_name,
+                    state_key,
+                )
+                return pending_request_id
+            # No pending request, clear the lock
+            self.storage.upsert_operation_state(
+                state_key,
+                {
+                    "in_progress": False,
+                    "current_request_id": None,
+                    "pending_request_id": None,
+                },
+            )
+            logger.info(
+                "Released in-progress lock for %s: state_key=%s, lock_request_id=%s",
+                self.service_name,
+                state_key,
+                lock_request_id,
+            )
+
+        return None
+
+    def clear_lock(self, scope_id: str | None = None) -> None:
+        """Clear the in-progress state (used for error cleanup).
+
+        Also drops any queued pending requests — they were tied to the now-failed
+        run's context and should not be drained against fresh state.
+
+        Args:
+            scope_id: Optional scope identifier (e.g., user_id)
+        """
+        state_key = self._lock_key(scope_id)
+        self.storage.upsert_operation_state(
+            state_key,
+            {
+                "in_progress": False,
+                "current_request_id": None,
+                "pending_request_id": None,
+                "pending_request_queue": [],
+            },
+        )
+        logger.debug(
+            "Cleared in-progress lock for %s: state_key=%s",
+            self.service_name,
+            state_key,
+        )
+
+    def clear_lock_if_owner(
+        self,
+        lock_request_id: str | None = None,
+        scope_id: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Atomically clear a lock only if ``lock_request_id`` still owns it."""
+        lock_request_id = self._normalize_lock_request_id(
+            lock_request_id, request_id=request_id
+        )
+        state_key = self._lock_key(scope_id)
+        cleared = self.storage.clear_in_progress_lock_if_owner(
+            state_key,
+            lock_request_id,
+            {
+                "in_progress": False,
+                "current_request_id": None,
+                "pending_request_id": None,
+                "pending_request_queue": [],
+            },
+        )
+        if cleared:
+            logger.debug(
+                "Cleared in-progress lock for %s: state_key=%s, lock_request_id=%s",
+                self.service_name,
+                state_key,
+                lock_request_id,
+            )
+        return cleared
+
+    def release_lock_pop_queue(
+        self,
+        lock_request_id: str | None = None,
+        scope_id: str | None = None,
+        request_id: str | None = None,
+    ) -> dict | None:
+        """Release the lock and pop the next queued pending request, if any.
+
+        FIFO drain — preserves order so blocked publishes are processed in the
+        order they arrived. Replaces the older single-slot ``pending_request_id``
+        last-wins behaviour that silently dropped earlier blocked publishes
+        (R2).
+
+        On a legacy state row (written by a pre-fix server before redeploy)
+        the queue is missing but ``pending_request_id`` may be set; we surface
+        that as a queue entry with ``payload=None`` so the caller falls back
+        to the original request rather than dropping it on the floor.
+
+        Args:
+            lock_request_id: Request ID for the current lock holder
+            scope_id: Optional scope identifier (e.g., user_id)
+            request_id: Legacy alias for ``lock_request_id``. When both are
+                provided they must match.
+
+        Returns:
+            dict | None: ``{"request_id": str, "payload": dict | None}`` for
+                the next queued request, or None if the queue is empty / we're
+                not the lock holder.
+        """
+        lock_request_id = self._normalize_lock_request_id(
+            lock_request_id, request_id=request_id
+        )
+        state_key = self._lock_key(scope_id)
+        state_record = self.storage.get_operation_state(state_key)
+
+        if not state_record:
+            return None
+
+        state = (
+            state_record.get("operation_state", {})
+            if isinstance(state_record.get("operation_state"), dict)
+            else state_record
+        )
+
+        # Backward compatibility for locks written before current_request_id was introduced.
+        current_request_id = state.get("current_request_id") or state.get("request_id")
+
+        # Only drain if we still own the lock.
+        if current_request_id != lock_request_id:
+            return None
+
+        queue = list(state.get("pending_request_queue") or [])
+        next_entry: dict | None = None
+
+        if queue:
+            head = queue.pop(0)
+            if isinstance(head, dict) and "request_id" in head:
+                next_entry = {
+                    "request_id": head["request_id"],
+                    "payload": head.get("payload"),
+                }
+
+        if next_entry is None:
+            # Legacy fallback: storage row lacks the queue field but the old
+            # pending_request_id slot was set by an in-flight pre-fix server.
+            legacy_pending = state.get("pending_request_id")
+            if legacy_pending and legacy_pending != lock_request_id:
+                next_entry = {"request_id": legacy_pending, "payload": None}
+
+        if next_entry is None:
+            # No more pending work — clear the lock.
+            self.storage.upsert_operation_state(
+                state_key,
+                {
+                    "in_progress": False,
+                    "current_request_id": None,
+                    "pending_request_id": None,
+                    "pending_request_queue": [],
+                },
+            )
+            logger.info(
+                "Released in-progress lock for %s: state_key=%s, lock_request_id=%s",
+                self.service_name,
+                state_key,
+                lock_request_id,
+            )
+            return None
+
+        # Transfer ownership to the popped request. The storage boundary still
+        # persists queued holders under legacy ``request_id`` keys, plus the
+        # mirrored ``pending_request_id`` slot during upgrade windows.
+        new_holder_request_id = next_entry["request_id"]
+        legacy_mirror = queue[0]["request_id"] if queue else None
+        self.storage.upsert_operation_state(
+            state_key,
+            {
+                "in_progress": True,
+                "started_at": int(time.time()),
+                "current_request_id": new_holder_request_id,
+                "pending_request_id": legacy_mirror,
+                "pending_request_queue": queue,
+            },
+        )
+        logger.info(
+            "Drained queued request %s on release of %s (state_key=%s, remaining=%d)",
+            new_holder_request_id,
+            self.service_name,
+            state_key,
+            len(queue),
+        )
+        return next_entry
+
+    # ── Use Case 3: Extractor Bookmark ──
+    # (Track last-processed interactions per extractor)
+
+    def get_extractor_state_with_new_interactions(
+        self,
+        extractor_name: str,
+        user_id: str | None = None,
+        sources: list[str] | None = None,
+    ) -> tuple[dict, list[RequestInteractionDataModel]]:
+        """Get extractor operation state and new interactions since last run.
+
+        Args:
+            extractor_name: Name of the extractor
+            user_id: Optional user ID for user-level extractors
+            sources: Optional source filter list
+
+        Returns:
+            Tuple of (state_dict, new_interactions_list)
+        """
+        state_key = self._bookmark_key(extractor_name, scope_id=user_id)
+        return self.storage.get_operation_state_with_new_request_interaction(
+            state_key, user_id, sources
+        )
+
+    def update_extractor_bookmark(
+        self,
+        extractor_name: str,
+        processed_interactions: list[Interaction],
+        user_id: str | None = None,
+    ) -> None:
+        """Update operation state for an extractor after processing.
+
+        Args:
+            extractor_name: Name of the extractor
+            processed_interactions: Interactions that were processed
+            user_id: Optional user ID for user-level extractors
+        """
+        if not processed_interactions:
+            return
+
+        state_key = self._bookmark_key(extractor_name, scope_id=user_id)
+
+        last_processed_ids = [
+            interaction.interaction_id for interaction in processed_interactions
+        ]
+        last_processed_timestamp = max(
+            (
+                interaction.created_at
+                for interaction in processed_interactions
+                if interaction.created_at is not None
+            ),
+            default=None,
+        )
+
+        state_payload: dict[str, Any] = {
+            "last_processed_interaction_ids": last_processed_ids,
+        }
+        if last_processed_timestamp is not None:
+            state_payload["last_processed_timestamp"] = last_processed_timestamp
+
+        self.storage.upsert_operation_state(state_key, state_payload)
+
+    # ── Use Case 4: Aggregator Bookmark ──
+    # (Track last-processed user_playbook_id per aggregator)
+
+    def get_aggregator_bookmark(self, name: str, version: str) -> int | None:
+        """Get the last processed user_playbook_id for an aggregator.
+
+        Args:
+            name: Aggregator/playbook name
+            version: Agent version
+
+        Returns:
+            Last processed user_playbook_id, or None if no state exists
+        """
+        state_key = self._bookmark_key(name, version=version)
+        record = self.storage.get_operation_state(state_key)
+        if record:
+            state = record.get("operation_state", {})
+            if isinstance(state, dict):
+                return state.get("last_processed_user_playbook_id")
+        return None
+
+    def update_aggregator_bookmark(
+        self, name: str, version: str, last_processed_id: int
+    ) -> None:
+        """Update the aggregator bookmark with the highest user_playbook_id processed.
+
+        Args:
+            name: Aggregator/playbook name
+            version: Agent version
+            last_processed_id: The highest user_playbook_id that was processed
+        """
+        state_key = self._bookmark_key(name, version=version)
+        state = {"last_processed_user_playbook_id": last_processed_id}
+        self.storage.upsert_operation_state(state_key, state)
+        logger.info(
+            "Updated aggregator bookmark for '%s' v%s with last_processed_user_playbook_id: %d",
+            name,
+            version,
+            last_processed_id,
+        )
+
+    # ── Use Case 4b: Aggregator Cluster Fingerprints ──
+    # (Track cluster fingerprints for change detection)
+
+    def get_cluster_fingerprints(self, name: str, version: str) -> dict:
+        """
+        Get stored cluster fingerprints for an aggregator.
+
+        Args:
+            name: Aggregator/playbook name
+            version: Agent version
+
+        Returns:
+            dict: Mapping of fingerprint_hash to {"agent_playbook_id": int, "user_playbook_ids": list[int]}.
+                  Returns empty dict if no state exists.
+        """
+        state_key = self._bookmark_key(name, version=version) + "::clusters"
+        record = self.storage.get_operation_state(state_key)
+        if record:
+            state = record.get("operation_state", {})
+            if isinstance(state, dict):
+                return state.get("cluster_fingerprints", {})
+        return {}
+
+    def update_cluster_fingerprints(
+        self, name: str, version: str, fingerprints: dict
+    ) -> None:
+        """
+        Store cluster fingerprint mapping for an aggregator.
+
+        Args:
+            name: Aggregator/playbook name
+            version: Agent version
+            fingerprints: Mapping of fingerprint_hash to {"agent_playbook_id": int, "user_playbook_ids": list[int]}
+        """
+        state_key = self._bookmark_key(name, version=version) + "::clusters"
+        state = {"cluster_fingerprints": fingerprints}
+        self.storage.upsert_operation_state(state_key, state)
+        logger.info(
+            "Updated cluster fingerprints for '%s' v%s with %d clusters",
+            name,
+            version,
+            len(fingerprints),
+        )
+
+    # ── Use Case 5: Simple Lock ──
+    # (Non-queuing lock for cleanup operations)
+
+    def acquire_simple_lock(self, stale_seconds: int = 300) -> bool:
+        """Atomically acquire a simple non-queuing lock.
+
+        Delegates to ``storage.try_acquire_in_progress_lock`` with a fresh
+        per-acquire token, so check-and-take is one atomic storage operation
+        rather than a read followed by a blind write. A lock whose holder took
+        it ``stale_seconds`` or more ago (measured from the holder's
+        ``started_at``, boundary inclusive) is taken over.
+
+        Behaviour differences from the queuing ``acquire_lock`` primitive it
+        shares: a refused acquire is still appended to the row's
+        ``pending_request_queue`` by storage, but nothing drains it here — the
+        next successful acquire resets the queue and ``release_simple_lock``
+        replaces the whole state, so entries are bounded by contention within
+        one hold. Storage does not report whether an acquire took over a stale
+        holder, so no separate stale-override log is emitted.
+
+        Args:
+            stale_seconds: Seconds after which a lock is considered stale
+
+        Returns:
+            bool: True if lock acquired, False if another operation holds it
+        """
+        token = str(uuid.uuid4())
+        result = self.storage.try_acquire_in_progress_lock(
+            self._lock_key(), token, stale_lock_seconds=stale_seconds
+        )
+        if not result.get("acquired"):
+            logger.info(
+                "Skipping %s - another operation is in progress", self.service_name
+            )
+            return False
+        self._simple_lock_token = token
+        return True
+
+    def release_simple_lock(self) -> None:
+        """Release the simple lock if this manager still owns it.
+
+        A no-op when this manager never acquired the lock. If another
+        operation took the lock over as stale, it is left untouched.
+        A storage exception retains the ownership token so release can be retried.
+        """
+        token = self._simple_lock_token
+        if token is None:
+            return
+        released = self.storage.clear_in_progress_lock_if_owner(
+            self._lock_key(),
+            token,
+            {"in_progress": False, "completed_at": int(time.time())},
+        )
+        self._simple_lock_token = None
+        if not released:
+            logger.warning(
+                "%s lock was taken over before release; leaving it to the new holder",
+                self.service_name,
+            )

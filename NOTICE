@@ -1,0 +1,10 @@
+Scenario Memory - local scenario-based work preferences
+Customization and distribution maintained by hyz.
+
+This distribution includes modified code from:
+- claude-smart: https://github.com/ReflexioAI/claude-smart
+- reflexio: https://github.com/ReflexioAI/reflexio
+
+Their Apache License 2.0 terms and existing copyright notices are retained.
+Third-party component licenses remain with the corresponding source files.
+The hyz attribution identifies the customization, not sole original authorship.

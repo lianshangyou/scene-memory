@@ -1,0 +1,4330 @@
+import asyncio
+import inspect
+import logging
+import os
+import time
+import warnings
+from collections.abc import Callable, Coroutine, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from typing import Any, Literal, TypeVar, get_args
+from urllib.parse import urljoin
+
+import aiohttp
+import requests
+from pydantic import BaseModel, ConfigDict
+
+from reflexio.defaults import DEFAULT_AGENT_VERSION
+from reflexio.models.api_schema.aggregation_operations import (
+    PlaybookAggregationOperation,
+    SubmitPlaybookAggregationRequest,
+)
+from reflexio.models.api_schema.eval_overview_schema import (
+    GradeOnDemandRequest,
+    GradeOnDemandResponse,
+    RegenerateRequest,
+    RegenerateStartResponse,
+    RegenerateStatusResponse,
+)
+from reflexio.models.api_schema.retriever_schema import (
+    ConversationTurn,
+    GetAgentPlaybooksRequest,
+    GetAgentPlaybooksViewResponse,
+    GetAgentSuccessEvaluationResultsRequest,
+    GetEvaluationResultsViewResponse,
+    GetInteractionsRequest,
+    GetInteractionsViewResponse,
+    GetProfilesViewResponse,
+    GetRequestsRequest,
+    GetRequestsViewResponse,
+    GetRetrievedLearningEvaluationResultsRequest,
+    GetRetrievedLearningEvaluationResultsResponse,
+    GetUserPlaybooksRequest,
+    GetUserPlaybooksViewResponse,
+    GetUserProfilesRequest,
+    ProfileChangeLogViewResponse,
+    RerankUserProfilesRequest,
+    RetrievalExperimentListResponse,
+    RetrievalExperimentResultsResponse,
+    SearchAgentPlaybookRequest,
+    SearchAgentPlaybooksViewResponse,
+    SearchInteractionRequest,
+    SearchInteractionsViewResponse,
+    SearchProfilesViewResponse,
+    SearchUserPlaybookRequest,
+    SearchUserPlaybooksViewResponse,
+    SearchUserProfileRequest,
+    StartRetrievalExperimentRequest,
+    StopRetrievalExperimentRequest,
+    StorageStatsResponse,
+    UnifiedSearchRequest,
+    UnifiedSearchViewResponse,
+    UpdateAgentPlaybookRequest,
+    UpdateAgentPlaybookResponse,
+    UpdatePlaybookStatusRequest,
+    UpdatePlaybookStatusResponse,
+    UpdateUserPlaybookRequest,
+    UpdateUserPlaybookResponse,
+)
+from reflexio.models.config_schema import SearchMode
+from reflexio.models.profile_id import new_profile_id
+
+IS_TEST_ENV = os.environ.get("IS_TEST_ENV", "false").strip() == "true"
+
+BACKEND_URL = "http://127.0.0.1:8000" if IS_TEST_ENV else "https://www.reflexio.ai/"
+# Both routes run under the server's 600s SYNC_REQUEST_TIMEOUT_SECONDS. The client
+# waits LONGER than that, not equally: transmission and response delivery happen
+# outside the middleware's timer, so a response produced at 599s server-side
+# arrives after a 600s client has already given up.
+_SERVER_SYNC_BUDGET_SECONDS = 600
+_CLIENT_TRANSPORT_MARGIN_SECONDS = 30
+REVIEW_USER_PLAYBOOKS_TIMEOUT_SECONDS = (
+    _SERVER_SYNC_BUDGET_SECONDS + _CLIENT_TRANSPORT_MARGIN_SECONDS
+)
+# grade_on_demand runs the LLM judge inline on a cache miss; a large session takes
+# minutes, so the 300s client default gave up first (claude-smart#162).
+GRADE_ON_DEMAND_TIMEOUT_SECONDS = (
+    _SERVER_SYNC_BUDGET_SECONDS + _CLIENT_TRANSPORT_MARGIN_SECONDS
+)
+
+from reflexio.models.api_schema.domain.entities import (
+    UpgradeProfilesRequest,
+    UpgradeProfilesResponse,
+    UpgradeUserPlaybooksRequest,
+    UpgradeUserPlaybooksResponse,
+)
+from reflexio.models.api_schema.pending_tool_call_schema import (
+    PendingToolCallListResponse,
+    PendingToolCallResponse,
+)
+from reflexio.models.api_schema.service_schemas import (
+    AddAgentPlaybookRequest,
+    AddAgentPlaybookResponse,
+    AddUserPlaybookRequest,
+    AddUserPlaybookResponse,
+    AddUserProfileRequest,
+    AddUserProfileResponse,
+    AgentPlaybook,
+    BulkDeleteResponse,
+    ClearUserDataRequest,
+    ClearUserDataResponse,
+    DeleteAgentPlaybookRequest,
+    DeleteAgentPlaybookResponse,
+    DeleteAgentPlaybooksByIdsRequest,
+    DeleteProfilesByIdsRequest,
+    DeleteRequestRequest,
+    DeleteRequestResponse,
+    DeleteRequestsByIdsRequest,
+    DeleteSessionRequest,
+    DeleteSessionResponse,
+    DeleteUserInteractionRequest,
+    DeleteUserInteractionResponse,
+    DeleteUserPlaybookRequest,
+    DeleteUserPlaybookResponse,
+    DeleteUserPlaybooksByIdsRequest,
+    DeleteUserProfileRequest,
+    DeleteUserProfileResponse,
+    FinalizeSessionRequest,
+    FinalizeSessionResponse,
+    GetOperationStatusResponse,
+    GetSessionOutcomesRequest,
+    GetSessionOutcomesResponse,
+    InteractionData,
+    ManualPlaybookGenerationRequest,
+    ManualProfileGenerationRequest,
+    MyConfigResponse,
+    OperationStatus,
+    PlaybookStatus,
+    PublishUserInteractionRequest,
+    PublishUserInteractionResponse,
+    RerunPlaybookGenerationRequest,
+    RerunPlaybookGenerationResponse,
+    RerunProfileGenerationRequest,
+    RerunProfileGenerationResponse,
+    ReviewUserPlaybooksRequest,
+    ReviewUserPlaybooksResponse,
+    RunPlaybookAggregationRequest,
+    RunPlaybookAggregationResponse,
+    SessionOutcomeKind,
+    SetSessionOutcomeRequest,
+    SetSessionOutcomeResponse,
+    Status,
+    UserPlaybook,
+    UserProfile,
+    WhoamiResponse,
+)
+from reflexio.models.api_schema.stall_state_schema import (
+    MarkNotifiedResponse,
+    StallStateResponse,
+)
+from reflexio.models.config_schema import Config
+
+from .cache import InMemoryCache
+
+
+class OfflineTunerConfigResponse(BaseModel):
+    enabled: bool
+
+
+class ConfigResponse(Config):
+    offline_tuner_config: OfflineTunerConfigResponse | None = None
+    model_config = ConfigDict(extra="allow")
+
+
+T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
+
+
+class ReflexioAPIError(Exception):
+    """Raised when the API returns a successful HTTP status but the body
+    cannot be decoded as JSON.
+
+    This is the "your REFLEXIO_URL points at a non-API host / a proxy
+    returned an HTML error page with status 200" class of failure. The
+    error message includes the URL, status code, Content-Type, and a
+    truncated body preview so the user can see at a glance what went
+    wrong. The CLI's ``handle_errors`` decorator renders this as a
+    structured ``CliError`` with ``error_type="api"``.
+    """
+
+
+class ReflexioClient:
+    """Client for interacting with the Reflexio API."""
+
+    # Shared thread pool for all instances to maximize efficiency
+    _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reflexio")
+
+    def __init__(
+        self, api_key: str = "", url_endpoint: str = "", timeout: float = 300
+    ) -> None:
+        """Initialize the Reflexio client.
+
+        Args:
+            api_key (str): API key for authentication. Falls back to REFLEXIO_API_KEY env var.
+            url_endpoint (str): Base URL for the API. Falls back to REFLEXIO_URL env var,
+                then to the default backend URL.
+            timeout (int): Default request timeout in seconds (default 300)
+        """
+        self.base_url = (
+            url_endpoint or os.environ.get("REFLEXIO_URL", "") or BACKEND_URL
+        )
+        self.api_key = api_key or os.environ.get("REFLEXIO_API_KEY", "")
+        self.timeout = timeout
+        self.session = requests.Session()
+        # Treat any API 3xx as an error instead of silently following.
+        # ``requests`` default would demote POST→GET on 302, which has
+        # historically turned misconfigured base URLs (e.g. pointing at a
+        # marketing site that 302s to its www subdomain) into silent
+        # publish losses: the POST became a GET to a marketing page that
+        # returned HTML 200, which then crashed ``response.json()``.
+        self.session.max_redirects = 0
+        self._cache = InMemoryCache()
+
+    def for_session(self, session_id: str) -> "SessionScopedClient":
+        """Bind a session ID once and get a client that cannot forget it.
+
+        This is the **recommended** way to use the client. Correlation is
+        what makes retrieval measurable: Reflexio can only tell which
+        learnings were shown and whether the session went well if the
+        search that surfaced them and the publish that recorded the turn
+        agree on one session ID.
+
+        The per-call ``session_id`` argument leaves that agreement up to
+        every call site, and every call site is one place it can be
+        dropped. Passing it to the publish but not the search is silent
+        and successful, and has been made independently by separate
+        integrations -- including one that derived a session internally,
+        used it on publish, and discarded it for search. Binding it once
+        removes the opportunity::
+
+            session = client.for_session(session_id)
+            context = session.search(query="...", user_id="u1")
+            session.publish_interaction(user_id="u1", interactions=[...])
+
+        Both calls above read the session from the same place, so they
+        cannot disagree.
+
+        The returned object shares this client's connection pool, auth,
+        cache, and configuration -- it binds one argument, it is not a
+        second client. Creating one per session is cheap.
+
+        Args:
+            session_id (str): The session ID to bind. Must be non-empty.
+
+        Returns:
+            SessionScopedClient: A view of this client with the session bound.
+
+        Raises:
+            ValueError: If ``session_id`` is None, empty, or whitespace.
+        """
+        return SessionScopedClient(self, session_id)
+
+    def _get_auth_headers(self) -> dict:
+        """Get authentication headers with Bearer token if api_key is configured.
+
+        Returns:
+            dict: Headers with Authorization bearer token, or empty dict if no api_key
+        """
+        if self.api_key:
+            return {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+        return {}
+
+    def _get_headers(self) -> dict:
+        """Get default headers for API requests.
+
+        Returns:
+            dict: Headers with content-type and optional authorization
+        """
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _convert_to_model(self, data: dict | object, model_class: type[T]) -> T:
+        """Convert dict to model instance if needed.
+
+        Args:
+            data: Either a dict or already an instance of model_class
+            model_class: The target class to convert to
+
+        Returns:
+            An instance of model_class
+        """
+        if isinstance(data, dict):
+            return model_class(**data)
+        return data  # type: ignore[reportReturnType]
+
+    def _build_request(
+        self,
+        request: T | dict | None,
+        model_class: type[T],
+        **kwargs: Any,
+    ) -> T:
+        """Build request object from request param or kwargs.
+
+        Args:
+            request: Optional request object or dict
+            model_class: The request class to instantiate
+            **kwargs: Field values to use if request is None
+
+        Returns:
+            An instance of model_class
+        """
+        if request is not None:
+            return self._convert_to_model(request, model_class)  # type: ignore[reportReturnType]
+        # Filter out None values and build from kwargs
+        filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        return model_class(**filtered_kwargs)
+
+    def _fire_and_forget(
+        self,
+        async_func: Callable[..., Coroutine[Any, Any, Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Execute an async request in fire-and-forget mode.
+
+        Args:
+            async_func: Asynchronous function to call
+            *args: Positional arguments to pass to the function
+            **kwargs: Keyword arguments to pass to the function
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(async_func(*args, **kwargs))
+        except RuntimeError:
+            self._thread_pool.submit(lambda: asyncio.run(async_func(*args, **kwargs)))
+
+    async def _make_async_request(
+        self, method: str, endpoint: str, headers: dict | None = None, **kwargs: Any
+    ) -> Any:
+        """Make an async HTTP request with sync-transport safety parity."""
+        url = urljoin(self.base_url, endpoint)
+
+        # Merge auth headers with any provided headers
+        request_headers = self._get_headers()
+        if headers:
+            request_headers.update(headers)
+
+        kwargs.setdefault("timeout", aiohttp.ClientTimeout(total=self.timeout))
+        kwargs.setdefault("allow_redirects", False)
+        async with aiohttp.ClientSession() as async_session:
+            response = await async_session.request(
+                method, url, headers=request_headers, **kwargs
+            )
+            if 300 <= response.status < 400:
+                raise ReflexioAPIError(
+                    f"Unexpected redirect from {method} {url} "
+                    f"(status {response.status})"
+                )
+            response.raise_for_status()
+            content = await response.read()
+            if not content:
+                return {}
+            content_type = response.headers.get("Content-Type", "").lower()
+            if content_type and "json" not in content_type:
+                body_preview = content.decode(errors="replace")[:200]
+                raise ReflexioAPIError(
+                    f"Expected JSON from {method} {url} but got "
+                    f"Content-Type={content_type} (status {response.status}). "
+                    f"Body preview: {body_preview!r}. "
+                    "Is REFLEXIO_URL pointing at the API host?"
+                )
+            try:
+                return await response.json(content_type=None)
+            except (aiohttp.ContentTypeError, ValueError) as exc:
+                body_preview = content.decode(errors="replace")[:200]
+                raise ReflexioAPIError(
+                    f"{method} {url} returned status {response.status} but "
+                    f"the body is not valid JSON: {exc}. "
+                    f"Body preview: {body_preview!r}. "
+                    "Is REFLEXIO_URL pointing at the API host?"
+                ) from exc
+
+    def _make_request(
+        self, method: str, endpoint: str, headers: dict | None = None, **kwargs: Any
+    ) -> Any:
+        """Make an HTTP request to the API and decode the JSON response.
+
+        Beyond ``requests.raise_for_status()`` this also guards against
+        the "2xx with non-JSON body" failure mode — typically a
+        misconfigured base URL pointing at a marketing/proxy host that
+        returns an HTML error or redirect page with status 200. Those
+        cases produce a ``ReflexioAPIError`` with the URL + body
+        preview instead of an opaque ``JSONDecodeError`` deep in the
+        stack.
+
+        Args:
+            method: HTTP method (GET, POST, DELETE).
+            endpoint: API endpoint path.
+            headers: Additional headers to include in the request.
+            **kwargs: Extra kwargs passed through to ``requests``.
+
+        Returns:
+            dict: Decoded JSON response, or ``{}`` for empty 2xx
+                bodies (e.g. 204 No Content).
+
+        Raises:
+            requests.HTTPError: For 4xx/5xx status codes.
+            ReflexioAPIError: For 2xx responses whose body isn't JSON.
+        """
+        url = urljoin(self.base_url, endpoint)
+
+        # Merge auth headers with any provided headers
+        request_headers = self._get_headers()
+        if headers:
+            request_headers.update(headers)
+
+        kwargs.setdefault("timeout", self.timeout)
+        response = self.session.request(method, url, headers=request_headers, **kwargs)
+        response.raise_for_status()
+
+        # Empty body on a successful response (e.g. 204 No Content).
+        # Only treat genuine empty bytes as "no content" — MagicMock
+        # tests leave ``content`` as a MagicMock and should fall through.
+        content = response.content
+        if isinstance(content, (bytes, bytearray)) and not content:
+            return {}
+
+        # Content-Type guard is only enforced when the header is a real
+        # string. Test fixtures that mock ``Session.request`` without
+        # wiring headers return MagicMock values here and should keep
+        # going straight to ``.json()`` for backward compatibility.
+        content_type_raw = response.headers.get("Content-Type", "")
+        if isinstance(content_type_raw, str) and content_type_raw:
+            content_type = content_type_raw.lower()
+            if "json" not in content_type:
+                body_preview = (
+                    response.text[:200] if isinstance(response.text, str) else ""
+                )
+                raise ReflexioAPIError(
+                    f"Expected JSON from {method} {url} but got "
+                    f"Content-Type={content_type} "
+                    f"(status {response.status_code}). "
+                    f"Body preview: {body_preview!r}. "
+                    "Is REFLEXIO_URL pointing at the API host?"
+                )
+        try:
+            return response.json()
+        except requests.exceptions.JSONDecodeError as exc:
+            body_preview = response.text[:200] if isinstance(response.text, str) else ""
+            raise ReflexioAPIError(
+                f"{method} {url} returned status {response.status_code} but "
+                f"the body is not valid JSON: {exc}. "
+                f"Body preview: {body_preview!r}. "
+                "Is REFLEXIO_URL pointing at the API host?"
+            ) from exc
+
+    def finalize_session(
+        self, user_id: str, session_id: str
+    ) -> FinalizeSessionResponse:
+        """Accept an optional completion hint for saved messages.
+
+        Returns acceptance, not extraction completion. The judge remains
+        enabled, and the session can receive later publications.
+        """
+        request = FinalizeSessionRequest(user_id=user_id, session_id=session_id)
+        result = FinalizeSessionResponse(
+            **self._make_request(
+                "POST", "/api/finalize_session", json=request.model_dump(mode="json")
+            )
+        )
+        if result.success:
+            self._cache.invalidate("get_profiles")
+            self._cache.invalidate("get_agent_playbooks")
+        return result
+
+    async def finalize_session_async(
+        self, user_id: str, session_id: str
+    ) -> FinalizeSessionResponse:
+        """Native-async counterpart to :meth:`finalize_session`."""
+        request = FinalizeSessionRequest(user_id=user_id, session_id=session_id)
+        result = FinalizeSessionResponse(
+            **await self._make_async_request(
+                "POST", "/api/finalize_session", json=request.model_dump(mode="json")
+            )
+        )
+        if result.success:
+            self._cache.invalidate("get_profiles")
+            self._cache.invalidate("get_agent_playbooks")
+        return result
+
+    def _publish_interaction_sync(
+        self,
+        request: PublishUserInteractionRequest,
+        wait_for_response: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Internal sync method to publish interaction.
+
+        Args:
+            request (PublishUserInteractionRequest): The publish request
+            wait_for_response (bool): If True, server processes synchronously and returns real result
+        """
+        params = {"wait_for_response": "true"} if wait_for_response else None
+        response = self._make_request(
+            "POST",
+            "/api/publish_interaction",
+            json=request.model_dump(mode="json"),
+            params=params,
+        )
+        return PublishUserInteractionResponse(**response)
+
+    async def _publish_interaction_async(
+        self,
+        request: PublishUserInteractionRequest,
+        wait_for_response: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Internal async method to publish interaction.
+
+        Args:
+            request (PublishUserInteractionRequest): The publish request
+            wait_for_response (bool): If True, server processes synchronously and returns real result
+        """
+        params = {"wait_for_response": "true"} if wait_for_response else None
+        response = await self._make_async_request(
+            "POST",
+            "/api/publish_interaction",
+            json=request.model_dump(mode="json"),
+            params=params,
+        )
+        return PublishUserInteractionResponse(**response)
+
+    def _build_publish_interaction_request(
+        self,
+        *,
+        user_id: str,
+        interactions: Sequence[InteractionData | dict],
+        source: str,
+        agent_version: str,
+        session_id: str | None,
+        skip_aggregation: bool,
+        force_extraction: bool,
+        evaluation_only: bool,
+        override_learning_stall: bool,
+        retrieval_experiment_id: str | None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None,
+        session_finished: bool = False,
+    ) -> PublishUserInteractionRequest:
+        """Validate and build the request shared by sync and async publishing."""
+        if session_id is None or not session_id.strip():
+            raise ValueError("session_id is required and cannot be empty")
+        interaction_data_list = [
+            (
+                InteractionData(**interaction_request)
+                if isinstance(interaction_request, dict)
+                else interaction_request
+            )
+            for interaction_request in interactions
+        ]
+        return PublishUserInteractionRequest(
+            session_id=session_id,
+            user_id=user_id,
+            interaction_data_list=interaction_data_list,
+            source=source,
+            agent_version=agent_version,
+            skip_aggregation=skip_aggregation,
+            force_extraction=force_extraction,
+            session_finished=session_finished,
+            evaluation_only=evaluation_only,
+            override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
+        )
+
+    def _finalize_publish_response(
+        self,
+        request: PublishUserInteractionRequest,
+        result: PublishUserInteractionResponse,
+    ) -> PublishUserInteractionResponse:
+        if local_warnings := request.payload_warnings():
+            result.warnings = [*result.warnings, *local_warnings]
+        self._cache.invalidate("get_profiles")
+        self._cache.invalidate("get_agent_playbooks")
+        return result
+
+    def publish_interaction(
+        self,
+        user_id: str,
+        interactions: Sequence[InteractionData | dict],
+        source: str = "",
+        agent_version: str = DEFAULT_AGENT_VERSION,
+        session_id: str | None = None,
+        wait_for_response: bool = False,
+        skip_aggregation: bool = False,
+        force_extraction: bool = False,
+        evaluation_only: bool = False,
+        override_learning_stall: bool = False,
+        retrieval_experiment_id: str | None = None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None,
+        session_finished: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Publish user interactions.
+
+        Always blocks on the HTTP round-trip so the caller can see
+        4xx/5xx, JSON-decode errors, and network errors. The
+        ``wait_for_response`` parameter controls whether the **server**
+        processes extraction synchronously; the client-side POST is
+        always synchronous.
+
+        In server-async mode (``wait_for_response=False``), the server
+        returns after interactions and their extraction admission are committed.
+        Extraction runs independently and survives process restarts. Poll the
+        request's learning status to check whether all eligible cursors cover it.
+
+        Library users who need a truly non-blocking call can submit
+        the request through ``_fire_and_forget`` directly.
+
+        Args:
+            user_id: The user ID.
+            interactions: List of interaction data.
+            source: Non-sensitive producer/workflow label. A non-empty value
+                must match ``^[a-z0-9][a-z0-9._:-]{0,127}$`` and must not
+                contain user identifiers or PII.
+            agent_version: The agent version.
+            session_id: Required non-empty session ID for grouping requests.
+            wait_for_response: If True, the **server** waits for
+                extraction to complete before returning (longer HTTP
+                call, response includes real profile/playbook counts).
+                If False, the server returns immediately after durable
+                acceptance. The client blocks on the HTTP round-trip
+                in both cases.
+            skip_aggregation: If True, extract profiles/playbooks but
+                skip aggregation to agent playbooks.
+            force_extraction: If True, bypass all extraction gates
+                (stride_size, cheap pre-filter, LLM should_run) and
+                always run extractors.
+            session_finished: Optional completion hint; evaluates the saved prefix
+                through the judge without waiting for a full window. Later messages remain valid.
+            evaluation_only: If True, store the interaction for
+                session-level evaluation only and permanently exclude it
+                from profile/playbook extraction.
+            override_learning_stall: If True, run extraction even when
+                Reflexio has recorded a provider auth/billing stall. Keep
+                this False for automatic hook publishes; use it only for an
+                explicit retry after reauth or limit reset.
+            retrieval_experiment_id: Experiment ID returned by the learning
+                search used for this response. Supply together with
+                ``retrieval_experiment_arm``.
+            retrieval_experiment_arm: ``"treatment"`` or ``"holdout"`` as
+                returned by learning search. Supply together with the ID.
+
+        Returns:
+            PublishUserInteractionResponse: Server response.
+
+                In deferred mode (``wait_for_response=False``) the
+                response carries ``learning_status="deferred"`` and a
+                ``request_id``; ``profiles_added``/``playbooks_added`` are
+                0 because extraction has not run yet. Poll
+                ``get_learning_status(request_id)`` for completion.
+
+                In ``wait_for_response=True`` mode the server waits for
+                extraction and the response includes ``request_id``,
+                storage routing, and real profile/playbook deltas.
+
+                ``warnings`` reports anything quietly altered: unrecognised
+                interaction fields that were stripped (a key you sent did not
+                bind and its value was discarded — check for a typo), and
+                interactions that carried nothing and were skipped. Indices
+                refer to the list as you passed it. The list is bounded, so on
+                a large batch treat it as a sample.
+        """
+        request = self._build_publish_interaction_request(
+            user_id=user_id,
+            interactions=interactions,
+            source=source,
+            agent_version=agent_version,
+            session_id=session_id,
+            skip_aggregation=skip_aggregation,
+            force_extraction=force_extraction,
+            session_finished=session_finished,
+            evaluation_only=evaluation_only,
+            override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
+        )
+        result = self._publish_interaction_sync(
+            request, wait_for_response=wait_for_response
+        )
+        # Merge the warnings detected locally. Building InteractionData above
+        # already stripped the caller's unknown keys, so request.model_dump()
+        # sends a clean payload and the server never sees them -- it cannot echo
+        # what it was never told. Without this, unrecognised fields are reported
+        # over raw HTTP but invisible through the SDK, which is the primary
+        # integration path and the one this method's docstring promises.
+        return self._finalize_publish_response(request, result)
+
+    async def publish_interaction_async(
+        self,
+        user_id: str,
+        interactions: Sequence[InteractionData | dict],
+        source: str = "",
+        agent_version: str = DEFAULT_AGENT_VERSION,
+        session_id: str | None = None,
+        wait_for_response: bool = False,
+        skip_aggregation: bool = False,
+        force_extraction: bool = False,
+        evaluation_only: bool = False,
+        override_learning_stall: bool = False,
+        retrieval_experiment_id: str | None = None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None,
+        session_finished: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Native-async counterpart to :meth:`publish_interaction`."""
+        request = self._build_publish_interaction_request(
+            user_id=user_id,
+            interactions=interactions,
+            source=source,
+            agent_version=agent_version,
+            session_id=session_id,
+            skip_aggregation=skip_aggregation,
+            force_extraction=force_extraction,
+            session_finished=session_finished,
+            evaluation_only=evaluation_only,
+            override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
+        )
+        result = await self._publish_interaction_async(
+            request, wait_for_response=wait_for_response
+        )
+        return self._finalize_publish_response(request, result)
+
+    def get_learning_status(self, request_id: str) -> str:
+        """Poll the learning status for a previously published request.
+
+        Call this after a deferred ``publish_interaction`` (where
+        ``wait_for_response=False``).  The response carries
+        ``learning_status="deferred"`` to signal that extraction has been
+        accepted durably; use this method to track cursor coverage. A partial
+        window waits for enough new interactions or an explicit force request.
+
+        Args:
+            request_id: The ``request_id`` of the published interaction, as
+                returned in ``PublishUserInteractionResponse.request_id``
+                (populated on both the deferred and ``wait_for_response=True``
+                paths) or known by the caller.
+
+        Returns:
+            One of: ``"pending"`` | ``"processing"`` | ``"done"`` | ``"not_tracked"``.
+            Older servers may also return ``"failed"``.
+
+        Raises:
+            requests.HTTPError: 404 when the request_id is not known to the
+                server for this org.
+        """
+        response = self._make_request(
+            "GET",
+            "/api/learning_status",
+            params={"request_id": request_id},
+        )
+        return str(response["status"])
+
+    def search_interactions(
+        self,
+        request: SearchInteractionRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        most_recent_k: int | None = None,
+        threshold: float | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchInteractionsViewResponse:
+        """Search for user interactions.
+
+        Args:
+            request (Optional[SearchInteractionRequest]): The search request object (alternative to kwargs)
+            user_id (str): The user ID to search for
+            request_id (Optional[str]): Filter by specific request ID
+            query (Optional[str]): Search query string
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+            top_k (Optional[int]): Maximum number of results to return
+            most_recent_k (Optional[int]): Return most recent k interactions
+            threshold (Optional[float]): Similarity threshold. When omitted,
+                the embedding model's default is used.
+
+        Returns:
+            SearchInteractionsViewResponse: Response containing matching interactions
+        """
+        req = self._build_request(
+            request,
+            SearchInteractionRequest,
+            user_id=user_id,
+            request_id=request_id,
+            query=query,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            most_recent_k=most_recent_k,
+            threshold=threshold,
+            search_mode=search_mode,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/search_interactions",
+            json=req.model_dump(mode="json"),
+        )
+        return SearchInteractionsViewResponse(**response)
+
+    def search_user_profiles(
+        self,
+        request: SearchUserProfileRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        generated_from_request_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        source: str | None = None,
+        custom_feature: str | None = None,
+        extractor_name: str | None = None,
+        tags: list[str] | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchProfilesViewResponse:
+        """Search for user profiles.
+
+        Args:
+            request (Optional[SearchUserProfileRequest]): The search request object (alternative to kwargs)
+            user_id (str): The user ID to search for
+            generated_from_request_id (Optional[str]): Filter by request ID that generated the profile
+            query (Optional[str]): Search query string
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+            top_k (Optional[int]): Maximum number of results to return (default: 10)
+            source (Optional[str]): Filter by source
+            custom_feature (Optional[str]): Filter by custom feature
+            extractor_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
+            tags (Optional[list[str]]): Match profiles having any of these tags.
+            threshold (Optional[float]): Similarity threshold. When omitted,
+                the embedding model's default is used.
+            enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
+
+        Returns:
+            SearchProfilesViewResponse: Response containing matching profiles
+        """
+        req = self._build_request(
+            request,
+            SearchUserProfileRequest,
+            user_id=user_id,
+            generated_from_request_id=generated_from_request_id,
+            query=query,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            source=source,
+            custom_feature=custom_feature,
+            extractor_name=extractor_name,
+            tags=tags,
+            threshold=threshold,
+            enable_reformulation=enable_reformulation,
+            search_mode=search_mode,
+        )
+        response = self._make_request(
+            "POST", "/api/search_profiles", json=req.model_dump(mode="json")
+        )
+        return SearchProfilesViewResponse(**response)
+
+    # NOTE: keep signature in sync with search_user_profiles
+    def search_profiles(
+        self,
+        request: SearchUserProfileRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        generated_from_request_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        source: str | None = None,
+        custom_feature: str | None = None,
+        extractor_name: str | None = None,
+        tags: list[str] | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchProfilesViewResponse:
+        """Deprecated alias for :meth:`search_user_profiles`. Will be removed in a future release."""
+        warnings.warn(
+            "ReflexioClient.search_profiles() is deprecated; use "
+            "search_user_profiles() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.search_user_profiles(
+            request,
+            user_id=user_id,
+            generated_from_request_id=generated_from_request_id,
+            query=query,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            source=source,
+            custom_feature=custom_feature,
+            extractor_name=extractor_name,
+            tags=tags,
+            threshold=threshold,
+            enable_reformulation=enable_reformulation,
+            search_mode=search_mode,
+        )
+
+    def rerank_user_profiles(
+        self,
+        request: RerankUserProfilesRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        query: str | None = None,
+        profile_ids: list[str] | None = None,
+        top_k: int | None = None,
+    ) -> SearchProfilesViewResponse:
+        """Rerank a list of profile ids by query relevance using a cross-encoder.
+
+        The server fetches each candidate's full content (filtered by
+        ``user_id``), scores ``(query, content)`` pairs with a CPU
+        cross-encoder, and returns the top_k profiles sorted by descending
+        score. Profile ids that don't exist for the user are silently dropped.
+
+        Args:
+            request (Optional[RerankUserProfilesRequest]): The rerank request
+                object (alternative to kwargs)
+            user_id (Optional[str]): The user whose profiles to rerank
+            query (Optional[str]): The reranking query
+            profile_ids (Optional[list[str]]): Candidate profile ids to score
+            top_k (Optional[int]): Maximum profiles to return (default: 10)
+
+        Returns:
+            SearchProfilesViewResponse: Reranked profiles, top_k entries
+        """
+        req = self._build_request(
+            request,
+            RerankUserProfilesRequest,
+            user_id=user_id,
+            query=query,
+            profile_ids=profile_ids,
+            top_k=top_k,
+        )
+        response = self._make_request(
+            "POST", "/api/rerank_user_profiles", json=req.model_dump(mode="json")
+        )
+        return SearchProfilesViewResponse(**response)
+
+    def storage_stats(
+        self,
+        user_id: str,
+    ) -> StorageStatsResponse:
+        """Get a quick count of how many profiles/playbooks the user has.
+
+        Returns counts and the modified-time range across every status —
+        useful for sizing ``top_k`` before retrieval.
+
+        Args:
+            user_id (str): The user to inspect.
+
+        Returns:
+            StorageStatsResponse: Counts and timestamp range for the user.
+        """
+        response = self._make_request(
+            "GET", "/api/storage_stats", params={"user_id": user_id}
+        )
+        return StorageStatsResponse(**response)
+
+    def search_user_playbooks(
+        self,
+        request: SearchUserPlaybookRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        user_id: str | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+    ) -> SearchUserPlaybooksViewResponse:
+        """Search for user playbooks with semantic/text search and filtering.
+
+        Args:
+            request (Optional[SearchUserPlaybookRequest]): The search request object (alternative to kwargs)
+            query (Optional[str]): Query for semantic/text search
+            user_id (Optional[str]): Filter by user (via request_id linkage to requests table)
+            agent_version (Optional[str]): Filter by agent version
+            playbook_name (Optional[str]): Filter by playbook name
+            source (Optional[str]): Filter by exact interaction source.
+            start_time (Optional[datetime]): Start time for created_at filter
+            end_time (Optional[datetime]): End time for created_at filter
+            status_filter (Optional[list[Optional[Status]]]): Filter by status (None for CURRENT, PENDING, ARCHIVED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
+            top_k (Optional[int]): Maximum results to return, from 1 to 100 (default: 10)
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
+            enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
+            request_id (Optional[str]): Caller correlation ID for the search turn,
+                at most 255 characters.
+            session_id (Optional[str]): Caller session ID for the search turn,
+                at most 255 characters.
+
+        Returns:
+            SearchUserPlaybooksViewResponse: Response containing matching user playbooks
+        """
+        req = self._build_request(
+            request,
+            SearchUserPlaybookRequest,
+            query=query,
+            user_id=user_id,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            status_filter=status_filter,
+            tags=tags,
+            top_k=top_k,
+            threshold=threshold,
+            enable_reformulation=enable_reformulation,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=session_id,
+        )
+        response = self._make_request(
+            "POST", "/api/search_user_playbooks", json=req.model_dump(mode="json")
+        )
+        return SearchUserPlaybooksViewResponse(**response)
+
+    def search_agent_playbooks(
+        self,
+        request: SearchAgentPlaybookRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        user_id: str | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchAgentPlaybooksViewResponse:
+        """Search for agent playbooks with semantic/text search and filtering.
+
+        Args:
+            request (Optional[SearchAgentPlaybookRequest]): The search request object (alternative to kwargs)
+            query (Optional[str]): Query for semantic/text search
+            user_id (Optional[str]): User receiving the playbooks. Used for
+                retrieval-experiment assignment; it does not filter agent playbooks.
+            agent_version (Optional[str]): Filter by agent version
+            playbook_name (Optional[str]): Filter by playbook name
+            source (Optional[str]): Match agent playbooks linked to at least one
+                user playbook with this exact source.
+            start_time (Optional[datetime]): Start time for created_at filter
+            end_time (Optional[datetime]): End time for created_at filter
+            status_filter (Optional[list[Optional[Status]]]): Filter by lifecycle status.
+                Defaults to CURRENT and PENDING when omitted.
+            playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (PENDING, APPROVED, REJECTED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
+            top_k (Optional[int]): Maximum number of results to return (default: 10)
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
+            enable_reformulation (Optional[bool]): Enable LLM query reformulation (default: False)
+
+        Returns:
+            SearchAgentPlaybooksViewResponse: Response containing matching agent playbooks
+        """
+        req = self._build_request(
+            request,
+            SearchAgentPlaybookRequest,
+            query=query,
+            user_id=user_id,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            status_filter=status_filter,
+            playbook_status_filter=playbook_status_filter,
+            tags=tags,
+            top_k=top_k,
+            threshold=threshold,
+            enable_reformulation=enable_reformulation,
+            search_mode=search_mode,
+        )
+        response = self._make_request(
+            "POST", "/api/search_agent_playbooks", json=req.model_dump(mode="json")
+        )
+        return SearchAgentPlaybooksViewResponse(**response)
+
+    def _delete_profile_sync(
+        self, request: DeleteUserProfileRequest
+    ) -> DeleteUserProfileResponse:
+        """Internal sync method to delete profile."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_profile",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserProfileResponse(**response)
+
+    async def _delete_profile_async(
+        self, request: DeleteUserProfileRequest
+    ) -> DeleteUserProfileResponse:
+        """Internal async method to delete profile."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_profile",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserProfileResponse(**response)
+
+    def delete_profile(
+        self,
+        user_id: str,
+        profile_id: str = "",
+        search_query: str = "",
+        wait_for_response: bool = False,
+    ) -> DeleteUserProfileResponse | None:
+        """Delete user profiles.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            user_id (str): The user ID
+            profile_id (str, optional): Specific profile ID to delete
+            search_query (str, optional): Query to match profiles for deletion
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteUserProfileResponse]: Response containing success status and message if wait_for_response=True, None otherwise
+        """
+        request = DeleteUserProfileRequest(
+            user_id=user_id,
+            profile_id=profile_id,
+            search_query=search_query,
+        )
+
+        self._cache.invalidate("get_profiles")
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_profile_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_profile_async, request)
+        return None
+
+    def _delete_interaction_sync(
+        self, request: DeleteUserInteractionRequest
+    ) -> DeleteUserInteractionResponse:
+        """Internal sync method to delete interaction."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_interaction",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserInteractionResponse(**response)
+
+    async def _delete_interaction_async(
+        self, request: DeleteUserInteractionRequest
+    ) -> DeleteUserInteractionResponse:
+        """Internal async method to delete interaction."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_interaction",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserInteractionResponse(**response)
+
+    def delete_interaction(
+        self, user_id: str, interaction_id: int, wait_for_response: bool = False
+    ) -> DeleteUserInteractionResponse | None:
+        """Delete a user interaction.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            user_id (str): The user ID
+            interaction_id (int): The interaction ID to delete
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteUserInteractionResponse]: Response containing success status and message if wait_for_response=True, None otherwise
+        """
+        request = DeleteUserInteractionRequest(
+            user_id=user_id,
+            interaction_id=interaction_id,
+        )
+
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_interaction_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_interaction_async, request)
+        return None
+
+    def _delete_request_sync(
+        self, request: DeleteRequestRequest
+    ) -> DeleteRequestResponse:
+        """Internal sync method to delete request."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_request",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteRequestResponse(**response)
+
+    async def _delete_request_async(
+        self, request: DeleteRequestRequest
+    ) -> DeleteRequestResponse:
+        """Internal async method to delete request."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_request",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteRequestResponse(**response)
+
+    def delete_request(
+        self, request_id: str, wait_for_response: bool = False
+    ) -> DeleteRequestResponse | None:
+        """Delete a request and all its associated interactions.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            request_id (str): The request ID to delete
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteRequestResponse]: Response containing success status and message if wait_for_response=True, None otherwise
+        """
+        request = DeleteRequestRequest(request_id=request_id)
+
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_request_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_request_async, request)
+        return None
+
+    def _delete_session_sync(
+        self, request: DeleteSessionRequest
+    ) -> DeleteSessionResponse:
+        """Internal sync method to delete session."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_session",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteSessionResponse(**response)
+
+    async def _delete_session_async(
+        self, request: DeleteSessionRequest
+    ) -> DeleteSessionResponse:
+        """Internal async method to delete session."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_session",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteSessionResponse(**response)
+
+    def delete_session(
+        self, session_id: str, wait_for_response: bool = False
+    ) -> DeleteSessionResponse | None:
+        """Delete all requests and interactions in a session.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            session_id (str): The session ID to delete
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteSessionResponse]: Response containing success status, message, and deleted count if wait_for_response=True, None otherwise
+        """
+        request = DeleteSessionRequest(session_id=session_id)
+
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_session_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_session_async, request)
+        return None
+
+    def mark_session_outcome(
+        self,
+        *,
+        session_id: str,
+        outcome: SessionOutcomeKind | str,
+        occurred_at: int,
+        label: str | None = None,
+        value: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SetSessionOutcomeResponse:
+        """Record the outcome of a published session.
+
+        The session must already contain at least one published request. Reflexio
+        derives both ``user_id`` and ``source`` from the earliest request ordered
+        by ``(created_at, request_id)``. New canonical rows bind the outcome to
+        the server-owned outcome contract and canonical finalized trajectory. An
+        exact canonical retry must match the payload, contract, and trajectory;
+        otherwise it is rejected with ``reason="conflicting_finalization"``.
+
+        Your report wins over one Reflexio inferred for itself. Where a
+        session already carries an inferred outcome, this REPLACES it and
+        returns ``recorded=True`` with a FRESH ``outcome_id`` and
+        ``outcome_revision=2`` -- the replacement is a different outcome, so it
+        gets its own identity rather than inheriting the one it replaced. The
+        inferred outcome is retained internally for analysis. That is the only
+        case in which a stored outcome is replaced -- an outcome you reported
+        yourself stays immutable, and its ``outcome_id`` never changes. The
+        replacement is refused, with ``reason="conflicting_finalization"``,
+        when the session's earliest request no longer resolves to the user the
+        stored outcome is filed under -- replacing it would move one user's
+        recorded outcome under another's, so the stored outcome is kept
+        instead.
+
+        Reflexio may also re-derive an outcome it inferred, in place, as the
+        session it was judged from grows. That never touches an outcome you
+        reported, and it is not something this call can trigger. It is visible
+        only through :meth:`get_session_outcomes`, where such a row's verdict,
+        ``occurred_at`` and digests can change while its ``outcome_id`` and
+        ``outcome_revision`` stay exactly as they were; ``is_inferred`` on the
+        returned record is how you tell such a row from your own.
+        Rolling-upgrade rows with all four identity fields null compare the
+        caller payload and any available server-derived session context, but
+        cannot compare absent contract or trajectory digests. An accepted retry
+        preserves all four null identity fields and returns ``success=True`` and
+        ``recorded=False``. Sessions may report ``success``, ``failure``, or
+        ``unknown`` and are not required to report an outcome.
+        """
+        request = SetSessionOutcomeRequest(
+            session_id=session_id,
+            outcome=SessionOutcomeKind(outcome),
+            occurred_at=occurred_at,
+            label=label,
+            value=value,
+            metadata=metadata,
+        )
+        response = self._make_request(
+            "POST", "/api/session_outcome", json=request.model_dump(mode="json")
+        )
+        return SetSessionOutcomeResponse(**response)
+
+    def get_session_outcomes(
+        self,
+        *,
+        session_ids: list[str] | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        outcome: SessionOutcomeKind | str | None = None,
+        label: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        top_k: int = 100,
+        offset: int = 0,
+    ) -> GetSessionOutcomesResponse:
+        """Read session outcomes using exact optional filters."""
+        payload = GetSessionOutcomesRequest(
+            session_ids=session_ids,
+            user_id=user_id,
+            source=source,
+            outcome=SessionOutcomeKind(outcome) if outcome is not None else None,
+            label=label,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            offset=offset,
+        )
+        response = self._make_request(
+            "POST", "/api/get_session_outcomes", json=payload.model_dump(mode="json")
+        )
+        return GetSessionOutcomesResponse(**response)
+
+    def _delete_agent_playbook_sync(
+        self, request: DeleteAgentPlaybookRequest
+    ) -> DeleteAgentPlaybookResponse:
+        """Internal sync method to delete agent playbook."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_agent_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteAgentPlaybookResponse(**response)
+
+    async def _delete_agent_playbook_async(
+        self, request: DeleteAgentPlaybookRequest
+    ) -> DeleteAgentPlaybookResponse:
+        """Internal async method to delete agent playbook."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_agent_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteAgentPlaybookResponse(**response)
+
+    def delete_agent_playbook(
+        self, agent_playbook_id: int, wait_for_response: bool = False
+    ) -> DeleteAgentPlaybookResponse | None:
+        """Delete an agent playbook by ID.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            agent_playbook_id (int): The agent playbook ID to delete
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteAgentPlaybookResponse]: Response containing success status and message if wait_for_response=True, None otherwise
+        """
+        request = DeleteAgentPlaybookRequest(agent_playbook_id=agent_playbook_id)
+
+        self._cache.invalidate("get_agent_playbooks")
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_agent_playbook_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_agent_playbook_async, request)
+        return None
+
+    def _delete_user_playbook_sync(
+        self, request: DeleteUserPlaybookRequest
+    ) -> DeleteUserPlaybookResponse:
+        """Internal sync method to delete user playbook."""
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_user_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserPlaybookResponse(**response)
+
+    async def _delete_user_playbook_async(
+        self, request: DeleteUserPlaybookRequest
+    ) -> DeleteUserPlaybookResponse:
+        """Internal async method to delete user playbook."""
+        response = await self._make_async_request(
+            "DELETE",
+            "/api/delete_user_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return DeleteUserPlaybookResponse(**response)
+
+    def delete_user_playbook(
+        self, user_playbook_id: int, wait_for_response: bool = False
+    ) -> DeleteUserPlaybookResponse | None:
+        """Delete a user playbook by ID.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            user_playbook_id (int): The user playbook ID to delete
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+
+        Returns:
+            Optional[DeleteUserPlaybookResponse]: Response containing success status and message if wait_for_response=True, None otherwise
+        """
+        request = DeleteUserPlaybookRequest(user_playbook_id=user_playbook_id)
+
+        if wait_for_response:
+            # Synchronous blocking call
+            return self._delete_user_playbook_sync(request)
+        # Non-blocking fire-and-forget
+        self._fire_and_forget(self._delete_user_playbook_async, request)
+        return None
+
+    def get_profile_change_log(self) -> ProfileChangeLogViewResponse:
+        """Get profile change log.
+
+        Returns:
+            ProfileChangeLogViewResponse: Response containing profile change log
+        """
+        response = self._make_request("GET", "/api/profile_change_log")
+        return ProfileChangeLogViewResponse(**response)
+
+    def get_interactions(
+        self,
+        request: GetInteractionsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+    ) -> GetInteractionsViewResponse:
+        """Get user interactions.
+
+        Args:
+            request (Optional[GetInteractionsRequest]): The list request object (alternative to kwargs)
+            user_id (str): The user ID to get interactions for
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+            top_k (Optional[int]): Maximum number of results to return (default: 30)
+
+        Returns:
+            GetInteractionsViewResponse: Response containing list of interactions
+        """
+        req = self._build_request(
+            request,
+            GetInteractionsRequest,
+            user_id=user_id,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_interactions",
+            json=req.model_dump(mode="json"),
+        )
+        return GetInteractionsViewResponse(**response)
+
+    def get_profiles(
+        self,
+        request: GetUserProfilesRequest | dict | None = None,
+        force_refresh: bool = False,
+        *,
+        user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        status_filter: list[Status | str | None] | None = None,
+        tags: list[str] | None = None,
+    ) -> GetProfilesViewResponse:
+        """Get user profiles.
+
+        Args:
+            request (Optional[GetUserProfilesRequest]): The list request object (alternative to kwargs)
+            force_refresh (bool, optional): If True, bypass cache and fetch fresh data. Defaults to False.
+            user_id (str): The user ID to get profiles for
+            profile_id (Optional[str]): Exact profile ID filter.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+            top_k (Optional[int]): Maximum number of results to return (default: 30)
+            source (Optional[str]): Filter by profile source.
+            profile_time_to_live (Optional[str]): Filter by profile TTL value.
+            status_filter (Optional[list[Optional[Union[Status, str]]]]): Filter by profile status. Accepts Status enum or string values (e.g., "archived", "pending").
+            tags (Optional[list[str]]): Match profiles having any of these tags.
+
+        Returns:
+            GetProfilesViewResponse: Response containing list of profiles
+        """
+        # Convert string status values to Status enum
+        converted_status_filter = None
+        if status_filter is not None:
+            converted_status_filter = []
+            for status in status_filter:
+                if status is None:
+                    converted_status_filter.append(None)
+                elif isinstance(status, str):
+                    converted_status_filter.append(Status(status))
+                else:
+                    converted_status_filter.append(status)
+
+        req = self._build_request(
+            request,
+            GetUserProfilesRequest,
+            user_id=user_id,
+            profile_id=profile_id,
+            query=query,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            source=source,
+            profile_time_to_live=profile_time_to_live,
+            status_filter=converted_status_filter,
+            tags=tags,
+        )
+
+        # Check cache if not forcing refresh
+        if not force_refresh:
+            cached_result = self._cache.get(
+                "get_profiles",
+                user_id=req.user_id,
+                profile_id=req.profile_id,
+                query=req.query,
+                start_time=req.start_time,
+                end_time=req.end_time,
+                top_k=req.top_k,
+                source=req.source,
+                profile_time_to_live=req.profile_time_to_live,
+                status_filter=req.status_filter,
+                tags=req.tags,
+            )
+            if cached_result is not None:
+                return cached_result
+
+        # Make API call
+        response = self._make_request(
+            "POST",
+            "/api/get_profiles",
+            json=req.model_dump(mode="json"),
+        )
+        result = GetProfilesViewResponse(**response)
+
+        # Store in cache
+        self._cache.set(
+            "get_profiles",
+            result,
+            user_id=req.user_id,
+            profile_id=req.profile_id,
+            query=req.query,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            top_k=req.top_k,
+            source=req.source,
+            profile_time_to_live=req.profile_time_to_live,
+            status_filter=req.status_filter,
+            tags=req.tags,
+        )
+
+        return result
+
+    def get_all_interactions(
+        self,
+        limit: int = 100,
+    ) -> GetInteractionsViewResponse:
+        """Get all user interactions across all users.
+
+        Args:
+            limit (int, optional): Maximum number of interactions to return. Defaults to 100.
+
+        Returns:
+            GetInteractionsViewResponse: Response containing all user interactions
+        """
+        response = self._make_request(
+            "GET",
+            f"/api/get_all_interactions?limit={limit}",
+        )
+        return GetInteractionsViewResponse(**response)
+
+    def get_all_profiles(
+        self,
+        limit: int = 100,
+        status_filter: str | None = None,
+        user_id: str | None = None,
+        profile_id: str | None = None,
+        query: str | None = None,
+        source: str | None = None,
+        profile_time_to_live: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        date_field: Literal[
+            "last_modified_timestamp", "created_at"
+        ] = "last_modified_timestamp",
+    ) -> GetProfilesViewResponse:
+        """Get all user profiles across all users.
+
+        Args:
+            limit (int, optional): Maximum number of profiles to return. Defaults to 100.
+            status_filter (str, optional): Filter by profile status. Accepts
+                ``"current"``, ``"pending"``, or ``"archived"``. If ``None``
+                (the default), profiles with any status are returned.
+            user_id (str, optional): Filter by exact user ID.
+            profile_id (str, optional): Filter by exact profile ID.
+            query (str, optional): Case-insensitive text filter across visible fields.
+            source (str, optional): Filter by exact profile source.
+            profile_time_to_live (str, optional): Filter by profile TTL value.
+            start_time (int, optional): Inclusive minimum epoch seconds for date_field.
+            end_time (int, optional): Inclusive maximum epoch seconds for date_field.
+            date_field: Date column to filter; defaults to last_modified_timestamp.
+                Use created_at for creation-time cohorts.
+
+        Returns:
+            GetProfilesViewResponse: Response containing all user profiles
+        """
+        from urllib.parse import urlencode
+
+        params: dict[str, str | int] = {"limit": limit}
+        if status_filter:
+            params["status_filter"] = status_filter
+        params.update(
+            {
+                key: value
+                for key, value in {
+                    "user_id": user_id,
+                    "profile_id": profile_id,
+                    "query": query,
+                    "source": source,
+                    "profile_time_to_live": profile_time_to_live,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "date_field": date_field
+                    if date_field != "last_modified_timestamp"
+                    else None,
+                }.items()
+                if value is not None
+            }
+        )
+        response = self._make_request(
+            "GET",
+            f"/api/get_all_profiles?{urlencode(params)}",
+        )
+        return GetProfilesViewResponse(**response)
+
+    def set_config(self, config: Config | dict) -> dict:
+        """Set configuration for the organization.
+
+        Args:
+            config (Union[Config, dict]): The configuration to set
+
+        Returns:
+            dict: Response containing success status and message
+        """
+        if isinstance(config, Config):
+            config = Config.model_validate(
+                config.model_dump(mode="python"),
+                extra="ignore",
+            )
+        else:
+            config = self._convert_to_model(  # type: ignore[reportAssignmentType]
+                config,
+                Config,
+            )
+        return self._make_request(
+            "POST",
+            "/api/set_config",
+            json=config.model_dump(mode="json"),  # type: ignore[reportAttributeAccessIssue]
+        )
+
+    def update_config(self, partial: dict) -> dict:
+        """Apply a partial (PATCH-style) update to the org config.
+
+        Unlike :meth:`set_config`, this does NOT round-trip the payload
+        through ``Config(**...)`` client-side, so partial updates like
+        ``{"shadow_mode_enabled": true}`` succeed without needing
+        the caller to also re-send required fields like ``storage_config``.
+        The server fetches the existing config and shallow-merges
+        atomically — there is no client-side read-modify-write race.
+
+        Nested objects (e.g. ``storage_config``, ``llm_config``) are
+        replaced wholesale; deep merging is intentionally not supported.
+
+        Args:
+            partial: Top-level fields to overlay on the existing config.
+                Unknown keys are rejected server-side.
+
+        Returns:
+            dict: ``{"success": bool, "msg": str}`` from the server.
+
+        Raises:
+            TypeError: If *partial* is not a ``dict``.
+        """
+        if not isinstance(partial, dict):
+            raise TypeError(
+                f"update_config requires a dict, got {type(partial).__name__}"
+            )
+        return self._make_request("POST", "/api/update_config", json=partial)
+
+    def list_retrieval_experiments(self) -> RetrievalExperimentListResponse:
+        """List the active and historical user-level retrieval experiments."""
+        response = self._make_request("GET", "/api/retrieval_experiments")
+        return RetrievalExperimentListResponse(**response)
+
+    def start_retrieval_experiment(
+        self, experiment_id: str, holdout_percentage: float
+    ) -> RetrievalExperimentListResponse:
+        """Start the organization's only active retrieval experiment."""
+        request = StartRetrievalExperimentRequest(
+            experiment_id=experiment_id,
+            holdout_percentage=holdout_percentage,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/retrieval_experiments",
+            json=request.model_dump(mode="json"),
+        )
+        return RetrievalExperimentListResponse(**response)
+
+    def stop_retrieval_experiment(
+        self, experiment_id: str
+    ) -> RetrievalExperimentListResponse:
+        """Stop the active retrieval experiment while retaining its history."""
+        request = StopRetrievalExperimentRequest(experiment_id=experiment_id)
+        response = self._make_request(
+            "POST",
+            "/api/retrieval_experiments/stop",
+            json=request.model_dump(mode="json"),
+        )
+        return RetrievalExperimentListResponse(**response)
+
+    def get_retrieval_experiment_results(
+        self, experiment_id: str
+    ) -> RetrievalExperimentResultsResponse:
+        """Return session-success metrics grouped by the users' assigned arms."""
+        response = self._make_request(
+            "GET",
+            f"/api/retrieval_experiments/{experiment_id}/results",
+        )
+        return RetrievalExperimentResultsResponse(**response)
+
+    def get_config(self) -> ConfigResponse:
+        """Get configuration for the organization.
+
+        Returns:
+            ConfigResponse: The current configuration, including response overlays.
+        """
+        response = self._make_request(
+            "GET",
+            "/api/get_config",
+        )
+        return ConfigResponse(**response)
+
+    def invalidate_cache(self, org_id: str | None = None) -> dict:
+        """Explicitly evict the server-side per-org Reflexio cache entry.
+
+        Useful when the running config has been mutated through a
+        channel the server can't observe (sibling-replica writes,
+        direct DB updates, hand-edited config files on backends that
+        don't support cheap version probing). Phase 1 mtime-based
+        auto-invalidation and Phase 3 DB-version probing cover most
+        cases automatically; this is the manual escape hatch.
+
+        Cross-org invalidation is intentionally not supported: the
+        endpoint only ever invalidates the caller's own org. The
+        ``org_id`` argument is a verification token — when provided
+        it must match the token's authenticated org or the server
+        rejects with 403.
+
+        Args:
+            org_id: Optional org_id to verify against the caller's
+                authenticated identity. Omit to let the server
+                resolve it from the auth header.
+
+        Returns:
+            dict: ``{"invalidated": bool, "org_id": str}``. The
+            ``invalidated`` flag is False when nothing was cached for
+            the org (still a successful no-op).
+        """
+        body: dict[str, str] = {}
+        if org_id is not None:
+            body["org_id"] = org_id
+        return self._make_request("POST", "/api/admin/cache/invalidate", json=body)
+
+    def get_user_playbooks(
+        self,
+        request: GetUserPlaybooksRequest | dict | None = None,
+        *,
+        limit: int | None = None,
+        user_playbook_id: int | None = None,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        query: str | None = None,
+        playbook_name: str | None = None,
+        agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
+    ) -> GetUserPlaybooksViewResponse:
+        """Get user playbooks.
+
+        Args:
+            request (Optional[GetUserPlaybooksRequest]): The get request object (alternative to kwargs)
+            limit (Optional[int]): Maximum number of results to return (default: 100)
+            user_playbook_id (Optional[int]): Exact user playbook ID filter.
+            user_id (Optional[str]): Filter by user ID
+            request_id (Optional[str]): Filter by generating request ID.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
+            playbook_name (Optional[str]): Filter by playbook name
+            agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time.
+            end_time (Optional[datetime]): Filter by end time.
+            status_filter (Optional[list[Optional[Status]]]): Filter by status
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
+
+        Returns:
+            GetUserPlaybooksViewResponse: Response containing user playbooks
+        """
+        req = self._build_request(
+            request,
+            GetUserPlaybooksRequest,
+            limit=limit,
+            user_playbook_id=user_playbook_id,
+            user_id=user_id,
+            request_id=request_id,
+            query=query,
+            playbook_name=playbook_name,
+            agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
+            status_filter=status_filter,
+            tags=tags,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_user_playbooks",
+            json=req.model_dump(mode="json"),
+        )
+        return GetUserPlaybooksViewResponse(**response)
+
+    def review_user_playbooks(
+        self,
+        *,
+        start_time: datetime,
+        end_time: datetime,
+        top_k: int = 10,
+        report_only: bool = True,
+    ) -> ReviewUserPlaybooksResponse:
+        """Re-review current user playbooks created within a bounded window.
+
+        The default ``report_only=True`` runs inline and returns one decision per
+        selected playbook. Each playbook is reviewed from its full finalized
+        extraction-run window plus any cited consolidation evidence, independent
+        of the current extractor window size or source filter. Rows with missing
+        or invalid persisted provenance are skipped. Only cited interactions are
+        reviewer evidence; other run-window interactions provide chronology.
+
+        With ``report_only=False`` the server accepts the run and applies it in
+        the background, so the response carries only ``run_id`` — not
+        ``results``. The run reviews newest-first and commits each completed
+        decision before moving to the next playbook: accepted rows stay
+        unchanged, rejected rows are archived, and an edit inserts the
+        replacement as current while superseding its incumbent. Applied edits are
+        recorded on the replacement's lineage under ``run_id``.
+        """
+        request = ReviewUserPlaybooksRequest(
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            report_only=report_only,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/review_user_playbooks",
+            json=request.model_dump(mode="json"),
+            timeout=(
+                max(self.timeout, REVIEW_USER_PLAYBOOKS_TIMEOUT_SECONDS)
+                if report_only
+                else self.timeout
+            ),
+        )
+        return ReviewUserPlaybooksResponse(**response)
+
+    def add_user_playbook(
+        self,
+        user_playbooks: list[UserPlaybook | dict],
+    ) -> AddUserPlaybookResponse:
+        """Add user playbooks directly to storage.
+
+        Args:
+            user_playbooks (list[Union[UserPlaybook, dict]]): List of user playbooks to add.
+                Each user playbook should contain:
+                - agent_version (str): Required. The agent version.
+                - request_id (str): Required. The request ID.
+                - content (str): Required. The playbook content.
+                - playbook_name (str): Optional. The playbook name/category.
+
+        Returns:
+            AddUserPlaybookResponse: Response containing success status, message, and added count.
+        """
+        # Convert dicts to UserPlaybook objects if needed
+        user_playbook_list = [
+            UserPlaybook(**rf) if isinstance(rf, dict) else rf for rf in user_playbooks
+        ]
+        request = AddUserPlaybookRequest(user_playbooks=user_playbook_list)
+        response = self._make_request(
+            "POST",
+            "/api/add_user_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return AddUserPlaybookResponse(**response)
+
+    def add_agent_playbooks(
+        self,
+        agent_playbooks: list[AgentPlaybook | dict],
+    ) -> AddAgentPlaybookResponse:
+        """Add agent playbooks directly to storage.
+
+        Args:
+            agent_playbooks (list[Union[AgentPlaybook, dict]]): List of agent playbooks to add.
+                Each agent playbook should contain:
+                - agent_version (str): Required. The agent version.
+                - content (str): Required. The playbook content.
+                - playbook_status (PlaybookStatus): Required. The playbook approval status.
+                - playbook_metadata (str): Required. Metadata about the playbook.
+                - playbook_name (str): Optional. The playbook name/category.
+
+        Returns:
+            AddAgentPlaybookResponse: Response containing success status, message, and added count.
+        """
+        # Convert dicts to AgentPlaybook objects if needed
+        agent_playbook_list = [
+            AgentPlaybook(**fb) if isinstance(fb, dict) else fb
+            for fb in agent_playbooks
+        ]
+        request = AddAgentPlaybookRequest(agent_playbooks=agent_playbook_list)
+        response = self._make_request(
+            "POST",
+            "/api/add_agent_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return AddAgentPlaybookResponse(**response)
+
+    @staticmethod
+    def _coerce_user_profile(profile: UserProfile | dict) -> UserProfile:
+        """Coerce a dict into a ``UserProfile``, filling in missing required fields.
+
+        Required fields on ``UserProfile`` that callers commonly omit
+        (``profile_id``, ``last_modified_timestamp``, ``generated_from_request_id``)
+        are filled in with sensible client-side defaults so that a minimal dict
+        like ``{"user_id": "u", "content": "x"}`` validates successfully.
+
+        Args:
+            profile (Union[UserProfile, dict]): The profile to coerce. If it is
+                already a ``UserProfile`` it is returned unchanged.
+
+        Returns:
+            UserProfile: A fully-populated ``UserProfile`` instance.
+        """
+        if isinstance(profile, UserProfile):
+            return profile
+        data = dict(profile)
+        data.setdefault("profile_id", new_profile_id())
+        data.setdefault("last_modified_timestamp", int(datetime.now(UTC).timestamp()))
+        data.setdefault("generated_from_request_id", "cli-manual")
+        data.setdefault("source", "cli-manual")
+        return UserProfile(**data)
+
+    def add_user_profile(
+        self,
+        user_profiles: list[UserProfile | dict],
+    ) -> AddUserProfileResponse:
+        """Add user profiles directly to storage, bypassing inference.
+
+        Mirror of :meth:`add_user_playbook` for the profile resource.
+        Useful for seeding a known fact about the user (testing,
+        migration, manual fact injection) without going through the
+        interaction-based generation pipeline. The server populates
+        the embedding automatically.
+
+        Args:
+            user_profiles (list[Union[UserProfile, dict]]): List of user profiles to add.
+                Each profile must contain at least:
+                - user_id (str): The user the profile belongs to.
+                - content (str): The profile content (used for embedding).
+                When passing dicts, missing required fields are auto-populated
+                client-side with sensible defaults: ``profile_id`` becomes a
+                canonical UUIDv4 string, ``last_modified_timestamp`` is set to
+                ``int(datetime.now(UTC).timestamp())``, and
+                ``generated_from_request_id`` defaults to ``"cli-manual"``.
+
+        Returns:
+            AddUserProfileResponse: Response containing success status, message, and added count.
+        """
+        user_profile_list = [self._coerce_user_profile(p) for p in user_profiles]
+        request = AddUserProfileRequest(user_profiles=user_profile_list)
+        response = self._make_request(
+            "POST",
+            "/api/add_user_profile",
+            json=request.model_dump(mode="json"),
+        )
+        return AddUserProfileResponse(**response)
+
+    def update_user_playbook(
+        self,
+        user_playbook_id: int,
+        *,
+        playbook_name: str | None = None,
+        content: str | None = None,
+        trigger: str | None = None,
+        rationale: str | None = None,
+    ) -> UpdateUserPlaybookResponse:
+        """Update editable fields of a user playbook in place.
+
+        Pass only the fields you want to change. Fields left as
+        ``None`` are not touched on the server side.
+
+        Args:
+            user_playbook_id (int): The ID of the user playbook to update.
+            playbook_name (Optional[str]): New playbook category name.
+            content (Optional[str]): New content text.
+            trigger (Optional[str]): New trigger condition.
+            rationale (Optional[str]): New rationale text.
+
+        Returns:
+            UpdateUserPlaybookResponse: Response containing success status and message.
+        """
+        request = UpdateUserPlaybookRequest(
+            user_playbook_id=user_playbook_id,
+            playbook_name=playbook_name,
+            content=content,
+            trigger=trigger,
+            rationale=rationale,
+        )
+        response = self._make_request(
+            "PUT",
+            "/api/update_user_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        return UpdateUserPlaybookResponse(**response)
+
+    def update_agent_playbook(
+        self,
+        agent_playbook_id: int,
+        *,
+        playbook_name: str | None = None,
+        content: str | None = None,
+        trigger: str | None = None,
+        rationale: str | None = None,
+        playbook_status: PlaybookStatus | None = None,
+    ) -> UpdateAgentPlaybookResponse:
+        """Update editable fields of an agent playbook in place.
+
+        Pass only the fields you want to change. To change ONLY the
+        approval status, prefer :meth:`update_agent_playbook_status` —
+        it has tighter semantics and a single-purpose endpoint.
+
+        Args:
+            agent_playbook_id (int): The ID of the agent playbook to update.
+            playbook_name (Optional[str]): New playbook category name.
+            content (Optional[str]): New content text.
+            trigger (Optional[str]): New trigger condition.
+            rationale (Optional[str]): New rationale text.
+            playbook_status (Optional[PlaybookStatus]): New approval status.
+
+        Returns:
+            UpdateAgentPlaybookResponse: Response containing success status and message.
+        """
+        request = UpdateAgentPlaybookRequest(
+            agent_playbook_id=agent_playbook_id,
+            playbook_name=playbook_name,
+            content=content,
+            trigger=trigger,
+            rationale=rationale,
+            playbook_status=playbook_status,
+        )
+        response = self._make_request(
+            "PUT",
+            "/api/update_agent_playbook",
+            json=request.model_dump(mode="json"),
+        )
+        self._cache.invalidate("get_agent_playbooks")
+        return UpdateAgentPlaybookResponse(**response)
+
+    def update_agent_playbook_status(
+        self,
+        agent_playbook_id: int,
+        *,
+        playbook_status: PlaybookStatus,
+    ) -> UpdatePlaybookStatusResponse:
+        """Update only the approval status of an agent playbook.
+
+        This is the dedicated endpoint for the approval workflow
+        (approve / pending / reject). Use it instead of
+        :meth:`update_agent_playbook` when the only change is the
+        ``playbook_status`` — the server enforces tighter validation
+        and writes a smaller change log.
+
+        Args:
+            agent_playbook_id (int): The ID of the agent playbook.
+            playbook_status (PlaybookStatus): New approval status
+                (``PENDING``, ``APPROVED``, or ``REJECTED``).
+
+        Returns:
+            UpdatePlaybookStatusResponse: Response containing success status and message.
+        """
+        request = UpdatePlaybookStatusRequest(
+            agent_playbook_id=agent_playbook_id,
+            playbook_status=playbook_status,
+        )
+        response = self._make_request(
+            "PUT",
+            "/api/update_agent_playbook_status",
+            json=request.model_dump(mode="json"),
+        )
+        self._cache.invalidate("get_agent_playbooks")
+        return UpdatePlaybookStatusResponse(**response)
+
+    def get_agent_playbooks(
+        self,
+        request: GetAgentPlaybooksRequest | dict | None = None,
+        force_refresh: bool = False,
+        *,
+        limit: int | None = None,
+        agent_playbook_id: int | None = None,
+        query: str | None = None,
+        playbook_name: str | None = None,
+        agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
+    ) -> GetAgentPlaybooksViewResponse:
+        """Get agent playbooks.
+
+        Args:
+            request (Optional[GetAgentPlaybooksRequest]): The get request object (alternative to kwargs)
+            force_refresh (bool, optional): If True, bypass cache and fetch fresh data. Defaults to False.
+            limit (Optional[int]): Maximum number of results to return (default: 100)
+            agent_playbook_id (Optional[int]): Exact agent playbook ID filter.
+            query (Optional[str]): Case-insensitive text filter across visible fields.
+            playbook_name (Optional[str]): Filter by playbook name
+            agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time.
+            end_time (Optional[datetime]): Filter by end time.
+            status_filter (Optional[list[Optional[Status]]]): Filter by status
+            playbook_status_filter (Optional[PlaybookStatus]): Filter by playbook status (default: APPROVED)
+            tags (Optional[list[str]]): Match playbooks having any of these tags.
+
+        Returns:
+            GetAgentPlaybooksViewResponse: Response containing agent playbooks
+        """
+        req = self._build_request(
+            request,
+            GetAgentPlaybooksRequest,
+            limit=limit,
+            agent_playbook_id=agent_playbook_id,
+            query=query,
+            playbook_name=playbook_name,
+            agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
+            status_filter=status_filter,
+            playbook_status_filter=playbook_status_filter,
+            tags=tags,
+        )
+
+        # Check cache if not forcing refresh
+        if not force_refresh:
+            cached_result = self._cache.get(
+                "get_agent_playbooks",
+                # Part of the key, or a scoped call would be served another
+                # session's cached response and never reach the server to be
+                # metered -- re-losing the correlation the binding just made.
+                # Unscoped callers pass None, so their key is unpartitioned.
+                session_id=req.session_id,
+                limit=req.limit,
+                agent_playbook_id=req.agent_playbook_id,
+                query=req.query,
+                playbook_name=req.playbook_name,
+                agent_version=req.agent_version,
+                start_time=req.start_time,
+                end_time=req.end_time,
+                status_filter=req.status_filter,
+                playbook_status_filter=req.playbook_status_filter,
+                tags=req.tags,
+            )
+            if cached_result is not None:
+                return cached_result
+
+        # Make API call
+        response = self._make_request(
+            "POST",
+            "/api/get_agent_playbooks",
+            json=req.model_dump(mode="json"),
+        )
+        result = GetAgentPlaybooksViewResponse(**response)
+
+        # Store in cache
+        self._cache.set(
+            "get_agent_playbooks",
+            result,
+            session_id=req.session_id,  # keep in step with the lookup key above
+            limit=req.limit,
+            agent_playbook_id=req.agent_playbook_id,
+            query=req.query,
+            playbook_name=req.playbook_name,
+            agent_version=req.agent_version,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            status_filter=req.status_filter,
+            playbook_status_filter=req.playbook_status_filter,
+            tags=req.tags,
+        )
+
+        return result
+
+    def get_requests(
+        self,
+        request: GetRequestsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+    ) -> GetRequestsViewResponse:
+        """Get requests with their associated interactions, grouped by session.
+
+        Args:
+            request (Optional[GetRequestsRequest]): The get request object (alternative to kwargs)
+            user_id (Optional[str]): Filter by user ID
+            request_id (Optional[str]): Filter by request ID
+            session_id (Optional[str]): Filter by session ID
+            source (Optional[str]): Filter by request source
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+            top_k (Optional[int]): Maximum number of results to return (default: 30)
+
+        Returns:
+            GetRequestsViewResponse: Response containing requests grouped by session with their interactions
+        """
+        req = self._build_request(
+            request,
+            GetRequestsRequest,
+            user_id=user_id,
+            request_id=request_id,
+            session_id=session_id,
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_requests",
+            json=req.model_dump(mode="json"),
+        )
+        return GetRequestsViewResponse(**response)
+
+    def get_agent_success_evaluation_results(
+        self,
+        request: GetAgentSuccessEvaluationResultsRequest | dict | None = None,
+        *,
+        limit: int | None = None,
+        agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> GetEvaluationResultsViewResponse:
+        """Get agent success evaluation results.
+
+        Args:
+            request (Optional[GetAgentSuccessEvaluationResultsRequest]): The get request object (alternative to kwargs)
+            limit (Optional[int]): Maximum number of results to return (default: 100)
+            agent_version (Optional[str]): Filter by agent version
+            start_time (Optional[datetime]): Filter by start time
+            end_time (Optional[datetime]): Filter by end time
+
+        Returns:
+            GetEvaluationResultsViewResponse: Response containing agent success evaluation results
+        """
+        req = self._build_request(
+            request,
+            GetAgentSuccessEvaluationResultsRequest,
+            limit=limit,
+            agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_agent_success_evaluation_results",
+            json=req.model_dump(mode="json"),
+        )
+        return GetEvaluationResultsViewResponse(**response)
+
+    def get_retrieved_learning_evaluation_results(
+        self,
+        request: GetRetrievedLearningEvaluationResultsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> GetRetrievedLearningEvaluationResultsResponse:
+        """Get per-learning relevance and impact verdicts for retrieved context.
+
+        Time filters apply to the interaction that received the learning, not
+        to the later timestamp when its evaluation row was generated.
+        """
+        req = self._build_request(
+            request,
+            GetRetrievedLearningEvaluationResultsRequest,
+            user_id=user_id,
+            session_id=session_id,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/get_retrieved_learning_evaluation_results",
+            json=req.model_dump(mode="json"),
+        )
+        return GetRetrievedLearningEvaluationResultsResponse(**response)
+
+    def regenerate_evaluations(
+        self,
+        request: RegenerateRequest | dict | None = None,
+        *,
+        from_ts: int | None = None,
+        to_ts: int | None = None,
+        evaluation_name: str | None = None,
+    ) -> RegenerateStartResponse:
+        """Start a replay-the-judge regeneration job over a time window.
+
+        Args:
+            request: Optional ``RegenerateRequest`` or dict. If omitted,
+                keyword arguments are used.
+            from_ts: Inclusive lower bound of the window as Unix seconds.
+            to_ts: Inclusive upper bound of the window as Unix seconds.
+            evaluation_name: Deprecated compatibility field accepted by the
+                API but ignored by the singleton evaluator.
+
+        Returns:
+            RegenerateStartResponse: The job id and number of queued sessions.
+        """
+        req = self._build_request(
+            request,
+            RegenerateRequest,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            evaluation_name=evaluation_name,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/evaluations/regenerate",
+            json=req.model_dump(mode="json"),
+        )
+        return RegenerateStartResponse(**response)
+
+    def get_evaluation_regeneration_status(
+        self, job_id: str
+    ) -> RegenerateStatusResponse:
+        """Get status for an evaluation regeneration job."""
+        response = self._make_request(
+            "GET",
+            f"/api/evaluations/regenerate/{job_id}",
+        )
+        return RegenerateStatusResponse(**response)
+
+    def cancel_evaluation_regeneration(self, job_id: str) -> dict[str, str]:
+        """Request cancellation for an evaluation regeneration job."""
+        return self._make_request(
+            "DELETE",
+            f"/api/evaluations/regenerate/{job_id}",
+        )
+
+    def grade_on_demand(
+        self,
+        request: GradeOnDemandRequest | dict | None = None,
+        *,
+        session_id: str | None = None,
+        agent_version: str | None = None,
+        evaluation_name: str | None = None,
+    ) -> GradeOnDemandResponse:
+        """Grade a single session synchronously.
+
+        Args:
+            request: Optional ``GradeOnDemandRequest`` or dict. If omitted,
+                keyword arguments are used.
+            session_id: Session to grade.
+            agent_version: Agent version to grade.
+            evaluation_name: Deprecated compatibility field accepted by the
+                API but ignored by the singleton evaluator.
+
+        Returns:
+            GradeOnDemandResponse: Result id, cache flag, or skipped reason.
+        """
+        req = self._build_request(
+            request,
+            GradeOnDemandRequest,
+            session_id=session_id,
+            agent_version=agent_version,
+            evaluation_name=evaluation_name,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/evaluations/grade_on_demand",
+            json=req.model_dump(mode="json"),
+            timeout=max(self.timeout, GRADE_ON_DEMAND_TIMEOUT_SECONDS),
+        )
+        return GradeOnDemandResponse(**response)
+
+    def _poll_operation_status(
+        self,
+        service_name: str,
+        poll_interval: float = 3.0,
+        max_wait: float = 600.0,
+        min_started_at: int | None = None,
+        operation_id: str | None = None,
+    ) -> GetOperationStatusResponse:
+        """
+        Poll the operation status endpoint until the operation completes, fails, or is cancelled.
+
+        Args:
+            service_name: The service name to poll (e.g. "profile_generation", "playbook_generation")
+            poll_interval: Seconds between polls
+            max_wait: Maximum seconds to wait before raising TimeoutError
+            min_started_at: Optional Unix timestamp for legacy uncorrelated polling.
+            operation_id: Exact admitted attempt. When provided, matching identity
+                replaces the timestamp heuristic and tolerates clock skew.
+
+        Returns:
+            GetOperationStatusResponse: Final operation status
+        """
+        start = time.monotonic()
+        while True:
+            try:
+                response = self._make_request(
+                    "GET",
+                    "/api/get_operation_status",
+                    params={"service_name": service_name},
+                )
+            except Exception as e:
+                logger.warning("Failed to poll operation status: %s", e)
+                elapsed = time.monotonic() - start
+                if elapsed + poll_interval > max_wait:
+                    raise TimeoutError(
+                        f"Operation '{service_name}' did not complete within {max_wait}s"
+                    ) from e
+                time.sleep(poll_interval)
+                continue
+            status_response = GetOperationStatusResponse(**response)
+            op = status_response.operation_status
+            # The API stores operation timestamps at second precision. Accept a
+            # one-second skew so a just-submitted operation that starts near the
+            # client timestamp boundary is not treated as stale forever.
+            if (
+                op
+                and operation_id is not None
+                and op.request_params.get("operation_id") != operation_id
+            ):
+                op = None
+            if (
+                op
+                and operation_id is None
+                and min_started_at is not None
+                and op.started_at < min_started_at - 1
+            ):
+                op = None
+            if op and op.status in (
+                OperationStatus.COMPLETED,
+                OperationStatus.FAILED,
+                OperationStatus.CANCELLED,
+            ):
+                return status_response
+            elapsed = time.monotonic() - start
+            if elapsed + poll_interval > max_wait:
+                raise TimeoutError(
+                    f"Operation '{service_name}' did not complete within {max_wait}s"
+                )
+            time.sleep(poll_interval)
+
+    def _rerun_profile_generation_sync(
+        self, request: RerunProfileGenerationRequest
+    ) -> RerunProfileGenerationResponse:
+        """Internal sync method to rerun profile generation.
+
+        Submits the request, then polls operation status until completion.
+        The server must return an attempt ID; a legacy service label cannot
+        confirm synchronous completion.
+        """
+        submitted_at = int(time.time())
+        response = self._make_request(
+            "POST",
+            "/api/rerun_profile_generation",
+            json=request.model_dump(mode="json"),
+        )
+        initial = RerunProfileGenerationResponse(**response)
+        if not initial.success:
+            return initial
+        # Older servers return a constant service label, which cannot prove an attempt.
+        if (
+            initial.operation_id == "rerun_profile_generation"
+            or not initial.operation_id
+        ):
+            return RerunProfileGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Server cannot identify this generation attempt; upgrade the server before using wait_for_response",
+            )
+
+        # Poll until the background task completes
+        try:
+            status_response = self._poll_operation_status(
+                "profile_generation",
+                min_started_at=submitted_at,
+                operation_id=initial.operation_id,
+            )
+            op = status_response.operation_status
+            if op and op.status == OperationStatus.COMPLETED:
+                return RerunProfileGenerationResponse(
+                    operation_id=initial.operation_id,
+                    success=True,
+                    msg="Profile generation completed",
+                    profiles_generated=op.stats.get("total_generated", 0),
+                )
+            if op and op.status == OperationStatus.FAILED:
+                return RerunProfileGenerationResponse(
+                    operation_id=initial.operation_id,
+                    success=False,
+                    msg=op.error_message or "Profile generation failed",
+                    profiles_generated=op.stats.get("total_generated", 0),
+                )
+            return RerunProfileGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Profile generation was cancelled",
+                profiles_generated=op.stats.get("total_generated", 0) if op else 0,
+            )
+        except Exception as e:
+            logger.warning("Error while polling profile generation status: %s", e)
+            return RerunProfileGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Could not confirm generation completion; check generation status before retrying",
+            )
+
+    async def _rerun_profile_generation_async(
+        self, request: RerunProfileGenerationRequest
+    ) -> RerunProfileGenerationResponse:
+        """Internal async method to rerun profile generation."""
+        response = await self._make_async_request(
+            "POST",
+            "/api/rerun_profile_generation",
+            json=request.model_dump(mode="json"),
+        )
+        return RerunProfileGenerationResponse(**response)
+
+    def rerun_profile_generation(
+        self,
+        request: RerunProfileGenerationRequest | dict | None = None,
+        wait_for_response: bool = False,
+        *,
+        user_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        source: str | None = None,
+        extractor_names: list[str] | None = None,
+    ) -> RerunProfileGenerationResponse | None:
+        """Rerun profile generation for users.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            request (Optional[RerunProfileGenerationRequest]): The rerun request object (alternative to kwargs)
+            wait_for_response (bool, optional): If True, wait for the exact server-admitted
+                attempt; requires a server returning attempt IDs. Partial failure,
+                cancellation or unconfirmed completion returns success=False. If False,
+                submit without waiting. Defaults to False.
+            user_id (Optional[str]): Specific user ID to rerun for. If None, runs for all users.
+            start_time (Optional[datetime]): Filter interactions by start time.
+            end_time (Optional[datetime]): Filter interactions by end time.
+            source (Optional[str]): Filter interactions by source.
+            extractor_names (Optional[list[str]]): Deprecated compatibility field. Accepted but ignored.
+
+        Returns:
+            Optional[RerunProfileGenerationResponse]: Response containing success status, message, profiles_generated count, and operation_id if wait_for_response=True, None otherwise.
+        """
+        req = self._build_request(
+            request,
+            RerunProfileGenerationRequest,
+            user_id=user_id,
+            start_time=start_time,
+            end_time=end_time,
+            source=source,
+            extractor_names=extractor_names,
+        )
+
+        if wait_for_response:
+            return self._rerun_profile_generation_sync(req)
+        self._fire_and_forget(self._rerun_profile_generation_async, req)
+        return None
+
+    def upgrade_profiles(
+        self,
+        *,
+        user_id: str | None = None,
+        only_affected_users: bool = True,
+    ) -> UpgradeProfilesResponse:
+        """Promote PENDING profiles to CURRENT, archive old CURRENT, delete old ARCHIVED.
+
+        Args:
+            user_id: Specific user ID to upgrade. If None, upgrades all users.
+            only_affected_users: If True, only upgrade users who have pending profiles.
+
+        Returns:
+            UpgradeProfilesResponse: Counts of archived, promoted, and deleted profiles.
+        """
+        req = UpgradeProfilesRequest(
+            user_id=user_id,
+            only_affected_users=only_affected_users,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/upgrade_all_profiles",
+            json=req.model_dump(mode="json"),
+        )
+        return UpgradeProfilesResponse(**response)
+
+    def upgrade_user_playbooks(
+        self,
+        *,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+    ) -> UpgradeUserPlaybooksResponse:
+        """Promote PENDING user playbooks to CURRENT, archive old CURRENT, delete old ARCHIVED.
+
+        Args:
+            agent_version: Filter by agent version. If None, upgrades all versions.
+            playbook_name: Filter by playbook name. If None, upgrades all playbooks.
+
+        Returns:
+            UpgradeUserPlaybooksResponse: Counts of archived, promoted, and deleted playbooks.
+        """
+        req = UpgradeUserPlaybooksRequest(
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+        )
+        response = self._make_request(
+            "POST",
+            "/api/upgrade_all_user_playbooks",
+            json=req.model_dump(mode="json"),
+        )
+        return UpgradeUserPlaybooksResponse(**response)
+
+    async def _manual_profile_generation_async(
+        self, request: ManualProfileGenerationRequest
+    ) -> None:
+        """Internal async method for manual profile generation."""
+        await self._make_async_request(
+            "POST",
+            "/api/manual_profile_generation",
+            json=request.model_dump(mode="json"),
+        )
+
+    def manual_profile_generation(
+        self,
+        request: ManualProfileGenerationRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        source: str | None = None,
+        extractor_names: list[str] | None = None,
+    ) -> None:
+        """Manually trigger profile generation with window-sized interactions (fire-and-forget).
+
+        Unlike rerun_profile_generation which uses ALL interactions and outputs PENDING status,
+        this method uses window-sized interactions (from window_size config) and
+        outputs profiles with CURRENT status.
+
+        This is a fire-and-forget operation that runs asynchronously in the background.
+
+        Args:
+            request (Optional[ManualProfileGenerationRequest]): The request object (alternative to kwargs)
+            user_id (Optional[str]): Specific user ID to generate for. If None, generates for all users.
+            source (Optional[str]): Filter interactions by source.
+            extractor_names (Optional[list[str]]): Deprecated compatibility field. Accepted but ignored.
+
+        Returns:
+            None: This method always returns None (fire-and-forget).
+        """
+        req = self._build_request(
+            request,
+            ManualProfileGenerationRequest,
+            user_id=user_id,
+            source=source,
+            extractor_names=extractor_names,
+        )
+        self._fire_and_forget(self._manual_profile_generation_async, req)
+
+    def _rerun_playbook_generation_sync(
+        self, request: RerunPlaybookGenerationRequest
+    ) -> RerunPlaybookGenerationResponse:
+        """Internal sync method to rerun playbook generation.
+
+        Submits the request, then polls operation status until completion.
+        The server must return an attempt ID; a legacy service label cannot
+        confirm synchronous completion.
+        """
+        submitted_at = int(time.time())
+        response = self._make_request(
+            "POST",
+            "/api/rerun_playbook_generation",
+            json=request.model_dump(mode="json"),
+        )
+        initial = RerunPlaybookGenerationResponse(**response)
+        if not initial.success:
+            return initial
+        # Older servers return a constant service label, which cannot prove an attempt.
+        if (
+            initial.operation_id == "rerun_playbook_generation"
+            or not initial.operation_id
+        ):
+            return RerunPlaybookGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Server cannot identify this generation attempt; upgrade the server before using wait_for_response",
+            )
+
+        # Poll until the background task completes
+        try:
+            status_response = self._poll_operation_status(
+                "playbook_generation",
+                min_started_at=submitted_at,
+                operation_id=initial.operation_id,
+            )
+            op = status_response.operation_status
+            if op and op.status == OperationStatus.COMPLETED:
+                return RerunPlaybookGenerationResponse(
+                    operation_id=initial.operation_id,
+                    success=True,
+                    msg="Playbook generation completed",
+                    playbooks_generated=op.stats.get("total_generated", 0),
+                )
+            if op and op.status == OperationStatus.FAILED:
+                return RerunPlaybookGenerationResponse(
+                    operation_id=initial.operation_id,
+                    success=False,
+                    msg=op.error_message or "Playbook generation failed",
+                    playbooks_generated=op.stats.get("total_generated", 0),
+                )
+            return RerunPlaybookGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Playbook generation was cancelled",
+                playbooks_generated=op.stats.get("total_generated", 0) if op else 0,
+            )
+        except Exception as e:
+            logger.warning("Error while polling playbook generation status: %s", e)
+            return RerunPlaybookGenerationResponse(
+                operation_id=initial.operation_id,
+                success=False,
+                msg="Could not confirm generation completion; check generation status before retrying",
+            )
+
+    async def _rerun_playbook_generation_async(
+        self, request: RerunPlaybookGenerationRequest
+    ) -> RerunPlaybookGenerationResponse:
+        """Internal async method to rerun playbook generation."""
+        response = await self._make_async_request(
+            "POST",
+            "/api/rerun_playbook_generation",
+            json=request.model_dump(mode="json"),
+        )
+        return RerunPlaybookGenerationResponse(**response)
+
+    def rerun_playbook_generation(
+        self,
+        request: RerunPlaybookGenerationRequest | dict | None = None,
+        wait_for_response: bool = False,
+        *,
+        agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        playbook_name: str | None = None,
+    ) -> RerunPlaybookGenerationResponse | None:
+        """Rerun playbook generation for an agent version.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            request (Optional[RerunPlaybookGenerationRequest]): The rerun request object (alternative to kwargs)
+            wait_for_response (bool, optional): If True, wait for the exact server-admitted
+                attempt; requires a server returning attempt IDs. Partial failure,
+                cancellation or unconfirmed completion returns success=False. If False,
+                submit without waiting. Defaults to False.
+            agent_version (str): Required. The agent version to evaluate.
+            start_time (Optional[datetime]): Filter by start time.
+            end_time (Optional[datetime]): Filter by end time.
+            playbook_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
+
+        Returns:
+            Optional[RerunPlaybookGenerationResponse]: Response containing success status, message, playbooks_generated count, and operation_id if wait_for_response=True, None otherwise.
+        """
+        req = self._build_request(
+            request,
+            RerunPlaybookGenerationRequest,
+            agent_version=agent_version,
+            start_time=start_time,
+            end_time=end_time,
+            playbook_name=playbook_name,
+        )
+
+        if wait_for_response:
+            return self._rerun_playbook_generation_sync(req)
+        self._fire_and_forget(self._rerun_playbook_generation_async, req)
+        return None
+
+    async def _manual_playbook_generation_async(
+        self, request: ManualPlaybookGenerationRequest
+    ) -> None:
+        """Internal async method for manual playbook generation."""
+        await self._make_async_request(
+            "POST",
+            "/api/manual_playbook_generation",
+            json=request.model_dump(mode="json"),
+        )
+
+    def manual_playbook_generation(
+        self,
+        request: ManualPlaybookGenerationRequest | dict | None = None,
+        *,
+        agent_version: str | None = None,
+        source: str | None = None,
+        playbook_name: str | None = None,
+    ) -> None:
+        """Manually trigger playbook generation with window-sized interactions (fire-and-forget).
+
+        Unlike rerun_playbook_generation which uses ALL interactions and outputs PENDING status,
+        this method uses window-sized interactions (from window_size config) and
+        outputs playbooks with CURRENT status.
+
+        This is a fire-and-forget operation that runs asynchronously in the background.
+
+        Args:
+            request (Optional[ManualPlaybookGenerationRequest]): The request object (alternative to kwargs)
+            agent_version (str): Required. The agent version to evaluate.
+            source (Optional[str]): Filter interactions by source.
+            playbook_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
+
+        Returns:
+            None: This method always returns None (fire-and-forget).
+        """
+        req = self._build_request(
+            request,
+            ManualPlaybookGenerationRequest,
+            agent_version=agent_version,
+            source=source,
+            playbook_name=playbook_name,
+        )
+        self._fire_and_forget(self._manual_playbook_generation_async, req)
+
+    def submit_playbook_aggregation(
+        self, *, request_id: str, agent_version: str
+    ) -> PlaybookAggregationOperation:
+        """Durably submit an idempotent full aggregation; return after admission."""
+        payload = SubmitPlaybookAggregationRequest(
+            request_id=request_id, agent_version=agent_version
+        )
+        response = self._make_request(
+            "POST",
+            "/api/playbook_aggregation_operations",
+            json=payload.model_dump(mode="json"),
+        )
+        return PlaybookAggregationOperation.model_validate(response)
+
+    def get_playbook_aggregation_operation(
+        self, operation_id: str
+    ) -> PlaybookAggregationOperation:
+        """Read committed status for a previously submitted operation."""
+        from urllib.parse import quote
+
+        response = self._make_request(
+            "GET",
+            f"/api/playbook_aggregation_operations/{quote(operation_id, safe='')}",
+        )
+        return PlaybookAggregationOperation.model_validate(response)
+
+    def _run_playbook_aggregation_sync(
+        self, request: RunPlaybookAggregationRequest
+    ) -> RunPlaybookAggregationResponse:
+        """Internal sync method to run playbook aggregation."""
+        response = self._make_request(
+            "POST",
+            "/api/run_playbook_aggregation",
+            json=request.model_dump(mode="json"),
+        )
+        return RunPlaybookAggregationResponse(**response)
+
+    async def _run_playbook_aggregation_async(
+        self, request: RunPlaybookAggregationRequest
+    ) -> RunPlaybookAggregationResponse:
+        """Internal async method to run playbook aggregation."""
+        response = await self._make_async_request(
+            "POST",
+            "/api/run_playbook_aggregation",
+            json=request.model_dump(mode="json"),
+        )
+        return RunPlaybookAggregationResponse(**response)
+
+    def run_playbook_aggregation(
+        self,
+        request: RunPlaybookAggregationRequest | dict | None = None,
+        wait_for_response: bool = False,
+        *,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+    ) -> RunPlaybookAggregationResponse | None:
+        """Run playbook aggregation to cluster similar user playbooks.
+
+        This method is optimized for resource efficiency:
+        - In async contexts (e.g., FastAPI): Uses existing event loop (most efficient)
+        - In sync contexts: Uses shared thread pool (avoids thread creation overhead)
+
+        Args:
+            request (Optional[RunPlaybookAggregationRequest]): The aggregation request object (alternative to kwargs)
+            wait_for_response (bool, optional): If True, wait for response. If False, send request without waiting. Defaults to False.
+            agent_version (str): Required. The agent version.
+            playbook_name (Optional[str]): Deprecated compatibility field. Accepted but ignored.
+
+        Returns:
+            Optional[RunPlaybookAggregationResponse]: Response containing success status and message if wait_for_response=True, None otherwise.
+        """
+        req = self._build_request(
+            request,
+            RunPlaybookAggregationRequest,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+        )
+
+        if wait_for_response:
+            return self._run_playbook_aggregation_sync(req)
+        self._fire_and_forget(self._run_playbook_aggregation_async, req)
+        return None
+
+    def search(
+        self,
+        request: UnifiedSearchRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        entity_types: list[str] | None = None,
+        agent_playbook_status_filter: list[PlaybookStatus | str] | None = None,
+        enable_reformulation: bool | None = None,
+        enable_agent_answer: bool | None = None,
+        conversation_history: list[ConversationTurn] | list[dict] | None = None,
+        search_mode: SearchMode | str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        interaction_id: int | None = None,
+    ) -> UnifiedSearchViewResponse:
+        """Search across all entity types (profiles, agent playbooks, user playbooks).
+
+        Runs query reformulation and searches all entity types in parallel.
+        Query reformulation is controlled per-request via the enable_reformulation parameter.
+
+        Args:
+            request (Optional[UnifiedSearchRequest]): The search request object (alternative to kwargs)
+            query (str): Search query text
+            top_k (Optional[int]): Maximum results per entity type, from 1 to 100
+                (default: 5).
+            threshold (Optional[float]): Similarity threshold for vector search.
+                When omitted, the embedding model's default is used.
+            agent_version (Optional[str]): Filter by agent version (agent_playbooks, user_playbooks)
+            playbook_name (Optional[str]): Filter by playbook name (agent_playbooks, user_playbooks)
+            user_id (Optional[str]): Filter by user ID (profiles, user_playbooks),
+                at most 255 characters.
+            source (Optional[str]): Filter every selected entity type by exact
+                source. Agent playbooks match through linked user playbooks.
+            tags (Optional[list[str]]): Match entities having any requested tag.
+            entity_types (Optional[list[str]]): Entity types to search. Valid values:
+                "profiles", "user_playbooks", "agent_playbooks".
+            agent_playbook_status_filter (Optional[list[Union[PlaybookStatus, str]]]):
+                Agent-playbook approval statuses to include.
+            enable_reformulation (Optional[bool]): Enable the pre-search LLM
+                query reformulation call (default: False). Besides rewriting
+                the query, it extracts temporal signals — time windows
+                ("this week"), as-of boundaries, and current-value intent —
+                that make retrieval time-sensitive (window filters,
+                freshness-preferred ranking for superseded facts).
+            enable_agent_answer (Optional[bool]): Enable agentic answer synthesis when
+                the configured search backend supports it (default: False).
+            conversation_history (Optional[list[ConversationTurn] | list[dict]]): Prior conversation turns for context-aware query reformulation. Accepts ConversationTurn objects or dicts with "role" and "content" keys.
+            search_mode (Optional[SearchMode | str]): Search mode to use. Accepts SearchMode enum or string value ("vector", "fts", "hybrid").
+            request_id (Optional[str]): Caller correlation ID for the search turn,
+                at most 255 characters.
+            session_id (Optional[str]): Caller session ID for the search turn,
+                at most 255 characters. Also enables session-scoped result deduplication.
+            interaction_id (Optional[int]): Caller interaction ID for the search
+                turn; must be a positive integer (minimum 1).
+
+        Returns:
+            UnifiedSearchViewResponse: Combined search results from all entity types
+        """
+        req = self._build_request(
+            request,
+            UnifiedSearchRequest,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            user_id=user_id,
+            source=source,
+            tags=tags,
+            entity_types=entity_types,
+            agent_playbook_status_filter=agent_playbook_status_filter,
+            enable_reformulation=enable_reformulation,
+            enable_agent_answer=enable_agent_answer,
+            conversation_history=conversation_history,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        )
+        response = self._make_request(
+            "POST", "/api/search", json=req.model_dump(mode="json")
+        )
+        return UnifiedSearchViewResponse(**response)
+
+    async def search_async(
+        self,
+        request: UnifiedSearchRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        entity_types: list[str] | None = None,
+        agent_playbook_status_filter: list[PlaybookStatus | str] | None = None,
+        enable_reformulation: bool | None = None,
+        enable_agent_answer: bool | None = None,
+        conversation_history: list[ConversationTurn] | list[dict] | None = None,
+        search_mode: SearchMode | str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        interaction_id: int | None = None,
+    ) -> UnifiedSearchViewResponse:
+        """Native-async counterpart to :meth:`search`."""
+        req = self._build_request(
+            request,
+            UnifiedSearchRequest,
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            user_id=user_id,
+            source=source,
+            tags=tags,
+            entity_types=entity_types,
+            agent_playbook_status_filter=agent_playbook_status_filter,
+            enable_reformulation=enable_reformulation,
+            enable_agent_answer=enable_agent_answer,
+            conversation_history=conversation_history,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        )
+        response = await self._make_async_request(
+            "POST", "/api/search", json=req.model_dump(mode="json")
+        )
+        return UnifiedSearchViewResponse(**response)
+
+    # =========================================================================
+    # Bulk Delete Operations
+    # =========================================================================
+
+    def delete_requests_by_ids(self, request_ids: list[str]) -> BulkDeleteResponse:
+        """Delete multiple requests by their IDs.
+
+        Args:
+            request_ids (list[str]): List of request IDs to delete
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        req = DeleteRequestsByIdsRequest(request_ids=request_ids)
+        response = self._make_request(
+            "DELETE", "/api/delete_requests_by_ids", json=req.model_dump(mode="json")
+        )
+        return BulkDeleteResponse(**response)
+
+    def delete_profiles_by_ids(self, profile_ids: list[str]) -> BulkDeleteResponse:
+        """Delete multiple profiles by their IDs.
+
+        Args:
+            profile_ids (list[str]): List of profile IDs to delete
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        req = DeleteProfilesByIdsRequest(profile_ids=profile_ids)
+        response = self._make_request(
+            "DELETE", "/api/delete_profiles_by_ids", json=req.model_dump(mode="json")
+        )
+        self._cache.invalidate("get_profiles")
+        return BulkDeleteResponse(**response)
+
+    def delete_agent_playbooks_by_ids(
+        self, agent_playbook_ids: list[int]
+    ) -> BulkDeleteResponse:
+        """Delete multiple agent playbooks by their IDs.
+
+        Args:
+            agent_playbook_ids (list[int]): List of agent playbook IDs to delete
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        req = DeleteAgentPlaybooksByIdsRequest(agent_playbook_ids=agent_playbook_ids)
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_agent_playbooks_by_ids",
+            json=req.model_dump(mode="json"),
+        )
+        self._cache.invalidate("get_agent_playbooks")
+        return BulkDeleteResponse(**response)
+
+    def delete_user_playbooks_by_ids(
+        self, user_playbook_ids: list[int]
+    ) -> BulkDeleteResponse:
+        """Delete multiple user playbooks by their IDs.
+
+        Args:
+            user_playbook_ids (list[int]): List of user playbook IDs to delete
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        req = DeleteUserPlaybooksByIdsRequest(user_playbook_ids=user_playbook_ids)
+        response = self._make_request(
+            "DELETE",
+            "/api/delete_user_playbooks_by_ids",
+            json=req.model_dump(mode="json"),
+        )
+        return BulkDeleteResponse(**response)
+
+    def whoami(self) -> WhoamiResponse:
+        """Return the server's view of the caller's org and storage routing.
+
+        Returns:
+            WhoamiResponse: Masked summary of org ID and resolved storage.
+                Never contains raw credentials — safe to print.
+        """
+        response = self._make_request("GET", "/api/whoami")
+        return WhoamiResponse(**response)
+
+    def get_my_config(self) -> MyConfigResponse:
+        """Return raw storage credentials for the caller's org.
+
+        Used by ``reflexio config storage`` to let users inspect their
+        per-org server-side storage credentials.
+
+        Returns:
+            MyConfigResponse: Unmasked storage config dict, or
+                ``success=False`` when no storage is configured
+                server-side or the endpoint is disabled.
+        """
+        response = self._make_request("GET", "/api/my_config")
+        return MyConfigResponse(**response)
+
+    def delete_all_interactions(self) -> BulkDeleteResponse:
+        """Delete all requests and their associated interactions.
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        response = self._make_request("DELETE", "/api/delete_all_interactions")
+        self._cache.clear()
+        return BulkDeleteResponse(**response)
+
+    def delete_all_profiles(self) -> BulkDeleteResponse:
+        """Delete all profiles.
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        response = self._make_request("DELETE", "/api/delete_all_profiles")
+        self._cache.invalidate("get_profiles")
+        return BulkDeleteResponse(**response)
+
+    def delete_all_playbooks(self) -> BulkDeleteResponse:
+        """Delete all playbooks (both user and agent).
+
+        Cascading variant — wipes both playbook stores. For per-entity
+        semantics use :meth:`delete_all_user_playbooks` (user only) or
+        :meth:`delete_all_agent_playbooks` (agent only).
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        response = self._make_request("DELETE", "/api/delete_all_playbooks")
+        self._cache.clear()
+        return BulkDeleteResponse(**response)
+
+    def delete_all_user_playbooks(self) -> BulkDeleteResponse:
+        """Delete all user playbooks (user only, not agent).
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        response = self._make_request("DELETE", "/api/delete_all_user_playbooks")
+        return BulkDeleteResponse(**response)  # user playbooks not cached
+
+    def delete_all_agent_playbooks(self) -> BulkDeleteResponse:
+        """Delete all agent playbooks (agent only, not user).
+
+        Returns:
+            BulkDeleteResponse: Response containing success status and deleted count
+        """
+        response = self._make_request("DELETE", "/api/delete_all_agent_playbooks")
+        self._cache.invalidate("get_agent_playbooks")
+        return BulkDeleteResponse(**response)
+
+    def get_stall_state(self) -> StallStateResponse:
+        """Read the current learning-stall state from the server.
+
+        Returns:
+            StallStateResponse: ``stalled=False`` when clean.
+        """
+        response = self._make_request("GET", "/stall_state")
+        return StallStateResponse.model_validate(response)
+
+    def mark_stall_notified(self) -> MarkNotifiedResponse:
+        """Idempotently flip ``notified_in_cc=1`` on the current stall row.
+
+        Returns:
+            MarkNotifiedResponse: New ``notified_in_cc`` value.
+        """
+        response = self._make_request("POST", "/stall_state/notified")
+        return MarkNotifiedResponse.model_validate(response)
+
+    # ===============================
+    # Pending tool calls (human questions)
+    # ===============================
+    # The resumable extraction agent can pause and emit an ``ask_human``
+    # pending tool call when it needs a human to answer a question before it
+    # can finish. These methods let a user list those questions, answer them
+    # to unblock the agent, edit a prior answer, mark a question N/A, or
+    # cancel it. See notebooks/08_resumable_agent_human_questions.ipynb.
+
+    def list_pending_tool_calls(
+        self, status: str | None = None, limit: int = 100
+    ) -> PendingToolCallListResponse:
+        """List pending tool calls (e.g. ``ask_human`` questions) for the org.
+
+        Args:
+            status (str | None): Optional status filter. One of ``"pending"``,
+                ``"resolved"``, ``"expired"``, ``"superseded"``, or
+                ``"cancelled"``. When None, all statuses are returned.
+            limit (int): Maximum number of results to return (1-500, default 100).
+
+        Returns:
+            PendingToolCallListResponse: The matching pending tool calls.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        response = self._make_request("GET", "/api/pending_tool_calls", params=params)
+        return PendingToolCallListResponse.model_validate(response)
+
+    def get_pending_tool_call(
+        self, pending_tool_call_id: str
+    ) -> PendingToolCallResponse:
+        """Fetch a single pending tool call by id.
+
+        Args:
+            pending_tool_call_id (str): The id of the pending tool call.
+
+        Returns:
+            PendingToolCallResponse: The pending tool call.
+        """
+        response = self._make_request(
+            "GET", f"/api/pending_tool_calls/{pending_tool_call_id}"
+        )
+        return PendingToolCallResponse.model_validate(response)
+
+    def resolve_pending_tool_call(
+        self,
+        pending_tool_call_id: str,
+        *,
+        result: dict[str, Any] | None = None,
+        answer: str | None = None,
+        valid_for_seconds: int | None = None,
+    ) -> PendingToolCallResponse:
+        """Resolve a pending tool call, unblocking dependent agent runs.
+
+        Provide exactly one of ``result`` or ``answer``. ``answer`` is a
+        convenience for the common ``ask_human`` case and is wrapped as
+        ``{"answer": answer}``; use ``result`` to send an arbitrary tool
+        result payload.
+
+        Args:
+            pending_tool_call_id (str): The id of the pending tool call.
+            result (dict[str, Any] | None): Raw tool result payload.
+            answer (str | None): Human answer text (wrapped as ``{"answer": ...}``).
+            valid_for_seconds (int | None): How long the resolved answer
+                stays valid for answer reuse. Server default when None.
+
+        Returns:
+            PendingToolCallResponse: The resolved pending tool call.
+
+        Raises:
+            ValueError: If both or neither of ``result`` and ``answer`` are set.
+        """
+        if (result is None) == (answer is None):
+            raise ValueError("Provide exactly one of 'result' or 'answer' to resolve.")
+        payload: dict[str, Any] = {
+            "result": result if result is not None else {"answer": answer}
+        }
+        if valid_for_seconds is not None:
+            payload["valid_for_seconds"] = valid_for_seconds
+        response = self._make_request(
+            "POST",
+            f"/api/pending_tool_calls/{pending_tool_call_id}/resolve",
+            json=payload,
+        )
+        return PendingToolCallResponse.model_validate(response)
+
+    def update_pending_tool_call_answer(
+        self,
+        pending_tool_call_id: str,
+        answer: str,
+        *,
+        valid_for_seconds: int | None = None,
+    ) -> PendingToolCallResponse:
+        """Edit the answer of an already-resolved ``ask_human`` question.
+
+        Editing schedules another resume of dependent agent runs with the new
+        answer.
+
+        Args:
+            pending_tool_call_id (str): The id of the pending tool call.
+            answer (str): The new (non-empty) answer text.
+            valid_for_seconds (int | None): How long the edited answer stays
+                valid for answer reuse. Server default when None.
+
+        Returns:
+            PendingToolCallResponse: The updated pending tool call.
+        """
+        payload: dict[str, Any] = {"answer": answer}
+        if valid_for_seconds is not None:
+            payload["valid_for_seconds"] = valid_for_seconds
+        response = self._make_request(
+            "PATCH",
+            f"/api/pending_tool_calls/{pending_tool_call_id}/answer",
+            json=payload,
+        )
+        return PendingToolCallResponse.model_validate(response)
+
+    def mark_pending_tool_call_not_applicable(
+        self,
+        pending_tool_call_id: str,
+        *,
+        valid_for_seconds: int | None = None,
+    ) -> PendingToolCallResponse:
+        """Mark an ``ask_human`` question as not applicable.
+
+        Resolves the question with the standard "user does not have
+        information" result so dependent agent runs can proceed.
+
+        Args:
+            pending_tool_call_id (str): The id of the pending tool call.
+            valid_for_seconds (int | None): How long the result stays valid
+                for answer reuse. Server default when None.
+
+        Returns:
+            PendingToolCallResponse: The resolved (N/A) pending tool call.
+        """
+        payload: dict[str, Any] = {}
+        if valid_for_seconds is not None:
+            payload["valid_for_seconds"] = valid_for_seconds
+        response = self._make_request(
+            "POST",
+            f"/api/pending_tool_calls/{pending_tool_call_id}/not_applicable",
+            json=payload,
+        )
+        return PendingToolCallResponse.model_validate(response)
+
+    def cancel_pending_tool_call(
+        self, pending_tool_call_id: str
+    ) -> PendingToolCallResponse:
+        """Cancel a pending tool call without answering it.
+
+        Only pending (unanswered) tool calls can be cancelled.
+
+        Args:
+            pending_tool_call_id (str): The id of the pending tool call.
+
+        Returns:
+            PendingToolCallResponse: The cancelled pending tool call.
+        """
+        response = self._make_request(
+            "POST", f"/api/pending_tool_calls/{pending_tool_call_id}/cancel"
+        )
+        return PendingToolCallResponse.model_validate(response)
+
+    def clear_user_data(self, user_id: str) -> ClearUserDataResponse:
+        """Delete all rows scoped to a single ``user_id``.
+
+        Wipes the user's interactions, user playbooks, profiles, and
+        requests on the server. Does NOT touch agent playbooks — they
+        are intentionally shared cross-project. Used by paired-protocol
+        harnesses (e.g. SWE-bench) to isolate per-task data on a shared
+        backend without one task's clear-all nuking another in-flight
+        task's rows.
+
+        Args:
+            user_id (str): The user id whose data should be cleared.
+
+        Returns:
+            ClearUserDataResponse: Per-entity deletion counts.
+        """
+        req = ClearUserDataRequest(user_id=user_id)
+        response = self._make_request(
+            "POST", "/api/clear_user_data", json=req.model_dump(mode="json")
+        )
+        # Nuclear — clear everything that could reference this user.
+        self._cache.clear()
+        return ClearUserDataResponse(**response)
+
+
+# Names that carry session correlation, whether they appear as a method
+# parameter or as a field of the request model that method builds. Any client
+# method reaching one of these either way must have an explicit binding
+# wrapper on ``SessionScopedClient``; ``__getattr__`` refuses to forward the
+# rest so a newly added method cannot silently reach callers unbound.
+_SESSION_PARAM_NAMES = frozenset({"session_id", "session_ids"})
+
+_MISSING = object()
+
+
+def _session_model_fields(annotation: Any) -> set[str]:
+    """Session-correlation fields reachable through a request model.
+
+    Walks the whole annotation, not just its outermost type: the request
+    parameter is spelled ``Model | dict | None``, so the model that carries
+    the field is a union member rather than the annotation itself.
+    """
+    found: set[str] = set()
+    stack: list[Any] = [annotation]
+    seen: set[int] = set()
+    while stack:
+        current = stack.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, type) and issubclass(current, BaseModel):
+            found |= set(current.model_fields) & _SESSION_PARAM_NAMES
+        stack.extend(get_args(current))
+    return found
+
+
+def _accepts_session_argument(func: Any) -> bool:
+    """Report whether ``func`` can carry session correlation.
+
+    Two shapes count, and the second is the one a signature-only check
+    misses. ``search`` exposes ``session_id`` as a parameter; but
+    ``search_agent_playbooks``, ``search_profiles``, ``search_user_profiles``
+    and ``get_agent_playbooks`` expose it **only** as a field of the request
+    model they build. Reading parameter names alone reported all four
+    session-free, so ``__getattr__`` forwarded them unchanged and a scoped
+    call went out with ``session_id: null`` -- the exact uncorrelated
+    exposure this client exists to prevent. Checking request-model fields
+    too is what makes a newly added method of either shape fail loudly here
+    instead of silently reaching callers unbound.
+    """
+    try:
+        parameters = inspect.signature(func).parameters
+    except (TypeError, ValueError):  # builtins / C functions
+        return False
+    for name, parameter in parameters.items():
+        if name in _SESSION_PARAM_NAMES:
+            return True
+        if parameter.annotation is inspect.Parameter.empty:
+            continue
+        if _session_model_fields(parameter.annotation):
+            return True
+    return False
+
+
+class SessionScopedClient:
+    """A :class:`ReflexioClient` with one session ID bound to every call.
+
+    Obtained from :meth:`ReflexioClient.for_session`, not constructed
+    directly in normal use::
+
+        session = client.for_session(session_id)
+        context = session.search(query="how do I refund?", user_id="u1")
+        session.publish_interaction(user_id="u1", interactions=[...])
+
+    Why this exists: ``search`` and ``publish_interaction`` each accepted
+    ``session_id`` independently, nothing linked them, and omitting it from
+    either was silent and successful. Every call that reads the session
+    through this object reads it from one place, so two calls in the same
+    turn cannot disagree about which session they belong to -- which is the
+    property Reflexio needs to attribute a retrieved learning to the session
+    it actually influenced.
+
+    This is a **view**, not a second client. It holds the client you made it
+    from and forwards to it, so connections, authentication, cache, and
+    configuration are shared and unchanged. Creating one per session is
+    cheap and expected.
+
+    Methods that do not involve a session are forwarded unchanged, so a
+    scoped client can be used for the whole API surface::
+
+        session.get_profiles(user_id="u1")   # forwarded as-is
+
+    Passing ``session_id`` explicitly to a scoped method is allowed only
+    when it equals the bound one. A different value raises
+    :class:`ValueError`: the call site disagrees with itself about which
+    session it is in, and either answer would be a guess. Reach the
+    unscoped client through :attr:`client` to work with another session.
+    """
+
+    def __init__(self, client: "ReflexioClient", session_id: str) -> None:
+        """Bind ``session_id`` to ``client``.
+
+        Args:
+            client (ReflexioClient): The client to forward to. Not copied.
+            session_id (str): The session ID to bind. Must be non-empty.
+
+        Raises:
+            ValueError: If ``session_id`` is None, empty, or whitespace.
+        """
+        if session_id is None or not str(session_id).strip():
+            raise ValueError("session_id is required and cannot be empty")
+        self._client = client
+        # Store the STRIPPED value, not the original. The schemas disagree
+        # about whitespace: publish and lifecycle requests type session_id as
+        # NonEmptyStr, whose validator strips it, while the search requests
+        # use a plain str and send it verbatim. Binding "  abc  " would then
+        # put "abc" on the publish and "  abc  " on the search -- two calls
+        # through one scoped client, landing in two different sessions, which
+        # is precisely the disagreement this class exists to make impossible.
+        self._session_id = str(session_id).strip()
+
+    @property
+    def session_id(self) -> str:
+        """The bound session ID."""
+        return self._session_id
+
+    @property
+    def client(self) -> "ReflexioClient":
+        """The underlying unscoped client this view forwards to."""
+        return self._client
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(session_id={self._session_id!r})"
+
+    # -- binding helpers --------------------------------------------------
+
+    def _resolve(self, explicit: str | None) -> str:
+        """Return the bound session ID, rejecting a conflicting explicit one.
+
+        ``None`` means "not supplied" and yields the bound ID. An explicit
+        value equal to the bound ID is accepted so existing call sites can
+        be wrapped without being edited first. Comparison is on the stripped
+        value, matching how the bound ID was normalized: " abc " and "abc"
+        name one session, and refusing that pair would be a false conflict.
+        """
+        if explicit is not None and str(explicit).strip() != self._session_id:
+            raise ValueError(
+                f"session_id={explicit!r} was passed to a client scoped to "
+                f"session_id={self._session_id!r}. A scoped call cannot "
+                "belong to two sessions, and silently preferring either one "
+                "would mis-attribute this turn. Drop the argument to use the "
+                "bound session, call client.for_session() again for the other "
+                "session, or use the unscoped client via `.client`."
+            )
+        return self._session_id
+
+    def _resolve_many(self, explicit: list[str] | None) -> list[str]:
+        """Return ``[bound session]``, rejecting a conflicting explicit list."""
+        if explicit is not None and [str(s).strip() for s in explicit] != [
+            self._session_id
+        ]:
+            raise ValueError(
+                f"session_ids={list(explicit)!r} was passed to a client scoped "
+                f"to session_id={self._session_id!r}. A scoped read covers the "
+                "bound session only. Drop the argument, or use the unscoped "
+                "client via `.client` to read across sessions."
+            )
+        return [self._session_id]
+
+    def _scope_request(self, request: Any) -> Any:
+        """Apply the bound session to a request object or dict.
+
+        The client's request-object form bypasses keyword arguments
+        entirely, so binding has to reach inside it or a scoped call made
+        with ``request=`` would go out uncorrelated.
+        """
+        if request is None:
+            return None
+        if isinstance(request, dict):
+            self._resolve(request.get("session_id"))
+            return {**request, "session_id": self._session_id}
+        existing = getattr(request, "session_id", _MISSING)
+        if existing is _MISSING:
+            return request
+        self._resolve(existing)  # type: ignore[arg-type]
+        if existing == self._session_id:
+            return request
+        return request.model_copy(update={"session_id": self._session_id})
+
+    def _bind_request(
+        self, request: Any, model_class: type[BaseModel], **kwargs: Any
+    ) -> Any:
+        """Build a wrapped method's request object with the session bound.
+
+        For the four retrieval methods that expose correlation only through
+        their request model, binding has to happen on the built object -- the
+        method has no ``session_id`` parameter to pass one through.
+
+        The merge must happen *here* rather than by forwarding ``request``
+        and the keyword arguments together: ``_build_request`` returns the
+        supplied ``request`` untouched and **ignores every keyword argument**
+        when one is given, so a wrapper that passed both would silently drop
+        the caller's kwargs. Building the finished object and handing it down
+        as ``request=`` is what keeps them.
+        """
+        return self._scope_request(
+            self._client._build_request(request, model_class, **kwargs)
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Forward session-free methods to the underlying client.
+
+        Refuses to forward anything that takes a session parameter without
+        an explicit wrapper here: a method added upstream must be bound
+        deliberately, not reach callers unbound through this fallback.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        attribute = getattr(self._client, name)
+        if callable(attribute) and _accepts_session_argument(attribute):
+            raise AttributeError(
+                f"{type(self).__name__} has no binding for {name!r}, which "
+                "takes a session argument. Forwarding it would let a scoped "
+                "call go out uncorrelated. Add an explicit wrapper to "
+                "SessionScopedClient, or reach the unscoped method via "
+                "`.client`."
+            )
+        return attribute
+
+    def finalize_session(
+        self, user_id: str, session_id: str | None = None
+    ) -> FinalizeSessionResponse:
+        """Finalize the bound session's saved prefix, retaining the judge."""
+        return self._client.finalize_session(user_id, self._resolve(session_id))
+
+    async def finalize_session_async(
+        self, user_id: str, session_id: str | None = None
+    ) -> FinalizeSessionResponse:
+        """Native-async completion hint for the bound session."""
+        return await self._client.finalize_session_async(
+            user_id, self._resolve(session_id)
+        )
+
+    # -- publishing -------------------------------------------------------
+
+    def publish_interaction(
+        self,
+        user_id: str,
+        interactions: Sequence[InteractionData | dict],
+        source: str = "",
+        agent_version: str = DEFAULT_AGENT_VERSION,
+        session_id: str | None = None,
+        wait_for_response: bool = False,
+        skip_aggregation: bool = False,
+        force_extraction: bool = False,
+        evaluation_only: bool = False,
+        override_learning_stall: bool = False,
+        retrieval_experiment_id: str | None = None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None,
+        session_finished: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Publish interactions into the bound session.
+
+        Identical to :meth:`ReflexioClient.publish_interaction` except that
+        ``session_id`` defaults to the bound session.
+        """
+        return self._client.publish_interaction(
+            user_id=user_id,
+            interactions=interactions,
+            source=source,
+            agent_version=agent_version,
+            session_id=self._resolve(session_id),
+            wait_for_response=wait_for_response,
+            skip_aggregation=skip_aggregation,
+            force_extraction=force_extraction,
+            session_finished=session_finished,
+            evaluation_only=evaluation_only,
+            override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
+        )
+
+    async def publish_interaction_async(
+        self,
+        user_id: str,
+        interactions: Sequence[InteractionData | dict],
+        source: str = "",
+        agent_version: str = DEFAULT_AGENT_VERSION,
+        session_id: str | None = None,
+        wait_for_response: bool = False,
+        skip_aggregation: bool = False,
+        force_extraction: bool = False,
+        evaluation_only: bool = False,
+        override_learning_stall: bool = False,
+        retrieval_experiment_id: str | None = None,
+        retrieval_experiment_arm: Literal["treatment", "holdout"] | None = None,
+        session_finished: bool = False,
+    ) -> PublishUserInteractionResponse:
+        """Native-async counterpart to :meth:`publish_interaction`."""
+        return await self._client.publish_interaction_async(
+            user_id=user_id,
+            interactions=interactions,
+            source=source,
+            agent_version=agent_version,
+            session_id=self._resolve(session_id),
+            wait_for_response=wait_for_response,
+            skip_aggregation=skip_aggregation,
+            force_extraction=force_extraction,
+            session_finished=session_finished,
+            evaluation_only=evaluation_only,
+            override_learning_stall=override_learning_stall,
+            retrieval_experiment_id=retrieval_experiment_id,
+            retrieval_experiment_arm=retrieval_experiment_arm,
+        )
+
+    # -- search -----------------------------------------------------------
+
+    def search(
+        self,
+        request: UnifiedSearchRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        entity_types: list[str] | None = None,
+        agent_playbook_status_filter: list[PlaybookStatus | str] | None = None,
+        enable_reformulation: bool | None = None,
+        enable_agent_answer: bool | None = None,
+        conversation_history: list[ConversationTurn] | list[dict] | None = None,
+        search_mode: SearchMode | str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        interaction_id: int | None = None,
+    ) -> UnifiedSearchViewResponse:
+        """Search within the bound session.
+
+        Identical to :meth:`ReflexioClient.search` except that
+        ``session_id`` defaults to the bound session, so the learnings this
+        returns are attributable to the same session a later
+        :meth:`publish_interaction` records.
+        """
+        return self._client.search(
+            self._scope_request(request),
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            user_id=user_id,
+            source=source,
+            tags=tags,
+            entity_types=entity_types,
+            agent_playbook_status_filter=agent_playbook_status_filter,
+            enable_reformulation=enable_reformulation,
+            enable_agent_answer=enable_agent_answer,
+            conversation_history=conversation_history,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=self._resolve(session_id),
+            interaction_id=interaction_id,
+        )
+
+    async def search_async(
+        self,
+        request: UnifiedSearchRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        tags: list[str] | None = None,
+        entity_types: list[str] | None = None,
+        agent_playbook_status_filter: list[PlaybookStatus | str] | None = None,
+        enable_reformulation: bool | None = None,
+        enable_agent_answer: bool | None = None,
+        conversation_history: list[ConversationTurn] | list[dict] | None = None,
+        search_mode: SearchMode | str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        interaction_id: int | None = None,
+    ) -> UnifiedSearchViewResponse:
+        """Native-async counterpart to :meth:`search`."""
+        return await self._client.search_async(
+            self._scope_request(request),
+            query=query,
+            top_k=top_k,
+            threshold=threshold,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            user_id=user_id,
+            source=source,
+            tags=tags,
+            entity_types=entity_types,
+            agent_playbook_status_filter=agent_playbook_status_filter,
+            enable_reformulation=enable_reformulation,
+            enable_agent_answer=enable_agent_answer,
+            conversation_history=conversation_history,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=self._resolve(session_id),
+            interaction_id=interaction_id,
+        )
+
+    def search_user_playbooks(
+        self,
+        request: SearchUserPlaybookRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        user_id: str | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        tags: list[str] | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+    ) -> SearchUserPlaybooksViewResponse:
+        """Search user playbooks within the bound session.
+
+        Identical to :meth:`ReflexioClient.search_user_playbooks` except
+        that ``session_id`` defaults to the bound session.
+        """
+        return self._client.search_user_playbooks(
+            self._scope_request(request),
+            query=query,
+            user_id=user_id,
+            agent_version=agent_version,
+            playbook_name=playbook_name,
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            status_filter=status_filter,
+            tags=tags,
+            top_k=top_k,
+            threshold=threshold,
+            enable_reformulation=enable_reformulation,
+            search_mode=search_mode,
+            request_id=request_id,
+            session_id=self._resolve(session_id),
+        )
+
+    # -- retrieval bound through the request model ------------------------
+    #
+    # These four take no ``session_id`` parameter: they carry correlation
+    # only as a field of the request they build. Each therefore binds by
+    # building that request here and handing it down, rather than by passing
+    # an argument through.
+
+    def search_user_profiles(
+        self,
+        request: SearchUserProfileRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        generated_from_request_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        source: str | None = None,
+        custom_feature: str | None = None,
+        extractor_name: str | None = None,
+        tags: list[str] | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchProfilesViewResponse:
+        """Search user profiles within the bound session.
+
+        Identical to :meth:`ReflexioClient.search_user_profiles` except that
+        the request carries the bound session.
+        """
+        return self._client.search_user_profiles(
+            self._bind_request(
+                request,
+                SearchUserProfileRequest,
+                user_id=user_id,
+                generated_from_request_id=generated_from_request_id,
+                query=query,
+                start_time=start_time,
+                end_time=end_time,
+                top_k=top_k,
+                source=source,
+                custom_feature=custom_feature,
+                extractor_name=extractor_name,
+                tags=tags,
+                threshold=threshold,
+                enable_reformulation=enable_reformulation,
+                search_mode=search_mode,
+            )
+        )
+
+    # NOTE: keep signature in sync with search_user_profiles
+    def search_profiles(
+        self,
+        request: SearchUserProfileRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        generated_from_request_id: str | None = None,
+        query: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+        source: str | None = None,
+        custom_feature: str | None = None,
+        extractor_name: str | None = None,
+        tags: list[str] | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchProfilesViewResponse:
+        """Deprecated alias of :meth:`search_user_profiles`, session bound.
+
+        Warns from *this* frame and then forwards to the replacement, rather
+        than forwarding to the deprecated method and relying on its warning.
+        ``ReflexioClient.search_profiles`` warns with ``stacklevel=2``, which
+        names its immediate caller -- through a wrapper that is this module,
+        not the user's code. Python's default filters only surface a
+        DeprecationWarning attributed to ``__main__``, so the scoped alias
+        was silent for every caller not running with warnings enabled, while
+        the unscoped one warned normally.
+        """
+        warnings.warn(
+            "ReflexioClient.search_profiles() is deprecated; use "
+            "search_user_profiles() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._client.search_user_profiles(
+            self._bind_request(
+                request,
+                SearchUserProfileRequest,
+                user_id=user_id,
+                generated_from_request_id=generated_from_request_id,
+                query=query,
+                start_time=start_time,
+                end_time=end_time,
+                top_k=top_k,
+                source=source,
+                custom_feature=custom_feature,
+                extractor_name=extractor_name,
+                tags=tags,
+                threshold=threshold,
+                enable_reformulation=enable_reformulation,
+                search_mode=search_mode,
+            )
+        )
+
+    def search_agent_playbooks(
+        self,
+        request: SearchAgentPlaybookRequest | dict | None = None,
+        *,
+        query: str | None = None,
+        user_id: str | None = None,
+        agent_version: str | None = None,
+        playbook_name: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
+        top_k: int | None = None,
+        threshold: float | None = None,
+        enable_reformulation: bool | None = None,
+        search_mode: SearchMode | None = None,
+    ) -> SearchAgentPlaybooksViewResponse:
+        """Search agent playbooks within the bound session.
+
+        Identical to :meth:`ReflexioClient.search_agent_playbooks` except
+        that the request carries the bound session.
+        """
+        return self._client.search_agent_playbooks(
+            self._bind_request(
+                request,
+                SearchAgentPlaybookRequest,
+                query=query,
+                user_id=user_id,
+                agent_version=agent_version,
+                playbook_name=playbook_name,
+                source=source,
+                start_time=start_time,
+                end_time=end_time,
+                status_filter=status_filter,
+                playbook_status_filter=playbook_status_filter,
+                tags=tags,
+                top_k=top_k,
+                threshold=threshold,
+                enable_reformulation=enable_reformulation,
+                search_mode=search_mode,
+            )
+        )
+
+    def get_agent_playbooks(
+        self,
+        request: GetAgentPlaybooksRequest | dict | None = None,
+        force_refresh: bool = False,
+        *,
+        limit: int | None = None,
+        agent_playbook_id: int | None = None,
+        query: str | None = None,
+        playbook_name: str | None = None,
+        agent_version: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        status_filter: list[Status | None] | None = None,
+        playbook_status_filter: PlaybookStatus | None = None,
+        tags: list[str] | None = None,
+    ) -> GetAgentPlaybooksViewResponse:
+        """Get agent playbooks within the bound session.
+
+        Identical to :meth:`ReflexioClient.get_agent_playbooks` except that
+        the request carries the bound session. ``force_refresh`` is not a
+        request field, so it is forwarded as an argument.
+        """
+        return self._client.get_agent_playbooks(
+            self._bind_request(
+                request,
+                GetAgentPlaybooksRequest,
+                limit=limit,
+                agent_playbook_id=agent_playbook_id,
+                query=query,
+                playbook_name=playbook_name,
+                agent_version=agent_version,
+                start_time=start_time,
+                end_time=end_time,
+                status_filter=status_filter,
+                playbook_status_filter=playbook_status_filter,
+                tags=tags,
+            ),
+            force_refresh,
+        )
+
+    # -- session lifecycle ------------------------------------------------
+
+    def mark_session_outcome(
+        self,
+        *,
+        outcome: SessionOutcomeKind | str,
+        occurred_at: int,
+        session_id: str | None = None,
+        label: str | None = None,
+        value: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SetSessionOutcomeResponse:
+        """Record the outcome of the bound session.
+
+        Identical to :meth:`ReflexioClient.mark_session_outcome` except
+        that ``session_id`` defaults to the bound session.
+        """
+        return self._client.mark_session_outcome(
+            session_id=self._resolve(session_id),
+            outcome=outcome,
+            occurred_at=occurred_at,
+            label=label,
+            value=value,
+            metadata=metadata,
+        )
+
+    def get_session_outcomes(
+        self,
+        *,
+        session_ids: list[str] | None = None,
+        user_id: str | None = None,
+        source: str | None = None,
+        outcome: SessionOutcomeKind | str | None = None,
+        label: str | None = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        top_k: int = 100,
+        offset: int = 0,
+    ) -> GetSessionOutcomesResponse:
+        """Read outcomes for the bound session.
+
+        Identical to :meth:`ReflexioClient.get_session_outcomes` except
+        that ``session_ids`` defaults to ``[bound session]``. Use
+        ``.client`` to read across sessions.
+        """
+        return self._client.get_session_outcomes(
+            session_ids=self._resolve_many(session_ids),
+            user_id=user_id,
+            source=source,
+            outcome=outcome,
+            label=label,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+            offset=offset,
+        )
+
+    def delete_session(
+        self, session_id: str | None = None, wait_for_response: bool = False
+    ) -> DeleteSessionResponse | None:
+        """Delete the bound session's requests and interactions.
+
+        Identical to :meth:`ReflexioClient.delete_session` except that
+        ``session_id`` defaults to the bound session.
+        """
+        return self._client.delete_session(
+            self._resolve(session_id), wait_for_response=wait_for_response
+        )
+
+    # -- reads and evaluation ---------------------------------------------
+
+    def get_requests(
+        self,
+        request: GetRequestsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        request_id: str | None = None,
+        session_id: str | None = None,
+        source: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        top_k: int | None = None,
+    ) -> GetRequestsViewResponse:
+        """Read requests in the bound session.
+
+        Identical to :meth:`ReflexioClient.get_requests` except that
+        ``session_id`` defaults to the bound session.
+        """
+        return self._client.get_requests(
+            self._scope_request(request),
+            user_id=user_id,
+            request_id=request_id,
+            session_id=self._resolve(session_id),
+            source=source,
+            start_time=start_time,
+            end_time=end_time,
+            top_k=top_k,
+        )
+
+    def get_retrieved_learning_evaluation_results(
+        self,
+        request: GetRetrievedLearningEvaluationResultsRequest | dict | None = None,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int | None = None,
+    ) -> GetRetrievedLearningEvaluationResultsResponse:
+        """Read retrieved-learning verdicts for the bound session.
+
+        Identical to
+        :meth:`ReflexioClient.get_retrieved_learning_evaluation_results`
+        except that ``session_id`` defaults to the bound session.
+        """
+        return self._client.get_retrieved_learning_evaluation_results(
+            self._scope_request(request),
+            user_id=user_id,
+            session_id=self._resolve(session_id),
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
+
+    def grade_on_demand(
+        self,
+        request: GradeOnDemandRequest | dict | None = None,
+        *,
+        session_id: str | None = None,
+        agent_version: str | None = None,
+        evaluation_name: str | None = None,
+    ) -> GradeOnDemandResponse:
+        """Grade the bound session synchronously.
+
+        Identical to :meth:`ReflexioClient.grade_on_demand` except that
+        ``session_id`` defaults to the bound session.
+        """
+        return self._client.grade_on_demand(
+            self._scope_request(request),
+            session_id=self._resolve(session_id),
+            agent_version=agent_version,
+            evaluation_name=evaluation_name,
+        )

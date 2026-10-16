@@ -1,0 +1,1087 @@
+"""Process-local scheduler for lineage tombstone garbage collection and expiry reclamation.
+
+Startup runs when EITHER ``lineage_gc.enabled`` OR ``expiry_reclamation.enabled``
+OR ``governance_retention.audit_events_retention_enabled`` is set in the bootstrap
+org's config. Each tick evaluates every org independently.
+
+- **Class A** (profile expiry sweep + tombstone GC): gated on ``lineage_gc.enabled``.
+  Hard-deletes expired tombstones per that org's ``lineage_gc`` config.
+- **Class B** (plain-row direct-delete sweeps, no PII/audit obligation): gated on
+  ``expiry_reclamation.enabled``. Currently sweeps expired share links and expired
+  pending tool calls.
+- **Per-org sweeps**: registered via :func:`register_per_org_sweep`; invoked
+  unconditionally once per org after the Class-B block. Enterprise registers a
+  governance-retention closure here at startup (see ``reflexio_ext``).
+
+One org's failure never stalls the loop; errors are captured as anomalies
+and the loop continues to the next org.
+
+A tick in which work genuinely FAILED is retried sooner (bounded; see
+``_FAILED_TICK_RETRY_SECONDS``). An org that only ran out of its per-org time
+budget does not fail the tick: it is logged as ``org_sweep_timeout`` and, if it
+times out again on the next tick, escalated as
+``lineage.gc.org_sweep_timeout_repeat``. A timed-out org's thread keeps running
+in the background; a failure it records after its own tick ended is ignored
+rather than charged to the tick then running.
+
+Note: the poll interval is always taken from ``lineage_gc.poll_interval_seconds``
+even when only ``expiry_reclamation`` or ``governance_retention`` is enabled;
+all sweep classes share that cadence.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Callable
+
+from reflexio.models.config_schema import Config
+from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.auth import DEFAULT_ORG_ID
+from reflexio.server.background_work import (
+    report_background_failure,
+    report_background_success,
+)
+from reflexio.server.env_utils import env_str
+from reflexio.server.error_reporting import capture_anomaly
+from reflexio.server.org_fanout import iterate_orgs_bounded
+from reflexio.server.scheduling import LeaderGate, ThreadedScheduler
+from reflexio.server.services.storage.retention import get_row_retention_limits
+from reflexio.server.services.storage.retention_sweep import (
+    RetentionSweepResult,
+    sweep_retention_caps,
+)
+from reflexio.server.services.storage.storage_base import BaseStorage
+from reflexio.server.work_scope import WorkScope, WorkScopeError, bind_work_scope
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_POLL_INTERVAL_SECONDS = 86400
+_MIN_POLL_SECONDS = 1
+_BOOTSTRAP_RETRY_INTERVAL_SECONDS = 5
+_ORG_SWEEP_TIMEOUT_SECONDS = 60.0
+_DEFAULT_ORG_FANOUT_WORKERS = 8
+
+# How soon to tick again after a tick in which work FAILED, rather than waiting
+# the full `poll_interval_seconds` (86400s by default).
+#
+# Measured on staging, 2026-09-24: 18 of 18 orgs failed one tick with PostgREST
+# `PGRST002: Could not query the database for the schema cache. Retrying.` The
+# scheduler's first tick fires seconds after boot, which is exactly when that
+# cache is cold after a deploy -- so the boot tick is the MOST likely to hit it.
+# Waiting a full day on a transient PostgREST itself calls retryable put
+# retention off for 24h, and a service redeployed more often than daily would
+# never have swept at all.
+_FAILED_TICK_RETRY_SECONDS = 300.0
+
+# ...but bounded. A persistently broken dependency already fires an anomaly on
+# every tick; retrying it every 5 minutes forever would reintroduce exactly the
+# repeated-probe cost that moving this sweep off the publish path removed.
+_MAX_CONSECUTIVE_FAST_RETRIES = 3
+
+# Window-misconfiguration tripwire: if a single tick deletes more than this
+# many tombstones for one org, something is likely wrong with the grace window.
+_HIGH_VOLUME_THRESHOLD = 1000
+
+_ENTITY_TYPES = ("user_playbook", "agent_playbook", "profile")
+
+# Class B: direct-delete sweeps for expired plain rows (no PII/audit obligation).
+# Each entry is (storage_method_name, grace_seconds, batch_limit).
+# Methods added in Tasks 2.2 / 2.3; getattr-guarded so missing impls are skipped.
+_CLASS_B_SWEEPS: tuple[tuple[str, int, int], ...] = (
+    ("delete_expired_share_links", 7 * 86400, 1000),
+    ("delete_expired_pending_tool_calls", 1 * 86400, 1000),
+)
+
+# Injection seam: a deployment (e.g. enterprise/managed) sets a tenant-enumerating
+# provider here at startup so the single OSS-started scheduler sweeps ALL tenant
+# orgs. maybe_start_lineage_gc reads this when no explicit provider is passed.
+# None (OSS default) keeps behavior byte-for-byte identical to before.
+_org_id_provider_hook: Callable[[], list[str]] | None = None
+
+
+def set_org_id_provider(provider: Callable[[], list[str]] | None) -> None:
+    """Register the org-id provider consulted by ``maybe_start_lineage_gc``.
+
+    Managed multi-tenant deployments call this at app-construction time so the
+    lineage GC / expiry sweep reaches every tenant org (``storage.list_org_ids()``
+    raises ``NotImplementedError`` on Supabase, degrading to bootstrap-only).
+    Pass ``None`` to clear the hook (used by tests to restore OSS defaults).
+
+    Args:
+        provider (Callable[[], list[str]] | None): Callable returning the tenant
+            org ids to sweep, or ``None`` to clear.
+    """
+    global _org_id_provider_hook  # noqa: PLW0603
+    _org_id_provider_hook = provider
+
+
+# Injection seam: a deployment with projects registers a per-org project
+# enumerator here, so each org's sweeps run once per project with that project
+# bound. Without it (OSS default) `_project_ids_for` yields a single `None`,
+# `bind_work_scope(None)` is a no-op, and the tick is byte-for-byte what it was.
+#
+# This exists because the sweeps below write project-scoped tables. An org-only
+# context passes no project, and under the enterprise row-level policies the
+# reads then return ZERO ROWS rather than failing -- so lineage GC ran every
+# tick and deleted nothing, silently, which is how it went unnoticed.
+_project_id_provider_hook: Callable[[str], list[str]] | None = None
+
+
+def set_project_id_provider(provider: Callable[[str], list[str]] | None) -> None:
+    """Register the per-org project enumerator consulted by ``_sweep_org``.
+
+    Deployments that have projects call this at app-composition time so each
+    org's sweeps run once per project, with that project bound. ``None`` (OSS
+    default) keeps the single unscoped pass. Pass ``None`` to clear the hook
+    (used by tests to restore OSS defaults).
+
+    Args:
+        provider (Callable[[str], list[str]] | None): Callable taking an org id
+            and returning that org's project ids, or ``None`` to clear.
+    """
+    global _project_id_provider_hook  # noqa: PLW0603
+    _project_id_provider_hook = provider
+
+
+# Injection seam: enterprise sets the fleet leader gate here at composition
+# time (spec 4.3), exactly like set_org_id_provider. None (OSS default) keeps
+# the always-tick behavior.
+_leader_gate_hook: LeaderGate | None = None
+
+
+def set_leader_gate(gate: LeaderGate | None) -> None:
+    """Register the leader gate consulted by ``maybe_start_lineage_gc``.
+
+    Enterprise deployments call this at app-composition time so the scheduler
+    only ticks on the elected leader (``gate.should_run()`` wraps fleet leader
+    election, e.g. an advisory-lock gate). ``None`` (OSS default) preserves
+    always-tick behavior. Pass ``None`` to clear the hook (tests restore defaults).
+
+    Args:
+        gate (LeaderGate | None): Fleet-coordination gate, or ``None`` to clear.
+    """
+    global _leader_gate_hook  # noqa: PLW0603
+    _leader_gate_hook = gate
+
+
+# Injection seam: enterprise aligns the healthy cadence to a fixed daily slot.
+# None (OSS default) keeps "poll_interval_seconds after the tick ended", which
+# drifts the start time later by each tick's duration.
+_healthy_interval_provider_hook: Callable[[float], float] | None = None
+
+
+def set_healthy_interval_provider(
+    provider: Callable[[float], float] | None,
+) -> None:
+    """Register how long to wait after a healthy (or retries-exhausted) tick.
+
+    The provider receives the configured ``poll_interval_seconds`` and returns
+    the seconds to wait, e.g. the time until the next daily UTC slot, so the
+    sweep starts at the same wall-clock time every day instead of drifting by
+    each tick's duration. The failed-tick fast retry is never affected.
+    ``None`` (OSS default) clears the hook.
+
+    Args:
+        provider (Callable[[float], float] | None): Wait-seconds provider, or
+            ``None`` to clear.
+    """
+    global _healthy_interval_provider_hook  # noqa: PLW0603
+    _healthy_interval_provider_hook = provider
+
+
+def _healthy_interval(poll_interval: float) -> float:
+    provider = _healthy_interval_provider_hook
+    wait = provider(poll_interval) if provider is not None else poll_interval
+    return max(wait, _MIN_POLL_SECONDS)
+
+
+# Global sweeps run once per tick (for GLOBAL, non-tenant-scoped tables),
+# gated on expiry_reclamation.enabled. Each fn takes `now` (unix epoch) and
+# returns a deleted-row count. Enterprise registers its sweeps here at startup;
+# empty (OSS default) keeps behavior byte-for-byte identical to before.
+_global_sweep_hooks: list[Callable[[int], int]] = []
+
+
+def register_global_sweep(fn: Callable[[int], int]) -> None:
+    """Register a global (once-per-tick) reclamation sweep.
+
+    Note: a registered sweep that absorbs its own exceptions (returns instead
+    of raising) will NOT trigger the generic ``lineage.global_sweep.failed``
+    backstop; such a sweep must emit its own failure anomaly.
+
+    Args:
+        fn (Callable[[int], int]): Called with the current unix epoch; returns
+            the number of rows it deleted.
+    """
+    if fn not in _global_sweep_hooks:
+        _global_sweep_hooks.append(fn)
+
+
+def clear_global_sweeps() -> None:
+    """Clear all registered global sweeps (tests restore OSS defaults)."""
+    _global_sweep_hooks.clear()
+
+
+# Always-global sweeps run once per elected tick and own their applicability
+# checks. Enterprise uses this for global maintenance that must not inherit the
+# unrelated expiry-reclamation feature gate.
+_always_global_sweep_hooks: list[Callable[[int], int]] = []
+
+
+def register_always_global_sweep(fn: Callable[[int], int]) -> None:
+    """Register an always-evaluated global sweep.
+
+    The scheduler's leader gate still controls the tick. The sweep itself must
+    decide whether its backing service is configured for this deployment.
+
+    Args:
+        fn (Callable[[int], int]): Called with the current unix epoch; returns
+            the number of rows it processed.
+    """
+    if fn not in _always_global_sweep_hooks:
+        _always_global_sweep_hooks.append(fn)
+
+
+def clear_always_global_sweeps() -> None:
+    """Clear all always-evaluated global sweeps (tests restore defaults)."""
+    _always_global_sweep_hooks.clear()
+
+
+# Per-org sweeps run once per org per tick (for per-org reclamation concerns).
+# Each fn takes (org_id, now) and returns a deleted-row count. Enterprise
+# registers its closure here at startup so governance retention folds into the
+# shared scheduler loop; empty (OSS default) keeps behavior identical to before.
+_per_org_sweep_hooks: list[Callable[[str, int], int]] = []
+
+
+def register_per_org_sweep(fn: Callable[[str, int], int]) -> None:
+    """Register a per-org reclamation sweep.
+
+    The sweep is invoked once per org inside ``_sweep_org``, after the
+    Class-B block, unconditionally (not gated on ``lineage_gc`` or
+    ``expiry_reclamation`` — the real gate lives in the enterprise closure).
+
+    Note: a registered sweep that absorbs its own exceptions (returns instead
+    of raising) will NOT trigger the generic ``lineage.per_org_sweep.failed``
+    backstop; such a sweep must emit its own failure anomaly.
+
+    Args:
+        fn (Callable[[str, int], int]): Called with ``(org_id, now)`` where
+            ``now`` is the current unix epoch; returns the number of rows deleted.
+    """
+    if fn not in _per_org_sweep_hooks:
+        _per_org_sweep_hooks.append(fn)
+
+
+def clear_per_org_sweeps() -> None:
+    """Clear all registered per-org sweeps (tests restore OSS defaults)."""
+    _per_org_sweep_hooks.clear()
+
+
+class LineageGCScheduler(ThreadedScheduler):
+    """Polling daemon that hard-deletes expired tombstones per org."""
+
+    def __init__(
+        self,
+        *,
+        request_context_factory: Callable[[str], RequestContext],
+        bootstrap_org_id: str,
+        org_id_provider: Callable[[], list[str]] | None = None,
+        leader_gate: LeaderGate | None = None,
+    ) -> None:
+        super().__init__(
+            thread_name="reflexio-lineage-gc-scheduler", leader_gate=leader_gate
+        )
+        self.request_context_factory = request_context_factory
+        self.bootstrap_org_id = bootstrap_org_id
+        # Optional injectable org-id source. When set (managed/multi-tenant mode),
+        # it is the authoritative enumeration seam; enterprise supplies a
+        # provider that lists tenant orgs via the control-plane repository — the
+        # only seam that surfaces managed tenants where storage.list_org_ids()
+        # raises NotImplementedError on Supabase. When None (OSS default),
+        # discovery falls back to storage.list_org_ids() exactly as before.
+        self.org_id_provider = org_id_provider
+        # Orgs that timed out on the PREVIOUS tick; a repeat escalates.
+        self._prior_timeout_orgs: set[str] = set()
+        # Set by any org's Class C pass that could not complete. Written from
+        # up to `_org_fanout_workers` threads, so it takes a lock rather than
+        # relying on the GIL to make `|=` atomic.
+        self._tick_had_failure = False
+        self._failure_lock = threading.Lock()
+        # Bumped at the start of every tick. An org worker records the
+        # generation it was submitted under in `_worker_generation`, so a
+        # straggler -- a timed-out org thread Python cannot kill -- that fails
+        # after its tick ended cannot mark a LATER tick failed.
+        self._tick_generation = 0
+        self._worker_generation = threading.local()
+        # Consecutive ticks that ended in failure, to bound the fast retry.
+        self._consecutive_failed_ticks = 0
+
+    def _on_started(self) -> None:
+        logger.info("event=lineage_gc_scheduler_started")
+
+    def _on_stopped(self) -> None:
+        logger.info("event=lineage_gc_scheduler_stopped")
+
+    def _discover_org_ids(self, bootstrap_ctx: RequestContext) -> list[str]:
+        """Return the orgs this tick should sweep.
+
+        When an ``org_id_provider`` was injected (managed/multi-tenant mode), it
+        is the authoritative org-id source: ``storage.list_org_ids()`` is not
+        consulted and the bootstrap org is NOT unioned in. Otherwise the OSS
+        single-tenant path is used unchanged (``storage.list_org_ids()`` with a
+        visible NotImplementedError fallback), and the bootstrap org is unioned
+        because there it is genuinely the only org GC would otherwise reach.
+
+        The bootstrap org is a *discovery seed*, resolved by the lowest org id
+        with no predicate — so in a managed deployment it can easily be an
+        abandoned unverified signup. Unioning it back after a provider has
+        deliberately filtered it re-admits an org the provider judged
+        unsweepable, and sweeping such an org raises PostgREST ``PGRST106``
+        ("Invalid schema") on every tick, because a tenant schema is only
+        exposed once its org is verified. That is not hypothetical: it ran in
+        production against ``org_23`` (see ``expiry_reclamation.org_enumeration``,
+        whose ``_is_sweepable`` docstring warns against exactly this caller).
+
+        A provider that returns an EMPTY list is still authoritative — "nothing
+        is sweepable" is a legitimate answer and must not be overridden by the
+        seed. Only a provider that *raised* falls back to the bootstrap org,
+        which is a deliberate, logged degradation.
+        """
+        if self.org_id_provider is not None:
+            try:
+                discovered = list(self.org_id_provider())
+            except Exception as exc:
+                capture_anomaly(
+                    "lineage.gc.org_id_provider_failed",
+                    bootstrap_org_id=self.bootstrap_org_id,
+                )
+                report_background_failure(
+                    logger,
+                    "lineage_gc_org_id_provider_failed",
+                    exc,
+                    scope="lineage-gc-org-discovery",
+                    bootstrap_org_id=self.bootstrap_org_id,
+                    fallback="bootstrap_org_only",
+                )
+                self._record_tick_failure()
+                return [bootstrap_ctx.org_id]
+            report_background_success("lineage-gc-org-discovery")
+            return discovered
+
+        storage = getattr(bootstrap_ctx, "storage", None)
+        org_ids: list[str] = []
+        if storage is not None:
+            try:
+                org_ids = storage.list_org_ids()
+            except NotImplementedError:
+                logger.warning(
+                    "event=lineage_gc_list_org_ids_not_implemented "
+                    "backend=%s bootstrap_org_id=%s — GC will only process bootstrap org",
+                    type(storage).__name__,
+                    bootstrap_ctx.org_id,
+                )
+                org_ids = []
+        if bootstrap_ctx.org_id not in org_ids:
+            org_ids = [bootstrap_ctx.org_id, *org_ids]
+        return org_ids
+
+    def _sweep_org(self, org_id: str) -> None:
+        """Run Class A, Class B, and per-org sweeps for a single org.
+
+        Extracted from ``_gc_tick``'s per-org loop body so it can be handed to
+        :func:`iterate_orgs_bounded` as the per-org work item; the stop-event
+        check that used to guard the loop iteration now lives in that helper.
+
+        Args:
+            org_id (str): The org to sweep this tick.
+        """
+        try:
+            ctx = self.request_context_factory(org_id)
+            if ctx.storage is None:
+                return
+            cfg = ctx.configurator.get_config()
+        except Exception as exc:
+            capture_anomaly("lineage.gc.run_failed", org_id=org_id)
+            report_background_failure(
+                logger,
+                "lineage_gc_org_failed",
+                exc,
+                scope=f"lineage-gc:{org_id}",
+                org_id=org_id,
+            )
+            self._record_tick_failure()
+            return
+        report_background_success(f"lineage-gc:{org_id}")
+
+        # One pass per project, not one per org. Everything below writes
+        # project-scoped tables; with no project bound the enterprise row-level
+        # policies match nothing, so the sweep deleted nothing and said so only
+        # through an `unbound_app_credential` probe warning.
+        #
+        # `cfg` is read once, outside the loop, on purpose: `lineage_gc` and
+        # `expiry_reclamation` are deliberately NOT project-overridable, so
+        # there is one window per org and re-reading it per project would imply
+        # a per-project value that cannot exist.
+        for project_id in self._project_ids_for(org_id):
+            scope = (
+                None
+                if project_id is None
+                else WorkScope(org_id=org_id, project_id=project_id)
+            )
+            try:
+                with bind_work_scope(scope):
+                    self._sweep_project_data(org_id, ctx.storage, cfg, project_id)
+            except WorkScopeError:
+                # A project that vanished between enumeration and binding.
+                # Escalate and keep going: letting this out of the loop would
+                # skip every remaining project's cleanup for one stale id.
+                capture_anomaly(
+                    "lineage.gc.scope_failed", org_id=org_id, project_id=project_id
+                )
+                logger.exception(
+                    "event=lineage_gc_scope_failed org_id=%s project_id=%s",
+                    org_id,
+                    project_id,
+                )
+
+        # Per-org sweeps: invoked unconditionally once per org (the real gate
+        # lives in each enterprise closure). Extracted to keep _gc_tick's
+        # cyclomatic complexity in check and to mirror _run_global_sweeps.
+        self._run_per_org_sweeps(org_id)
+
+    def _project_ids_for(self, org_id: str) -> list[str | None]:
+        """Return the project ids to sweep for ``org_id``.
+
+        Without a registered provider (OSS) this is a single ``None``, which
+        makes ``bind_work_scope`` a no-op and preserves the original single
+        unscoped pass exactly.
+
+        Args:
+            org_id (str): The org being swept this tick.
+
+        Returns:
+            list[str | None]: Project ids, or ``[None]`` when unscoped.
+        """
+        if _project_id_provider_hook is None:
+            return [None]
+        try:
+            project_ids: list[str | None] = list(_project_id_provider_hook(org_id))
+        except Exception as exc:
+            # Enumeration is the whole tick for this org; a failure here must
+            # not silently degrade to an unscoped pass that deletes nothing.
+            capture_anomaly("lineage.gc.project_enumeration_failed", org_id=org_id)
+            report_background_failure(
+                logger,
+                "lineage_gc_project_enumeration_failed",
+                exc,
+                scope=f"lineage-gc-projects:{org_id}",
+                org_id=org_id,
+            )
+            # No project ids means NO pass runs for this org -- including Class C
+            # -- so without this the tick reports clean while retention did not
+            # run at all. That is the silence this whole change exists to remove.
+            self._record_tick_failure()
+            return []
+        if project_ids:
+            report_background_success(f"lineage-gc-projects:{org_id}")
+        else:
+            # Not a success either: a provider may swallow its own lookup
+            # failure and return [] (the enterprise one does, at ERROR).
+            #
+            # NOT a fallback to one unscoped pass. Under project row-level
+            # policies an unscoped sweep matches nothing anyway, so the fallback
+            # would do no work while re-emitting the very unbound-credential
+            # warning this change exists to clear. Skipping says the same thing
+            # honestly. Mirrors the aggregation capability, which skips an org
+            # with no project to attribute its work to.
+            logger.warning(
+                "event=lineage_gc_no_projects org_id=%s -- skipping; the sweeps "
+                "are project-scoped and this org has no project to bind",
+                org_id,
+            )
+        return project_ids
+
+    def _sweep_project_data(
+        self,
+        org_id: str,
+        storage: BaseStorage,
+        cfg: Config,
+        project_id: str | None = None,
+    ) -> None:
+        """Run the Class A and Class B sweeps for the bound project.
+
+        Called once per project with that project bound; see ``_sweep_org``.
+
+        Args:
+            org_id (str): Org being swept, for log/anomaly attribution.
+            storage (BaseStorage): The org's storage, already known non-None.
+            cfg (Config): The org config resolved once by ``_sweep_org``.
+            project_id (str | None): The bound project; None for the single
+                unscoped OSS pass.
+        """
+        # Failure streaks are per (org, project): this runs once per project
+        # each tick, so an org-wide scope would count one failing project N
+        # times per tick and let a healthy sibling clear its streak. Passed in
+        # rather than read from the bound scope, which is inert in OSS.
+        unit = f"{org_id}:{project_id}"
+        # Class A: profile expiry sweep (requires PII/grace sign-off; gated on
+        # lineage_gc.enabled independently of Class B).
+        if cfg.lineage_gc.enabled:
+            try:
+                expired_tombstoned = storage.expire_active_profiles(
+                    now=int(time.time())
+                )
+                if expired_tombstoned:
+                    logger.info(
+                        "event=expiry_sweep org_id=%s profiles_tombstoned=%d",
+                        org_id,
+                        expired_tombstoned,
+                    )
+                if expired_tombstoned > _HIGH_VOLUME_THRESHOLD:
+                    capture_anomaly(
+                        "lineage.expiry_sweep.high_volume",
+                        org_id=org_id,
+                        count=expired_tombstoned,
+                    )
+            except Exception as exc:
+                capture_anomaly("lineage.expiry_sweep.failed", org_id=org_id)
+                report_background_failure(
+                    logger,
+                    "lineage_expiry_sweep_failed",
+                    exc,
+                    scope=f"lineage-expiry-sweep:{unit}",
+                    org_id=org_id,
+                )
+                self._record_tick_failure()
+            else:
+                report_background_success(f"lineage-expiry-sweep:{unit}")
+
+            # Tombstone GC: each entity type is independent within the loop.
+            try:
+                older_than_epoch = (
+                    int(time.time())
+                    - cfg.lineage_gc.tombstone_grace_window_days * 86400
+                )
+                tombstone_deleted = 0
+                for entity_type in _ENTITY_TYPES:
+                    tombstone_deleted += storage.gc_expired_tombstones(
+                        entity_type=entity_type,
+                        older_than_epoch=older_than_epoch,
+                    )
+                if tombstone_deleted:
+                    logger.info(
+                        "event=lineage_gc_tick org_id=%s tombstone_deleted=%d",
+                        org_id,
+                        tombstone_deleted,
+                    )
+                if tombstone_deleted > _HIGH_VOLUME_THRESHOLD:
+                    capture_anomaly(
+                        "lineage.gc.high_volume",
+                        org_id=org_id,
+                        count=tombstone_deleted,
+                    )
+            except Exception as exc:
+                capture_anomaly("lineage.gc.tombstone_gc_failed", org_id=org_id)
+                report_background_failure(
+                    logger,
+                    "lineage_gc_tombstone_gc_failed",
+                    exc,
+                    scope=f"lineage-tombstone-gc:{unit}",
+                    org_id=org_id,
+                )
+                self._record_tick_failure()
+            else:
+                report_background_success(f"lineage-tombstone-gc:{unit}")
+
+        # Class B: direct-delete of expired plain rows (no audit/grace
+        # obligation; independent of lineage_gc).  Each sweep is isolated so
+        # one failing method does not skip the rest.
+        if (
+            getattr(cfg, "expiry_reclamation", None) is not None
+            and cfg.expiry_reclamation.enabled
+        ):
+            now = int(time.time())
+            for method_name, grace, limit in _CLASS_B_SWEEPS:
+                method = getattr(storage, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    deleted = method(now=now, grace_seconds=grace, limit=limit)
+                    if deleted:
+                        logger.info(
+                            "event=class_b_reclaim org_id=%s method=%s deleted=%d",
+                            org_id,
+                            method_name,
+                            deleted,
+                        )
+                except Exception as exc:
+                    capture_anomaly(
+                        "lineage.class_b_reclaim.failed",
+                        org_id=org_id,
+                        method=method_name,
+                    )
+                    report_background_failure(
+                        logger,
+                        "class_b_reclaim_failed",
+                        exc,
+                        scope=f"lineage-class-b:{unit}:{method_name}",
+                        org_id=org_id,
+                        method=method_name,
+                    )
+                    self._record_tick_failure()
+                else:
+                    report_background_success(f"lineage-class-b:{unit}:{method_name}")
+
+        # Class C: row-count retention caps. UNGATED -- the caps are env-driven
+        # and always in force, so this block has no config flag of its own, and
+        # deliberately does not inherit Class A's or Class B's.
+        #
+        # It lives HERE, inside the per-project loop, and not on the
+        # `register_per_org_sweep` seam, because that seam fires outside the
+        # loop with no project bound. An unbound pass reads zero rows under the
+        # row-level policies and reports success -- the silent failure mode
+        # documented on `_sweep_org`.
+        #
+        # `sweep_retention_caps` absorbs its own errors and emits its own
+        # `retention.sweep.failed` anomaly, so there is no generic backstop here.
+        result: RetentionSweepResult = sweep_retention_caps(org_id, storage)
+        if result.failed:
+            self._record_tick_failure()
+
+    def _gc_tick(self, org_ids: list[str], *, max_workers: int = 1) -> None:
+        """Run one GC pass across the given org IDs.
+
+        Factored out of ``_run_loop`` so tests can exercise it without threads.
+        Default ``max_workers=1`` is the serial path (used by existing tests);
+        ``_run_once`` passes the configured fan-out width.
+
+        Args:
+            org_ids (list[str]): Org IDs to process in this tick.
+            max_workers (int): Bounded fan-out width (1 = serial).
+        """
+        generation = self._tick_generation
+
+        def _sweep_in_generation(org_id: str) -> None:
+            self._worker_generation.value = generation
+            try:
+                self._sweep_org(org_id)
+            finally:
+                del self._worker_generation.value
+
+        timed_out = iterate_orgs_bounded(
+            org_ids,
+            _sweep_in_generation,
+            max_workers=max_workers,
+            per_org_timeout_seconds=_ORG_SWEEP_TIMEOUT_SECONDS,
+            stop_event=self._stop_event,
+        )
+        # A timeout does NOT fail the tick. The fast retry re-sweeps the WHOLE
+        # fleet, and one slow org would otherwise buy every org three extra
+        # passes a day -- while the timed-out thread is still running, so a
+        # retry 300s later only stacks a second sweep on the same slow org.
+        # Visibility comes from `org_sweep_timeout` (WARNING, in the fan-out)
+        # and, for an org that times out on consecutive ticks, the anomaly
+        # below. A straggler that later FAILS is kept out of the next tick's
+        # state by the generation check in `_record_tick_failure`.
+        for org_id in set(timed_out) & self._prior_timeout_orgs:
+            capture_anomaly("lineage.gc.org_sweep_timeout_repeat", org_id=org_id)
+        self._prior_timeout_orgs = set(timed_out)
+
+    def _org_fanout_workers(self, bootstrap_ctx: RequestContext) -> int:
+        """Resolve the fan-out width: SQLite pins to 1; else env (default 8).
+
+        SQLite: each worker would construct a fresh storage (connection +
+        migrate()) against one shared DB file — contention the serial loop
+        never produces — and OSS-local is usually one org anyway (spec 6.1).
+
+        Args:
+            bootstrap_ctx (RequestContext): This tick's bootstrap context.
+
+        Returns:
+            int: The pool width for this tick.
+        """
+        storage = getattr(bootstrap_ctx, "storage", None)
+        if storage is not None and "sqlite" in type(storage).__name__.lower():
+            return 1
+        raw = env_str(
+            "REFLEXIO_SCHEDULER_ORG_WORKERS", str(_DEFAULT_ORG_FANOUT_WORKERS)
+        )
+        try:
+            value = int(raw)
+        except ValueError:
+            return _DEFAULT_ORG_FANOUT_WORKERS
+        return value if value > 0 else _DEFAULT_ORG_FANOUT_WORKERS
+
+    def _run_per_org_sweeps(self, org_id: str) -> None:
+        """Invoke each registered per-org sweep once for this org.
+
+        Invoked unconditionally (not gated on ``lineage_gc``/``expiry_reclamation``
+        — the real gate lives in each enterprise closure). Per-sweep failure
+        isolation: one sweep raising does not skip the others; a sweep that
+        absorbs its own exceptions bypasses the ``lineage.per_org_sweep.failed``
+        backstop and must emit its own anomaly.
+
+        Args:
+            org_id: The org being swept this tick.
+        """
+        now = int(time.time())
+        for position, sweep in enumerate(_per_org_sweep_hooks):
+            sweep_id = getattr(sweep, "__qualname__", repr(sweep))
+            # Two hooks can share a qualname (closures from one factory); the
+            # registration position keeps their streaks apart.
+            sweep_key = f"{position}:{sweep_id}"
+            try:
+                deleted = sweep(org_id, now)
+                if deleted:
+                    logger.info(
+                        "event=per_org_sweep org_id=%s sweep=%s deleted=%d",
+                        org_id,
+                        sweep_id,
+                        deleted,
+                    )
+            except Exception as exc:
+                capture_anomaly(
+                    "lineage.per_org_sweep.failed",
+                    org_id=org_id,
+                    sweep=sweep_id,
+                )
+                report_background_failure(
+                    logger,
+                    "per_org_sweep_failed",
+                    exc,
+                    scope=f"lineage-per-org-sweep:{org_id}:{sweep_key}",
+                    org_id=org_id,
+                    sweep=sweep_id,
+                )
+                self._record_tick_failure()
+            else:
+                report_background_success(f"lineage-per-org-sweep:{org_id}:{sweep_key}")
+
+    def _run_global_sweeps(self, cfg: object) -> None:
+        """Invoke each registered global sweep once, gated on expiry_reclamation.
+
+        Per-sweep failure isolation: one sweep raising does not skip the others.
+        The specific per-entity anomaly is emitted inside each registered sweep;
+        this is a generic backstop.
+
+        Args:
+            cfg: The bootstrap-org config read for this tick.
+        """
+        expiry = getattr(cfg, "expiry_reclamation", None)
+        if expiry is None or not expiry.enabled:
+            return
+        now = int(time.time())
+        for position, sweep in enumerate(_global_sweep_hooks):
+            sweep_id = getattr(sweep, "__qualname__", repr(sweep))
+            # Two hooks can share a qualname (closures from one factory); the
+            # registration position keeps their streaks apart.
+            sweep_key = f"{position}:{sweep_id}"
+            try:
+                deleted = sweep(now)
+                if deleted:
+                    logger.info("event=global_sweep deleted=%d", deleted)
+            except Exception as exc:
+                capture_anomaly("lineage.global_sweep.failed", sweep=sweep_id)
+                report_background_failure(
+                    logger,
+                    "global_sweep_failed",
+                    exc,
+                    scope=f"lineage-global-sweep:{sweep_key}",
+                    sweep=sweep_id,
+                )
+                self._record_tick_failure()
+            else:
+                report_background_success(f"lineage-global-sweep:{sweep_key}")
+
+    def _run_always_global_sweeps(self) -> None:
+        """Invoke each applicability-owning global sweep once per elected tick."""
+        now = int(time.time())
+        for position, sweep in enumerate(_always_global_sweep_hooks):
+            sweep_id = getattr(sweep, "__qualname__", repr(sweep))
+            # Two hooks can share a qualname (closures from one factory); the
+            # registration position keeps their streaks apart.
+            sweep_key = f"{position}:{sweep_id}"
+            try:
+                processed = sweep(now)
+                if processed:
+                    logger.info("event=always_global_sweep processed=%d", processed)
+            except Exception as exc:
+                capture_anomaly("lineage.always_global_sweep.failed", sweep=sweep_id)
+                report_background_failure(
+                    logger,
+                    "always_global_sweep_failed",
+                    exc,
+                    scope=f"lineage-always-global-sweep:{sweep_key}",
+                    sweep=sweep_id,
+                )
+                self._record_tick_failure()
+            else:
+                report_background_success(f"lineage-always-global-sweep:{sweep_key}")
+
+    def _record_tick_failure(self) -> None:
+        """Mark this tick as having failed work, from any fan-out worker.
+
+        A call from an org worker submitted under an earlier tick (a straggler
+        that outlived its timeout) is ignored: its failure was already reported
+        at the call site, and it says nothing about the tick now running.
+        """
+        worker_generation = getattr(self._worker_generation, "value", None)
+        with self._failure_lock:
+            if (
+                worker_generation is not None
+                and worker_generation != self._tick_generation
+            ):
+                logger.info(
+                    "event=lineage_gc_stale_tick_failure_ignored "
+                    "worker_generation=%d current_generation=%d",
+                    worker_generation,
+                    self._tick_generation,
+                )
+                return
+            self._tick_had_failure = True
+
+    def _next_interval(self, poll_interval: float) -> float:
+        """Return how long to wait, shortening a failed tick's wait.
+
+        A clean tick resets the budget, so one bad day cannot permanently spend
+        the fast retries.
+
+        Args:
+            poll_interval (float): The configured cadence for a healthy tick.
+
+        Returns:
+            float: Seconds to wait before the next tick.
+        """
+        if not self._tick_had_failure:
+            self._consecutive_failed_ticks = 0
+            return _healthy_interval(poll_interval)
+
+        self._consecutive_failed_ticks += 1
+        # `min`, not the constant: `poll_interval_seconds` may legitimately be
+        # configured below 300 (the schema permits 1), and a "retry sooner" path
+        # that returned 300 there would SLOW the scheduler -- for lineage GC and
+        # every registered global sweep too, not just retention.
+        fast = min(_FAILED_TICK_RETRY_SECONDS, poll_interval)
+        if self._consecutive_failed_ticks > _MAX_CONSECUTIVE_FAST_RETRIES:
+            # ERROR, not WARNING: every fast retry failed, so this is a
+            # persistent failure. The per-scope streaks cannot be relied on to
+            # page for it: the budget is per scheduler, so failures of other
+            # scopes may have spent it, and after this the next attempt is a
+            # full interval (a day) away -- past the streak idle reset, so each
+            # later failure would count as the first. Paging here does not
+            # depend on how the budget was spent.
+            logger.error(
+                "event=lineage_gc_fast_retry_exhausted consecutive=%d — backing "
+                "off to the configured interval; the per-org anomalies say why",
+                self._consecutive_failed_ticks,
+            )
+            return _healthy_interval(poll_interval)
+
+        logger.warning(
+            "event=lineage_gc_tick_retry_soon in=%.0fs consecutive=%d",
+            fast,
+            self._consecutive_failed_ticks,
+        )
+        return max(fast, _MIN_POLL_SECONDS)
+
+    def _run_once(self) -> float:
+        with self._failure_lock:
+            self._tick_generation += 1
+            self._tick_had_failure = False
+        self._run_always_global_sweeps()
+        poll_interval = _DEFAULT_POLL_INTERVAL_SECONDS
+        try:
+            if (
+                self.bootstrap_org_id == DEFAULT_ORG_ID
+                and self.org_id_provider is not None
+            ):
+                org_ids = [
+                    org_id
+                    for org_id in self.org_id_provider()
+                    if org_id != DEFAULT_ORG_ID
+                ]
+                if not org_ids:
+                    return _BOOTSTRAP_RETRY_INTERVAL_SECONDS
+                self.bootstrap_org_id = org_ids[0]
+            bootstrap_ctx = self.request_context_factory(self.bootstrap_org_id)
+            cfg = bootstrap_ctx.configurator.get_config()
+            poll_interval = cfg.lineage_gc.poll_interval_seconds
+            org_ids = self._discover_org_ids(bootstrap_ctx)
+            self._gc_tick(org_ids, max_workers=self._org_fanout_workers(bootstrap_ctx))
+            self._run_global_sweeps(cfg)
+        except Exception as exc:
+            report_background_failure(
+                logger, "lineage_gc_scheduler_tick_failed", exc, scope="lineage-gc-tick"
+            )
+            self._record_tick_failure()
+        else:
+            report_background_success("lineage-gc-tick")
+        return self._next_interval(poll_interval)
+
+
+def maybe_start_lineage_gc(
+    request_context_factory: Callable[[str], RequestContext],
+    *,
+    bootstrap_org_id: str,
+    org_id_provider: Callable[[], list[str]] | None = None,
+    leader_gate: LeaderGate | None = None,
+) -> LineageGCScheduler | None:
+    """Start the scheduler when bootstrap config enables tombstone GC or expiry reclamation.
+
+    Startup runs when the bootstrap-org config sets ``lineage_gc.enabled``
+    (Class A: profile expiry + tombstone GC), ``expiry_reclamation.enabled``
+    (Class B: plain-row direct-delete sweeps), or
+    ``governance_retention.audit_events_retention_enabled`` — OR when any sweep
+    hook has been registered via :func:`register_per_org_sweep` /
+    :func:`register_global_sweep`. Registered hooks carry their own per-org gate
+    in the enterprise closure, so the scheduler must start to evaluate them even
+    when none of the bootstrap-org flags are set. Returns ``None`` only if none
+    of these conditions hold.
+
+    Tombstone-GC enablement criteria (must ALL hold before enabling ``lineage_gc``
+    for a production org):
+
+    1. **Mechanism**: GC ages tombstones by ``retired_at`` (the INTEGER epoch
+       written at every tombstone write-path).  Rows with ``retired_at = NULL``
+       (created before the column was added) are never eligible and are retained.
+    2. **Grace window**: 90 days is the vetted default (``tombstone_grace_window_days``).
+       This is a per-deployment policy knob — do not shorten without reviewing
+       PII-lifetime obligations (GDPR Art. 5(1)(e)) and audit-depth requirements.
+    3. **B2↔B3 timing gate**: enable per-org only once the grace window is ≥ the
+       reconstruction read-back horizon used by B3 changelog replay, OR once B3 is
+       fully shipped and the horizon is confirmed.  Enabling before this point risks
+       GC'ing tombstones the B3 replay still needs.
+    4. **DPO sign-off**: obtain sign-off on the PII-lifetime and audit-depth
+       implications before enabling in any deployment that processes personal data.
+
+    Note: the poll cadence is always controlled by ``lineage_gc.poll_interval_seconds``
+    even when only ``expiry_reclamation`` is enabled; Class B shares that interval.
+
+    Args:
+        request_context_factory: Builds an org-scoped :class:`RequestContext`.
+        bootstrap_org_id: Org used to read config and seed cross-org discovery.
+        org_id_provider: Optional tenant-enumerating org-id source. When ``None``
+            (OSS default), falls back to the module-level provider hook set via
+            :func:`set_org_id_provider`; when both are ``None`` discovery uses
+            ``storage.list_org_ids()`` exactly as before.
+        leader_gate: Optional fleet-coordination gate. When ``None`` (OSS
+            default), falls back to the module-level hook set via
+            :func:`set_leader_gate`; when both are ``None`` the scheduler ticks
+            unconditionally (today's behavior).
+
+    Returns:
+        LineageGCScheduler: The started scheduler, or ``None`` if no start
+        condition holds (see the startup criteria above).
+    """
+    effective_org_id_provider = (
+        org_id_provider if org_id_provider is not None else _org_id_provider_hook
+    )
+
+    # Registered sweeps carry their own per-org gates, so they must start the
+    # scheduler whether or not the bootstrap org's config is readable. Evaluate
+    # that first: the config read below needs a real org, and a failure there
+    # must not silence sweeps that were explicitly registered. Production ran
+    # with 8 registered sweeps (metering force-seal/retention/derive, governance
+    # retention, missing-vector backfill) never firing because this read raised.
+    has_registered_sweeps = bool(
+        _per_org_sweep_hooks or _global_sweep_hooks or _always_global_sweep_hooks
+    )
+
+    # Resolved BEFORE the config read, because that read can fail and its
+    # handler returns early. Row caps are env-driven and do not depend on the
+    # bootstrap org's config at all, so letting a config failure decide them
+    # would drop retention for exactly the deployment that is already unhealthy.
+    # Gated on a positive limit rather than hardcoded True so that disabling
+    # every cap (`REFLEXIO_ROW_LIMIT_*=0`) still answers "nothing to do".
+    retention_enabled = any(limit > 0 for limit in get_row_retention_limits().values())
+
+    try:
+        ctx = request_context_factory(bootstrap_org_id)
+        cfg = ctx.configurator.get_config()
+
+        # Dead-knob warning: audit-event retention is an ENTERPRISE-only feature
+        # (handled by an enterprise per-org reclamation sweep registered via
+        # register_per_org_sweep). In an OSS-only deployment the knob is accepted
+        # but does nothing — warn loudly. Detected via the configurator class:
+        # enterprise swaps in EnterpriseConfigurator at construction, so the OSS
+        # DefaultConfigurator means "no enterprise here".
+        from reflexio.server.services.configurator.configurator import (  # noqa: PLC0415
+            DefaultConfigurator,
+            get_configurator_class,
+        )
+
+        gr = getattr(cfg, "governance_retention", None)
+        if (
+            gr is not None
+            and getattr(gr, "audit_events_retention_enabled", False)
+            and get_configurator_class() is DefaultConfigurator
+        ):
+            logger.warning(
+                "event=governance_retention_knob_ignored "
+                "audit_events_retention_enabled=True but this is an OSS-only "
+                "deployment — audit-event retention is an enterprise-only feature "
+                "and will NOT run here."
+            )
+
+        expiry_reclamation_enabled = getattr(
+            getattr(cfg, "expiry_reclamation", None), "enabled", False
+        )
+        governance_retention_enabled = getattr(
+            gr, "audit_events_retention_enabled", False
+        )
+        config_enabled = bool(
+            cfg.lineage_gc.enabled
+            or expiry_reclamation_enabled
+            or governance_retention_enabled
+        )
+    except Exception as exc:
+        # Only a deployment with nothing registered has nothing to lose here.
+        if not (has_registered_sweeps or retention_enabled):
+            logger.warning(
+                "event=lineage_gc_scheduler_start_skipped error_type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if bootstrap_org_id == DEFAULT_ORG_ID and effective_org_id_provider is not None:
+            logger.info(
+                "event=lineage_gc_scheduler_start_deferred reason=no_organizations"
+            )
+        else:
+            logger.warning(
+                "event=lineage_gc_config_read_failed error_type=%s error=%s "
+                "starting anyway: registered sweeps gate themselves per-org",
+                type(exc).__name__,
+                exc,
+            )
+        config_enabled = False
+
+    # Also start when any reclamation sweep has been registered — registered
+    # hooks carry their own per-org gates (in the enterprise closure), so the
+    # scheduler must run even if the bootstrap org's config has all flags off.
+    # This preserves the "start unconditionally, gate per-org" invariant of
+    # the deleted GovernanceRetentionScheduler.
+    #
+    # Class C (row-count retention) is its own start condition, and must be:
+    # the caps are env-driven and unconditional, so they cannot ride another
+    # feature's flag. Before this was here, an OSS deployment that set
+    # `lineage_gc.enabled = false` -- which this module's own docstring frames
+    # as a deliberate operator choice, and which `maybe_start_lineage_gc`'s
+    # criteria REQUIRE until DPO sign-off -- got no scheduler, and so no row
+    # caps at all. They had been enforced on every publish until the sweep
+    # moved here, so that would have been a silent regression into unbounded
+    # table growth. `retention_enabled` is resolved above, before the config read.
+    if not (config_enabled or has_registered_sweeps or retention_enabled):
+        return None
+
+    scheduler = LineageGCScheduler(
+        request_context_factory=request_context_factory,
+        bootstrap_org_id=bootstrap_org_id,
+        org_id_provider=effective_org_id_provider,
+        leader_gate=leader_gate if leader_gate is not None else _leader_gate_hook,
+    )
+    scheduler.start()
+    return scheduler

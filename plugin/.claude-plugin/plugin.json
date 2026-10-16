@@ -1,0 +1,25 @@
+{
+  "name": "claude-smart",
+  "version": "0.3.11",
+  "description": "按场景管理和提炼可复用工作偏好",
+  "author": {
+    "name": "hyz"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-code-plugin",
+    "codex",
+    "codex-plugin",
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "agent-memory",
+    "plugin",
+    "reflexio",
+    "self-improvement",
+    "self-improving-agents",
+    "skills",
+    "learning"
+  ]
+}

@@ -1,0 +1,208 @@
+"""Singleton scheduler for deferred, off-request-path entity tagging.
+
+Tagging runs an LLM call per newly generated profile, playbook, or evaluation,
+so it must not block the publish or evaluation request. This scheduler mirrors
+:class:`GroupEvaluationScheduler`: a single daemon thread with a min-heap, where
+each enqueue upserts the fire time for its
+``(org_id, project_id, user_id, agent_version)`` key. Rapid successive enqueues
+for the same key debounce into a single tagging
+pass; when the timer fires, the tagging callback runs on its own daemon thread.
+
+Tagging is idempotent (already-tagged entities are skipped), so a deferred pass
+naturally handles both newly generated entities and the one-time backfill that
+happens when a tagging definition is first configured.
+"""
+
+from __future__ import annotations
+
+import heapq
+import itertools
+import logging
+import threading
+import time
+from collections.abc import Callable
+from functools import partial
+
+from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.background_work import (
+    report_background_failure,
+    report_background_success,
+)
+from reflexio.server.callback_executor import drain_callbacks, submit_callback
+from reflexio.server.env_utils import env_bool
+from reflexio.server.error_reporting import capture_anomaly
+from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.services.tagging.service import TaggingService
+from reflexio.server.work_scope import (
+    WorkScope,
+    WorkScopeError,
+    bind_work_scope,
+    current_project_id,
+)
+
+logger = logging.getLogger(__name__)
+
+# Delay before a tagging pass fires after the last publish for a key. Long enough
+# to debounce a burst of publishes into one pass, short enough that tags appear
+# promptly. Kept as a patch point for tests.
+TAGGING_DELAY_SECONDS = 15
+IS_TEST_ENV = env_bool("IS_TEST_ENV", default=False)
+_EFFECTIVE_DELAY_SECONDS = 1 if IS_TEST_ENV else TAGGING_DELAY_SECONDS
+
+# (org_id, project_id, user_id, agent_version)
+#
+# ``project_id`` is part of the DEBOUNCE IDENTITY, not decoration. Two projects
+# in one org publishing for the same user inside the 15s window would otherwise
+# collapse into a single tagging pass attributed to whichever request won the
+# race. ``None`` in OSS, where projects do not exist.
+TaggingKey = tuple[str, str | None, str, str]
+
+
+class TaggingScheduler:
+    """Singleton scheduler that fires entity tagging after a short debounce."""
+
+    _instance = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_instance(cls) -> TaggingScheduler:
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        self._scheduled: dict[TaggingKey, tuple[float, int, Callable]] = {}
+        self._heap: list[tuple[float, int, TaggingKey]] = []
+        self._sequence = itertools.count()
+        self._mutex = threading.Lock()
+        self._wake_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._scheduler_loop, daemon=True, name="tagging-scheduler"
+        )
+        self._thread.start()
+        logger.info("TaggingScheduler started")
+
+    def schedule(self, key: TaggingKey, callback: Callable) -> None:
+        """Schedule or reschedule a tagging pass for ``key`` (slides the fire time forward)."""
+        fire_time = time.monotonic() + _EFFECTIVE_DELAY_SECONDS
+        with self._mutex:
+            sequence = next(self._sequence)
+            self._scheduled[key] = (fire_time, sequence, callback)
+            heapq.heappush(self._heap, (fire_time, sequence, key))
+        self._wake_event.set()
+
+    def drain(self, *, timeout_seconds: float = 5.0) -> bool:
+        """Wait for scheduled tagging callbacks and executor work to settle."""
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            with self._mutex:
+                scheduled = bool(self._scheduled)
+            if not scheduled:
+                remaining = max(0.0, deadline - time.monotonic())
+                return drain_callbacks(timeout_seconds=remaining)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+
+    def _scheduler_loop(self) -> None:
+        while True:
+            try:
+                with self._mutex:
+                    next_fire_time = self._heap[0][0] if self._heap else None
+
+                if next_fire_time is None:
+                    self._wake_event.wait()
+                    self._wake_event.clear()
+                    continue
+
+                wait_seconds = next_fire_time - time.monotonic()
+                if wait_seconds > 0:
+                    self._wake_event.wait(timeout=wait_seconds)
+                    self._wake_event.clear()
+                    continue
+
+                with self._mutex:
+                    while self._heap and self._heap[0][0] <= time.monotonic():
+                        _fire_time, sequence, key = heapq.heappop(self._heap)
+
+                        current = self._scheduled.get(key)
+                        if current is None:
+                            continue
+                        _current_fire_time, current_sequence, callback = current
+                        if current_sequence != sequence:
+                            # Superseded by a newer schedule for the same key.
+                            continue
+
+                        del self._scheduled[key]
+                        submit_callback(
+                            # key[2] is user_id — key[1] is the nullable project.
+                            f"tagging-{key[2][:20]}",
+                            partial(self._run_callback, key, callback),
+                        )
+                report_background_success("tagging-loop")
+            except Exception as exc:
+                report_background_failure(
+                    logger, "tagging_scheduler_loop_failed", exc, scope="tagging-loop"
+                )
+                time.sleep(1)
+
+    @staticmethod
+    def _run_callback(key: TaggingKey, callback: Callable) -> None:
+        try:
+            logger.info("Firing tagging for key=%s", key)
+            with bind_work_scope(WorkScope(org_id=key[0], project_id=key[1])):
+                callback()
+            logger.info("Completed tagging for key=%s", key)
+        except WorkScopeError:
+            # NOT an operational failure: the pass could not be attributed to a
+            # project, so tolerating it would tag entities under the wrong one.
+            # Escalated rather than propagated — see WorkScopeError.
+            logger.exception("Tagging scope binding failed for key=%s", key)
+            capture_anomaly(
+                "tagging.work_scope_failed",
+                level="error",
+                org_id=key[0],
+                project_id=key[1],
+                user_id=key[2],
+            )
+        except Exception:
+            logger.exception("Tagging callback failed for key=%s", key)
+
+
+def schedule_tagging(
+    *,
+    org_id: str,
+    user_id: str,
+    agent_version: str,
+    request_context: RequestContext,
+    llm_client: LiteLLMClient,
+) -> None:
+    """Enqueue a deferred tagging pass for the given user/agent off the publish path."""
+    if not user_id:
+        return
+
+    # Resolved on the publishing thread: by fire time the scope is gone, and
+    # reading it there would pick whichever request won the debounce race.
+    key: TaggingKey = (org_id, current_project_id(), user_id, agent_version)
+    storage_base_dir = getattr(request_context, "storage_base_dir", None)
+
+    def callback() -> None:
+        fresh_context = RequestContext(
+            org_id=org_id,
+            storage_base_dir=storage_base_dir,
+        )
+        TaggingService(llm_client=llm_client, request_context=fresh_context).run(
+            user_id=user_id, agent_version=agent_version
+        )
+
+    TaggingScheduler.get_instance().schedule(key, callback)
+
+
+def drain_tagging(*, timeout_seconds: float = 5.0) -> bool:
+    """Wait for the singleton tagging scheduler and callback executor to settle."""
+    if TaggingScheduler._instance is None:
+        return drain_callbacks(timeout_seconds=timeout_seconds)
+    return TaggingScheduler._instance.drain(timeout_seconds=timeout_seconds)

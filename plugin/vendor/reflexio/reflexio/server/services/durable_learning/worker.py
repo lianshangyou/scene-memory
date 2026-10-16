@@ -1,0 +1,482 @@
+"""Bounded execution of durable sliding windows with renewable user leases."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.background_work import (
+    background_work,
+    report_background_failure,
+    report_background_success,
+)
+from reflexio.server.env_utils import env_str
+from reflexio.server.operation_limiter import operation_limit_value
+from reflexio.server.operational_metrics import record_health
+from reflexio.server.services.durable_learning.window_executor import (
+    WindowExecutor,
+    WindowInputsDeletedError,
+)
+from reflexio.server.services.extraction.overflow_coordinator import (
+    OverflowSuspendedError,
+)
+from reflexio.server.services.storage.storage_base import BaseStorage
+from reflexio.server.services.storage.storage_base._extraction_stream import (
+    LeaseLostError,
+    Window,
+)
+from reflexio.server.work_scope import WorkScope, WorkScopeError, bind_work_scope
+
+logger = logging.getLogger(__name__)
+_budget_lock = threading.Lock()
+_budget: threading.BoundedSemaphore | None = None
+
+_VIA = "<-"
+# One coordinate, INCLUDING its ``:line`` suffix, which is never sacrificed.
+_POSITION_MAX = 59
+# Two coordinates joined by ``_VIA``. This bound is structural rather than a
+# trailing slice: a blind prefix cut lands mid-coordinate and strips the very
+# line number the field exists to carry, leaving something that reads as
+# diagnosed while pointing nowhere.
+_LOCATOR_MAX = 2 * _POSITION_MAX + len(_VIA)
+
+
+def _first_party_roots(module_file: str) -> tuple[str, ...]:
+    """Package-root prefixes for each spelling a deployment may import through.
+
+    ``co_filename`` keeps the path a module was imported *as*, so a release
+    that imports through a ``current``-style symlink produces symlinked frame
+    paths. Resolving only our own side would then match nothing and reject
+    every first-party frame - silently, everywhere, for the life of the
+    deployment. Keep both spellings and accept either.
+    """
+    # ``.absolute()``, never ``.resolve()``: resolving here would discard the
+    # as-imported spelling, which is the whole point of keeping both.
+    package = Path(module_file).absolute().parents[3]
+    spellings = {package, package.resolve()}
+    return tuple(sorted(str(path) + os.sep for path in spellings))
+
+
+# Used only to tell our own frames from a dependency's; never rendered itself.
+_FIRST_PARTY_ROOTS = _first_party_roots(__file__)
+
+
+def _tb_positions(exc: BaseException) -> list[tuple[str, int]]:
+    """Walk the traceback for code positions only.
+
+    Deliberately not ``traceback.extract_tb``: that populates each frame's
+    ``.line`` by reading the source file, which both costs disk I/O on a
+    failure path and puts source text on an object we hand to a logger.
+    ``co_filename`` and ``tb_lineno`` are integers and paths, nothing else.
+    """
+    positions: list[tuple[str, int]] = []
+    tb = exc.__traceback__
+    while tb is not None:
+        positions.append((tb.tb_frame.f_code.co_filename, tb.tb_lineno))
+        tb = tb.tb_next
+    return positions
+
+
+def _position(filename: str, lineno: int) -> str:
+    """``parent/file.py:12`` - bounded, and enough to disambiguate.
+
+    One component would be ambiguous in this tree (``sqlite_storage`` and
+    ``storage_base`` both hold an ``_extraction_stream.py``); two is enough,
+    and keeps an absolute container path out of the field.
+
+    Should even two components overrun the budget, the PATH is elided from the
+    left and marked with ``~``, so that the tail identifying the file and the
+    ``:line`` both survive. A truncated coordinate must still name a line.
+    """
+    suffix = f":{lineno}"
+    path = "/".join(Path(filename).parts[-2:])
+    budget = max(_POSITION_MAX - len(suffix), 0)
+    if len(path) > budget:
+        path = ("~" + path[len(path) - budget + 1 :]) if budget > 1 else ""
+    return path + suffix
+
+
+def exception_locator(exc: BaseException) -> str:
+    """Where an exception came from, as source coordinates and nothing else.
+
+    A file path and line number are *our* coordinates, so unlike an exception
+    message they can never carry customer content. That is what makes this
+    safe to log and to store where ``str(exc)`` is not.
+
+    The raise site is reported first. When it lands inside a dependency the
+    innermost first-party frame is appended after ``<-``, because
+    ``pydantic/main.py:210`` alone does not say which of our calls provoked
+    it. When the two coincide only one is emitted.
+
+    Every coordinate returned names a line: each half is bounded on its own,
+    so the composition cannot overrun and need not be sliced afterwards.
+    """
+    positions = _tb_positions(exc)
+    if not positions:
+        return "unknown"
+    raised = _position(*positions[-1])
+    for filename, lineno in reversed(positions):
+        if filename.startswith(_FIRST_PARTY_ROOTS):
+            ours = _position(filename, lineno)
+            if ours != raised:
+                raised = f"{raised}{_VIA}{ours}"
+            break
+    return raised
+
+
+def _user_ref(user_id: str) -> str:
+    """Stable, value-free handle for a user in a failure scope.
+
+    Scopes are printed in log lines, and this worker keeps customer identifiers
+    out of them, so a scope names the user by a short hash rather than the id.
+    """
+    return hashlib.sha256(user_id.encode()).hexdigest()[:12]
+
+
+@dataclass
+class _TurnRecord:
+    """What one turn did, for the caller that reports its outcome.
+
+    ``completed`` is True only when the claimed user's extraction finished:
+    every pending effect delivered, or the window executed (or invalidated
+    because its inputs were deleted). A turn that deferred setup, scheduled a
+    retry, lost its lease or found nothing to prepare returns normally but
+    did not complete, and must not end that user's failure streak.
+    """
+
+    user_id: str | None = None
+    completed: bool = False
+
+
+def worker_count() -> int:
+    return max(
+        1,
+        int(
+            env_str(
+                "REFLEXIO_PUBLISH_LEARNING_WORKERS",
+                str(operation_limit_value("publish")),
+            )
+        ),
+    )
+
+
+def _reserve() -> bool:
+    global _budget
+    with _budget_lock:
+        if _budget is None:
+            _budget = threading.BoundedSemaphore(worker_count())
+    return _budget.acquire(blocking=False)
+
+
+def _release() -> None:
+    if _budget is not None:
+        _budget.release()
+
+
+def _input_budget_failure_reason(exc: BaseException) -> str | None:
+    from reflexio.server.llm.input_budget import (
+        InputBudgetConfigurationError,
+        InputBudgetExceededError,
+    )
+    from reflexio.server.services.extraction.input_preparation import (
+        ExtractionInputBudgetExceededError,
+    )
+    from reflexio.server.services.storage.storage_base._extraction_stream import (
+        OverflowAttemptBudgetExceededError,
+    )
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, InputBudgetConfigurationError):
+            return "input_budget_configuration_error"
+        if isinstance(
+            current,
+            InputBudgetExceededError
+            | ExtractionInputBudgetExceededError
+            | OverflowAttemptBudgetExceededError,
+        ):
+            return "input_budget_exceeded"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+class DurableLearningWorker:
+    def __init__(
+        self,
+        request_context_factory: Callable[[str], RequestContext],
+        *,
+        instance_id: str | None = None,
+    ):
+        self._factory = request_context_factory
+        self._instance_id = instance_id or uuid.uuid4().hex
+
+    def start_org(self, org_id: str, lease_seconds: int) -> bool:
+        """Reserve capacity BEFORE a thread may claim one user."""
+        if not _reserve():
+            return False
+        threading.Thread(
+            target=self._reserved_turn,
+            args=(org_id, lease_seconds),
+            daemon=True,
+            name="reflexio-extraction-window",
+        ).start()
+        return True
+
+    def drain_org(self, org_id: str, batch_size: int, lease_seconds: int) -> int:
+        """Synchronous harness entry point; each turn claims one runnable user."""
+        completed = 0
+        for _ in range(batch_size):
+            if not _reserve():
+                break
+            completed += self._reserved_turn(org_id, lease_seconds)
+        return completed
+
+    @background_work()
+    def _reserved_turn(self, org_id: str, lease_seconds: int) -> int:
+        # Two units, two streaks. Before a claim the unit is the org's claim
+        # (context + claim query), retried by the next poll. After a claim it
+        # is that USER's turn: an escaping failure leaves the lease to expire
+        # and the same user is claimed again. An org-wide turn scope let any
+        # other user's turn -- or an idle poll -- clear a stuck user's streak.
+        record = _TurnRecord()
+        try:
+            completed = self._turn(org_id, lease_seconds, record)
+        except Exception as exc:
+            if record.user_id is not None:
+                user_ref = _user_ref(record.user_id)
+                report_background_failure(
+                    logger,
+                    "extraction_turn_failed",
+                    exc,
+                    scope=f"durable-learning-turn:{org_id}:{user_ref}",
+                    org_id=org_id,
+                    stage="claimed",
+                )
+            else:
+                report_background_failure(
+                    logger,
+                    "extraction_turn_failed",
+                    exc,
+                    scope=f"durable-learning-claim:{org_id}",
+                    org_id=org_id,
+                    stage="claim",
+                )
+            return 0
+        finally:
+            _release()
+        # Only a turn that actually completed ends the user's streak: one that
+        # swallowed a failure (setup deferred, window retried, effect retried)
+        # returns normally too.
+        if record.user_id is not None and record.completed:
+            user_ref = _user_ref(record.user_id)
+            report_background_success(f"durable-learning-turn:{org_id}:{user_ref}")
+        return completed
+
+    @staticmethod
+    def _handle_window_failure(
+        storage: BaseStorage, window: Window, token: str, exc: Exception
+    ) -> str:
+        if isinstance(exc, OverflowSuspendedError):
+            storage.suspend_extraction(window, token)
+            return "suspended"
+        reason = _input_budget_failure_reason(exc)
+        if reason is not None:
+            storage.fail_extraction_input_budget(window, token, reason)
+            record_health("worker.input_budget_failures", reason=reason)
+            return "input_budget_failure"
+        where = exception_locator(exc)
+        logger.warning(
+            "Extraction window failed kind=%s error=%s at=%s",
+            window.kind,
+            type(exc).__name__,
+            where,
+        )
+        # Only class/source coordinates are stored; messages may contain customer
+        # content. An already committed window retries its durable effects.
+        try:
+            storage.retry_extraction(window, token, f"{type(exc).__name__}@{where}")
+        except LeaseLostError:
+            storage.retry_extraction_effects(window)
+            record_health("worker.retries", phase="effects")
+        else:
+            record_health("worker.retries", phase="window")
+        return "failure"
+
+    def _turn(
+        self, org_id: str, lease_seconds: int, record: _TurnRecord | None = None
+    ) -> int:
+        """Claim one runnable user and run its turn.
+
+        Args:
+            org_id (str): The org to claim from.
+            lease_seconds (int): Lease length for the claim.
+            record (_TurnRecord | None): Receives the claimed user id and
+                whether the extraction completed, so the caller can attribute
+                a failure that escapes after the claim and report success
+                only for a completed turn.
+
+        Returns:
+            int: 1 when a window or its effects were delivered, else 0.
+        """
+        from reflexio.lib._base import create_generation_litellm_client
+
+        context = self._factory(org_id)
+        storage = context.storage
+        if storage is None:
+            return 0
+        claim = storage.claim_extraction(self._instance_id, lease_seconds)
+        # The claim query itself succeeded, whether or not it found a user.
+        report_background_success(f"durable-learning-claim:{org_id}")
+        if claim is None:
+            return 0
+        user_id, token = claim
+        if record is None:
+            record = _TurnRecord()
+        record.user_id = user_id
+        user_ref = _user_ref(user_id)
+        started = time.monotonic()
+        outcome = "setup_failure"
+        phase = "prepare"
+        stop = threading.Event()
+
+        @background_work()
+        def heartbeat() -> None:
+            while not stop.wait(max(0.1, lease_seconds / 3)):
+                try:
+                    if not storage.renew_extraction(user_id, token, lease_seconds):
+                        return
+                    report_background_success(
+                        f"durable-learning-heartbeat:{org_id}:{user_ref}"
+                    )
+                except Exception as exc:
+                    # Renewal is per (org, user, token): scope it to this lease's
+                    # user so another user's renewals cannot mask a stuck one.
+                    report_background_failure(
+                        logger,
+                        "extraction_heartbeat_failed",
+                        exc,
+                        scope=f"durable-learning-heartbeat:{org_id}:{user_ref}",
+                        org_id=org_id,
+                    )
+
+        thread = threading.Thread(
+            target=heartbeat, daemon=True, name="reflexio-extraction-heartbeat"
+        )
+        thread.start()
+        window: Window | None = None
+        try:
+            for effect_window, effects in storage.pending_extraction_effects(
+                user_id=user_id, token=token
+            ):
+                phase = "effects"
+                outcome = "failure"
+                with bind_work_scope(
+                    WorkScope(
+                        org_id=org_id, project_id=effect_window.project_id or None
+                    )
+                ):
+                    try:
+                        WindowExecutor(
+                            context, create_generation_litellm_client(context)
+                        ).deliver(effect_window, effects, token=token)
+                        outcome = "success"
+                    except Exception as exc:
+                        outcome = (
+                            "lease_lost"
+                            if isinstance(exc, LeaseLostError)
+                            else "failure"
+                        )
+                        storage.retry_extraction_effects(effect_window)
+                        record_health("worker.retries", phase=phase)
+                        # Log-only, unlike the window handler below: the effects
+                        # retry has no error column to widen -
+                        # ``retry_extraction_effects`` stores only a due time.
+                        logger.warning(
+                            "Extraction effects will retry org_id=%s error=%s at=%s",
+                            org_id,
+                            type(exc).__name__,
+                            exception_locator(exc),
+                        )
+                # One effect window per turn; it completed only if delivered.
+                record.completed = outcome == "success"
+                return 1
+            window = storage.prepare_extraction(user_id, token)
+            if window is None:
+                outcome = "idle"
+                return 0
+            phase = "window"
+            outcome = "failure"
+            with bind_work_scope(
+                WorkScope(org_id=org_id, project_id=window.project_id or None)
+            ):
+                executor = WindowExecutor(
+                    context, create_generation_litellm_client(context)
+                )
+                try:
+                    executor.execute(window, token)
+                    outcome = "success"
+                except WindowInputsDeletedError:
+                    storage.invalidate_extraction(window, token)
+                    outcome = "invalidated"
+                except LeaseLostError:
+                    outcome = "lease_lost"
+                    return 0
+                except Exception as exc:
+                    outcome = self._handle_window_failure(storage, window, token, exc)
+                    return 0
+            # Reached only when the window executed or was invalidated.
+            record.completed = True
+            return 1
+        except LeaseLostError:
+            # A stale claim cannot schedule setup work; its new owner proceeds.
+            outcome = "lease_lost"
+            return 0
+        except WorkScopeError:
+            from reflexio.server.error_reporting import capture_anomaly
+
+            capture_anomaly(
+                "durable_learning.work_scope_failed",
+                level="error",
+                org_id=org_id,
+                project_id=window.project_id if window else None,
+                user_id=user_id,
+            )
+            storage.defer_extraction_setup(user_id, token)
+            record_health("worker.retries", phase="prepare")
+            return 0
+        except Exception as exc:
+            logger.warning(
+                "Extraction setup will retry org_id=%s error=%s at=%s",
+                org_id,
+                type(exc).__name__,
+                exception_locator(exc),
+            )
+            storage.defer_extraction_setup(user_id, token)
+            record_health("worker.retries", phase="prepare")
+            return 0
+        finally:
+            if outcome != "idle":
+                record_health("worker.attempts", phase=phase, outcome=outcome)
+                record_health(
+                    "worker.duration",
+                    time.monotonic() - started,
+                    kind="distribution",
+                    unit="second",
+                    phase=phase,
+                    outcome=outcome,
+                )
+            try:
+                storage.release_user_extraction(user_id, token)
+            finally:
+                stop.set()
+                thread.join(timeout=1)

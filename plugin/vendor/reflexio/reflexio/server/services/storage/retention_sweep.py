@@ -1,0 +1,680 @@
+"""Row-count retention caps, swept on the shared lineage GC scheduler.
+
+This body used to run on the publish request thread, two lines before the
+generation service's own clock started. It probes every registered retention
+target -- 17 today -- each one a serialised remote round trip, so one unlucky
+publish per throttle window paid for all of them and reported a fast request.
+Measured at 968ms on idle staging: 52% of that publish.
+
+It now runs once per project per lineage-GC tick, and sizes every target in
+ONE ``RetentionMixin.probe_retention_targets`` call before the per-target loop.
+On a remote backend that is a catalog read plus at most one batched count, not
+two to three round trips per target: an empty, never-analyzed org used to pay
+for 17 exact counts one by one, ~23 s per project, all of it overhead. The
+decisions are the per-target ones -- a delete still rests on an exact count, and
+after any delete the remaining targets are probed one at a time, as they always
+were, because a cascade may have shrunk them (``user_playbooks`` ->
+``agent_playbook_source_user_playbooks``).
+
+The probe is a snapshot taken at the start of the pass, and a snapshot is only
+ever trusted to say "nothing to do": below the warn threshold by exact count,
+or below the exact-count threshold by estimate. A target the snapshot puts AT
+or OVER the warn threshold is counted again at its own turn, so every warning
+and every delete rests on a count taken immediately before acting on it -- the
+same window the per-target loop had.
+
+Residual, stated rather than hidden: a target the snapshot put BELOW the warn
+threshold is not recounted, so writers adding more than 10% of its cap (25,000
+rows at the default) between the probe and its turn go unseen until the next
+pass. That window holds no statements but the recounts of near-cap targets.
+It is the same shape as, and narrower than, the residual the estimate already
+carries -- a burst of 20% of the cap inside the statistics flush delay, the
+documented limit of a ``reltuples``-based ``estimate_retention_target_rows``.
+Closing it entirely means counting every target at its own turn, which is the
+cost this change exists to remove.
+
+Two properties are
+load-bearing and easy to lose:
+
+- **It must run with a project bound.** Under the enterprise row-level policies
+  an org-scoped pass reads ZERO ROWS rather than failing, so an unbound sweep
+  deletes nothing and reports success. That is why the caller is
+  ``LineageGCScheduler._sweep_project_data`` (inside ``bind_work_scope``) and
+  not the ``register_per_org_sweep`` seam, which fires outside the project loop.
+- **It must stay on the APP credential.** Retention is not exempt from project
+  scoping: given the governance credential, a busy project would evict a quiet
+  project's oldest rows org-wide, irreversibly. See
+  ``supabase_storage/base/_deletion.py``.
+
+It absorbs its own exceptions so one org cannot stall the scheduler loop, and
+therefore emits its own ``retention.sweep.failed`` anomaly -- a sweep that
+swallows errors silently is indistinguishable from one with nothing to do, and
+nothing to do is what every tick looks like today.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+
+from reflexio.server.error_reporting import capture_anomaly, error_tags
+from reflexio.server.extensions import ServiceKey, get_service
+from reflexio.server.ops_log import get_ops_logger
+from reflexio.server.services.operation_state_utils import OperationStateManager
+from reflexio.server.services.storage.retention import (
+    AGE_RETAINED_TARGETS,
+    DEFAULT_RETENTION_POLICY,
+    FAIL_SAFE_RETENTION_POLICY,
+    RETENTION_TARGETS_BY_NAME,
+    RetentionPolicy,
+    delete_count_for_retention,
+    get_row_retention_limits,
+)
+from reflexio.server.services.storage.retention_mixin import (
+    AgeRetentionResult,
+    RetentionMixin,
+    RetentionProbe,
+    probe_retention_targets_individually,
+)
+from reflexio.server.services.storage.storage_base import BaseStorage
+from reflexio.server.work_scope import WORK_SCOPE_PROVIDER, current_project_id
+
+logger = logging.getLogger(__name__)
+_ops_logger = get_ops_logger("retention")
+
+#: How long a ``storage_table_cleanup`` lease may be held before it is stale.
+CLEANUP_STALE_LOCK_SECONDS = 600
+
+#: Warn at this fraction of a target's limit, while still below it. At the
+#: busiest org's ~2,500 interactions/day this is ~17 days of notice before the
+#: first enforcement deletes 50,000 rows. A constant, not an env var: nothing
+#: has asked for it to be tunable.
+CAP_WARN_FRACTION = 0.90
+
+#: Below this fraction of the cap, by the backend's upper-bound estimate, a
+#: target is not counted exactly. Kept under CAP_WARN_FRACTION so the
+#: "approaching" warning and every delete still rest on the exact count.
+EXACT_COUNT_FROM_FRACTION = 0.80
+
+#: One project-pass slower than this is reported. One third of the scheduler's
+#: 60s per-org budget (``_ORG_SWEEP_TIMEOUT_SECONDS``), so a single slow pass
+#: already means retention alone is a third of the org's allowance.
+SLOW_SWEEP_SECONDS = 20.0
+
+#: Rows the age pass examines per target per sweep, and per select/archive/
+#: delete round. A daily sweep therefore drains at most this many expired rows a
+#: day per target -- a plan downgrade or the first enforced sweep spreads over
+#: days instead of one burst, and every round is archived before it is deleted.
+AGE_ROWS_PER_TARGET = 10_000
+AGE_BATCH_ROWS = 1_000
+
+#: Wall-clock budget for the whole age pass of one project. Well inside the
+#: scheduler's 60s per-org allowance, which also has to cover the cap pass.
+AGE_PASS_SECONDS = 20.0
+
+#: Resolves an org's :class:`RetentionPolicy`. Unregistered (OSS) means
+#: ``DEFAULT_RETENTION_POLICY``: no age expiry, every cap deletes as before.
+RETENTION_POLICY_PROVIDER = ServiceKey[Callable[[str], RetentionPolicy]](
+    "retention_policy_provider"
+)
+
+#: Tag value for a pass whose project could not be resolved. A literal, because
+#: ``error_reporting._normalize_tags`` DROPS ``None`` values: tagging the real
+#: ``None`` would make an unbound enterprise pass byte-identical in error reports to a
+#: correct OSS one, which is the one distinction that matters here.
+UNBOUND_PROJECT_TAG = "<unbound>"
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionSweepResult:
+    """What one project-pass did, and whether it got to finish.
+
+    ``failed`` exists because this function absorbs its own exceptions -- the
+    call site in ``gc_scheduler`` has no backstop, by contract -- and a caller
+    that cannot tell "swept, nothing due" from "could not sweep at all" will
+    schedule its next attempt as if all is well. On staging that meant a
+    ``PGRST002`` transient at the boot tick put retention off for a full
+    ``poll_interval_seconds`` (86400s by default).
+
+    Attributes:
+        deleted (int): Rows removed across all targets this pass.
+        failed (bool): True when the pass could not complete -- a refused lease
+            or a disabled cap is NOT a failure, because there was nothing to do.
+            Nor is a *single* target raising: that is isolated deliberately, is
+            usually permanent (a table the backend does not have), and escalating
+            it would spend the scheduler's bounded fast-retry budget on something
+            a retry cannot fix. Such a target is still logged with ``error_tags``.
+            But EVERY target failing is a different animal -- that is the shape a
+            backend-wide transient takes, and absorbing it target by target would
+            hand the scheduler a clean-looking tick.
+    """
+
+    deleted: int
+    failed: bool = False
+
+
+#: Minimum gap between embedded-library sweeps for one org.
+#:
+#: The library has NO background scheduler -- `maybe_start_lineage_gc` is called
+#: only from the FastAPI lifespan -- so an embedded/SQLite user who publishes
+#: through `Reflexio.publish_interaction` would otherwise get no row caps at all
+#: once the sweep left the server's request path. Sweeping there is correct and
+#: cheap: the cost this change removed was a REMOTE round trip per target, and
+#: the embedded case is typically a local file. The throttle keeps it from
+#: running on every single publish, exactly as the request path used to.
+LIBRARY_SWEEP_MIN_INTERVAL_SECONDS = 300.0
+
+_library_last_sweep: dict[str, float] = {}
+_library_sweep_lock = threading.Lock()
+_scheduler_managed: ContextVar[bool] = ContextVar(
+    "retention_scheduler_managed", default=False
+)
+
+
+@contextmanager
+def scheduler_managed_retention() -> Iterator[None]:
+    """Keep server calls out of embedded cleanup without changing library defaults.
+
+    The server's lifespan owns the per-project retention scheduler. Scope this
+    to its publish worker so embedded calls in other threads keep their cleanup,
+    and reset even when publishing fails.
+    """
+    token = _scheduler_managed.set(True)
+    try:
+        yield
+    finally:
+        _scheduler_managed.reset(token)
+
+
+def maybe_sweep_retention_caps_for_library(
+    org_id: str, storage: BaseStorage
+) -> RetentionSweepResult | None:
+    """Sweep for an embedded caller that has no scheduler, at most every 5 min.
+
+    For the SERVER path this is the wrong entry point -- there the sweep belongs
+    on ``LineageGCScheduler`` and must not touch the request thread. This exists
+    only for :mod:`reflexio.lib`, which constructs ``GenerationService`` directly
+    and starts no daemons.
+
+    Args:
+        org_id (str): Org whose caps to enforce.
+        storage (BaseStorage): The caller's storage.
+
+    Returns:
+        RetentionSweepResult | None: The pass's result, or ``None`` when the
+        throttle suppressed it.
+    """
+    if _scheduler_managed.get():
+        return None
+    now = time.monotonic()
+    with _library_sweep_lock:
+        last = _library_last_sweep.get(org_id)
+        if last is not None and now - last < LIBRARY_SWEEP_MIN_INTERVAL_SECONDS:
+            return None
+        _library_last_sweep[org_id] = now
+    return sweep_retention_caps(org_id, storage)
+
+
+def sweep_retention_caps(org_id: str, storage: BaseStorage) -> RetentionSweepResult:
+    """Enforce row-count caps for the project bound on this thread.
+
+    Args:
+        org_id (str): Org being swept, for lease scope and anomaly attribution.
+        storage (BaseStorage): The org's app-role storage.
+
+    Returns:
+        RetentionSweepResult: Rows deleted, and whether the pass could not
+        complete. The scheduler reads ``failed`` to decide how soon to tick
+        again; see ``gc_scheduler._FAILED_TICK_RETRY_SECONDS``.
+    """
+    # `started` is outside the try because `time.monotonic()` cannot raise;
+    # `project_id` is pre-bound so the failure handler can tag with it even if
+    # resolving it is what failed. Everything that CAN raise is inside, because
+    # `gc_scheduler._sweep_project_data` calls this with no backstop of its own
+    # -- an escape from here aborts the org's remaining projects AND the
+    # enterprise per-org governance sweep, and on the serial fan-out path every
+    # remaining org in the tick.
+    started = time.monotonic()
+    project_id: str | None = None
+    deleted_total = 0
+    targets_failed = 0
+    # Per-target wall time, so a slow sweep names the table that made it slow.
+    target_seconds: dict[str, float] = {}
+    # Time inside the up-front `probe_retention_targets`, which a batched
+    # backend cannot attribute to any one target.
+    probe_seconds = 0.0
+    # The age pass is bounded by its own deadline (`AGE_PASS_SECONDS`) and is
+    # kept out of the slow-sweep measure, which exists to catch slow probes.
+    age_seconds = 0.0
+    age_failed = False
+    try:
+        project_id = current_project_id()
+
+        # Refuse an unbound pass rather than trusting the call site's position.
+        # With a provider registered, "no project bound" means the scope was
+        # lost: under the row-level policies that pass reads ZERO ROWS and
+        # reports success, so it is invisible to every count-based check. A
+        # deployment with no provider at all is OSS, where no project exists and
+        # an unscoped sweep is the correct behaviour.
+        if project_id is None and get_service(WORK_SCOPE_PROVIDER) is not None:
+            capture_anomaly(
+                "retention.sweep.unbound",
+                org_id=org_id,
+                project_id=UNBOUND_PROJECT_TAG,
+            )
+            logger.error(
+                "event=retention_sweep_unbound org_id=%s -- refusing to sweep: a "
+                "work-scope provider is registered but no project is bound",
+                org_id,
+            )
+            return RetentionSweepResult(0, failed=True)
+
+        policy = _resolve_policy(org_id, project_id)
+        limits = _effective_limits(policy)
+        if not limits and policy.age_days is None:
+            return RetentionSweepResult(0)
+
+        mgr = OperationStateManager(
+            storage,  # type: ignore[reportArgumentType]
+            org_id,
+            "storage_table_cleanup",  # type: ignore[reportArgumentType]
+        )
+        if not mgr.acquire_simple_lock(stale_seconds=CLEANUP_STALE_LOCK_SECONDS):
+            return RetentionSweepResult(0)
+        try:
+            if policy.age_days is not None:
+                age_started = time.monotonic()
+                age_deleted, age_failed = _age_pass(org_id, project_id, storage, policy)
+                deleted_total += age_deleted
+                age_seconds = time.monotonic() - age_started
+            probe_started = time.monotonic()
+            probes: Mapping[str, RetentionProbe] = _probe_targets(storage, limits)
+            probe_seconds = time.monotonic() - probe_started
+            for target_name, limit in limits.items():
+                probe = probes.get(target_name)
+                # Isolate per-target failures so one bad table does not
+                # short-circuit every subsequent target.
+                target_started = time.monotonic()
+                try:
+                    total_count = _exact_rows(storage, target_name, limit, probe)
+                    if total_count is not None:
+                        if total_count >= limit:
+                            # A cascade may have removed rows from a target
+                            # probed before this delete, and the per-target
+                            # loop this replaced always saw a table as it stood
+                            # after the previous delete. So every target after
+                            # one is probed on its own, when its turn comes --
+                            # linear, as before, on every backend.
+                            probes = {}
+                        deleted_total += _sweep_target(
+                            org_id,
+                            project_id,
+                            storage,
+                            target_name,
+                            limit,
+                            total_count,
+                            alert_only=_cap_alerts_only(policy, target_name),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    targets_failed += 1
+                    with error_tags(
+                        subsystem="retention",
+                        op="sweep_target",
+                        org_id=org_id,
+                        target_name=target_name,
+                        error_type=type(exc).__name__,
+                    ):
+                        logger.exception(
+                            "Failed to sweep retention target %s", target_name
+                        )
+                finally:
+                    target_seconds[target_name] = (
+                        time.monotonic() - target_started
+                    ) + (probe.seconds if probe is not None else 0.0)
+        finally:
+            mgr.release_simple_lock()
+    except Exception as exc:  # noqa: BLE001
+        capture_anomaly(
+            "retention.sweep.failed",
+            org_id=org_id,
+            project_id=project_id or UNBOUND_PROJECT_TAG,
+            error_type=type(exc).__name__,
+        )
+        logger.exception("event=retention_sweep_failed org_id=%s", org_id)
+        return RetentionSweepResult(deleted_total, failed=True)
+
+    elapsed = time.monotonic() - started - age_seconds
+    if elapsed > SLOW_SWEEP_SECONDS:
+        capture_anomaly(
+            "retention.sweep.slow",
+            org_id=org_id,
+            project_id=project_id,
+            elapsed_seconds=round(elapsed, 1),
+            targets=len(limits),
+            slowest_target=max(
+                target_seconds, key=target_seconds.__getitem__, default="-"
+            ),
+            slowest_target_seconds=round(max(target_seconds.values(), default=0.0), 1),
+            probe_seconds=round(probe_seconds, 1),
+        )
+    # EVERY target failing is a different animal from one failing: a single bad
+    # table is isolated and usually permanent, but a backend-wide transient
+    # (the PGRST002 that prompted the retry cadence) lands on all of them and
+    # would otherwise be absorbed target by target into a clean-looking tick.
+    if age_failed:
+        # Every age target raised or was blocked: the shape a backend-wide or
+        # archive-wide transient takes. Report it so the scheduler takes its
+        # bounded fast retry rather than waiting a full poll interval.
+        return RetentionSweepResult(deleted_total, failed=True)
+    if targets_failed and targets_failed == len(limits):
+        capture_anomaly(
+            "retention.sweep.all_targets_failed",
+            org_id=org_id,
+            project_id=project_id or UNBOUND_PROJECT_TAG,
+            targets=targets_failed,
+        )
+        return RetentionSweepResult(deleted_total, failed=True)
+    return RetentionSweepResult(deleted_total)
+
+
+def _resolve_policy(org_id: str, project_id: str | None) -> RetentionPolicy:
+    """Ask the registered provider for the org's policy; fail SAFE, not open.
+
+    No provider is OSS, and gets today's behavior. A provider that raises gets
+    ``FAIL_SAFE_RETENTION_POLICY`` -- no age expiry, customer caps only alert --
+    because the default would turn a billing-database outage into oldest-first
+    deletion of customer data.
+    """
+    provider = get_service(RETENTION_POLICY_PROVIDER)
+    if provider is None:
+        return DEFAULT_RETENTION_POLICY
+    try:
+        return provider(org_id)
+    except Exception as exc:  # noqa: BLE001 -- reported, then fail safe
+        capture_anomaly(
+            "retention.policy.failed",
+            level="error",
+            org_id=org_id,
+            project_id=project_id or UNBOUND_PROJECT_TAG,
+            error_type=type(exc).__name__,
+        )
+        logger.exception("event=retention_policy_failed org_id=%s", org_id)
+        return FAIL_SAFE_RETENTION_POLICY
+
+
+def _cap_alerts_only(policy: RetentionPolicy, target_name: str) -> bool:
+    return (
+        policy.customer_cap_action == "alert"
+        and RETENTION_TARGETS_BY_NAME[target_name].customer_data
+    )
+
+
+def _effective_limits(policy: RetentionPolicy) -> dict[str, int]:
+    """Per-target caps, with ``customer_cap_limit`` applied to alert-only targets."""
+    limits = get_row_retention_limits()
+    if policy.customer_cap_limit is not None:
+        for name in limits:
+            if _cap_alerts_only(policy, name):
+                limits[name] = policy.customer_cap_limit
+    return {name: limit for name, limit in limits.items() if limit > 0}
+
+
+def _age_pass(
+    org_id: str, project_id: str | None, storage: BaseStorage, policy: RetentionPolicy
+) -> tuple[int, bool]:
+    """Expire ``age_retained`` rows older than ``policy.age_days``.
+
+    Runs before the cap pass, under the same lease. Each target is isolated: one
+    failing reports ``retention.age.failed`` and the rest still run. Enforcement
+    without an archiver deletes nothing and says so at error level -- archiving
+    is a precondition of deletion, not a best effort.
+
+    Returns:
+        tuple[int, bool]: Rows deleted across all age-retained targets, and
+        whether EVERY target raised or was blocked. A missing archiver is a
+        configuration error a retry cannot fix, so it is reported but not
+        counted as a failure.
+    """
+    if not isinstance(storage, RetentionMixin) or policy.age_days is None:
+        return 0, False
+    if policy.enforce_age and policy.archiver is None:
+        capture_anomaly(
+            "retention.age.no_archiver",
+            level="error",
+            org_id=org_id,
+            project_id=project_id,
+        )
+        return 0, False
+    archiver = policy.archiver if policy.enforce_age else None
+    cutoff = int(time.time()) - policy.age_days * 86400
+    deadline = time.monotonic() + AGE_PASS_SECONDS
+    deleted = failed = 0
+    for index, target in enumerate(AGE_RETAINED_TARGETS):
+        # An equal share of what is left, so one table with a long backlog (or a
+        # long protected prefix) cannot spend the whole pass and starve the rest.
+        remaining = max(0.0, deadline - time.monotonic())
+        target_deadline = time.monotonic() + remaining / (
+            len(AGE_RETAINED_TARGETS) - index
+        )
+        try:
+            result = storage.expire_retention_target_rows(
+                target.name,
+                older_than_epoch=cutoff,
+                budget=AGE_ROWS_PER_TARGET,
+                batch_size=AGE_BATCH_ROWS,
+                archiver=archiver,
+                deadline=target_deadline,
+            )
+        except Exception as exc:  # noqa: BLE001 -- isolated per target
+            capture_anomaly(
+                "retention.age.failed",
+                level="error",
+                org_id=org_id,
+                project_id=project_id,
+                target=target.name,
+                error_type=type(exc).__name__,
+            )
+            logger.exception("event=retention_age_failed target=%s", target.name)
+            failed += 1
+            continue
+        _report_age_result(org_id, project_id, target.name, policy, result)
+        deleted += result.deleted
+        failed += result.blocked is not None
+    return deleted, failed == len(AGE_RETAINED_TARGETS)
+
+
+def _report_age_result(
+    org_id: str,
+    project_id: str | None,
+    target_name: str,
+    policy: RetentionPolicy,
+    result: AgeRetentionResult,
+) -> None:
+    if result.blocked is not None:
+        capture_anomaly(
+            "retention.age.blocked",
+            level="error",
+            org_id=org_id,
+            project_id=project_id,
+            target=target_name,
+            reason=result.blocked,
+            deleted=result.deleted,
+        )
+    if not policy.enforce_age:
+        if result.eligible:
+            _ops_logger.info(
+                "event=retention_age_would_delete org_id=%s project_id=%s "
+                "target=%s rows=%d age_days=%s backlog=%s",
+                org_id,
+                project_id,
+                target_name,
+                result.eligible,
+                policy.age_days,
+                result.backlog,
+            )
+        return
+    if result.deleted:
+        _ops_logger.info(
+            "event=retention_age_enforced org_id=%s project_id=%s target=%s "
+            "deleted=%d age_days=%s backlog=%s",
+            org_id,
+            project_id,
+            target_name,
+            result.deleted,
+            policy.age_days,
+            result.backlog,
+        )
+
+
+def _probe_targets(
+    storage: BaseStorage, limits: Mapping[str, int]
+) -> Mapping[str, RetentionProbe]:
+    """Size ``limits``' targets in one call where the backend supports it.
+
+    ``probe_retention_targets`` is supplied by ``RetentionMixin``, which every
+    SQL backend mixes in, and is deliberately NOT declared on ``BaseStorage`` --
+    see the note at ``storage_base/_base.py``: leaving it off is what lets a test
+    double subclass ``BaseStorage`` without implementing retention. Anything
+    without the mixin is probed one target at a time through the same
+    ``estimate``/``count`` methods this module always called, so a backend that
+    really lacks them still fails per target, inside the loop's isolation.
+    """
+    exact_count_from = {
+        name: limit * EXACT_COUNT_FROM_FRACTION for name, limit in limits.items()
+    }
+    if isinstance(storage, RetentionMixin):
+        return storage.probe_retention_targets(exact_count_from)
+    return probe_retention_targets_individually(storage, exact_count_from)
+
+
+def _exact_rows(
+    storage: BaseStorage,
+    target_name: str,
+    limit: int,
+    probe: RetentionProbe | None,
+) -> int | None:
+    """Return the target's EXACT row count, or ``None`` when it is settled cheaply.
+
+    ``None`` only for an estimate under ``EXACT_COUNT_FROM_FRACTION`` of the cap.
+    Everything downstream -- the approaching warning and every delete -- rests
+    on what this returns, so it never returns an estimate: one at or above the
+    threshold (a probe that should have counted and did not) is counted here.
+    Nor does it act on a STALE count: a pre-fetched exact count at or over
+    ``CAP_WARN_FRACTION`` -- one that will warn or delete -- is taken again now,
+    because the pre-fetch happened before every earlier target's turn.
+
+    Args:
+        storage (BaseStorage): The org's app-role storage.
+        target_name (str): Retention target being probed.
+        limit (int): Row cap for this target, already known positive.
+        probe (RetentionProbe | None): The pre-fetched probe; ``None`` when the
+            backend returned none for this target, which is probed on its own.
+
+    Returns:
+        int | None: The exact count, or ``None`` when the target is far below
+        its cap by estimate.
+    """
+    fresh = probe is None
+    if probe is None:
+        probe = probe_retention_targets_individually(
+            storage, {target_name: limit * EXACT_COUNT_FROM_FRACTION}
+        )[target_name]
+    if probe.error is not None:
+        raise probe.error
+    if probe.exact:
+        if fresh or probe.rows < limit * CAP_WARN_FRACTION:
+            return probe.rows
+    elif probe.rows < limit * EXACT_COUNT_FROM_FRACTION:
+        return None
+    return storage.count_retention_target_rows(target_name)  # type: ignore[reportAttributeAccessIssue]
+
+
+def _sweep_target(
+    org_id: str,
+    project_id: str | None,
+    storage: BaseStorage,
+    target_name: str,
+    limit: int,
+    total_count: int,
+    *,
+    alert_only: bool = False,
+) -> int:
+    """Warn near one target's cap; at it, delete -- or, ``alert_only``, page.
+
+    Args:
+        org_id (str): Org being swept, for anomaly attribution.
+        project_id (str | None): Project bound on this thread, or ``None``
+            where projects do not exist (OSS).
+        storage (BaseStorage): The org's app-role storage.
+        target_name (str): Retention target being enforced.
+        limit (int): Row cap for this target, already known positive.
+        total_count (int): The target's EXACT row count -- never an estimate.
+        alert_only (bool): The cap is a backstop for customer data: reaching it
+            raises an error-level ``retention.cap.exceeded`` for a human to act
+            on, and deletes nothing.
+
+    Returns:
+        int: Rows deleted for this target.
+    """
+    # `delete_oldest_retention_target_rows` is supplied by `RetentionMixin`; see
+    # `_probe_targets` for why it is not declared on `BaseStorage`. A backend
+    # that really lacks it raises `AttributeError`, which the per-target
+    # isolation in the caller absorbs.
+    if total_count < limit:
+        if total_count >= limit * CAP_WARN_FRACTION:
+            capture_anomaly(
+                "retention.cap.approaching",
+                org_id=org_id,
+                project_id=project_id,
+                target=target_name,
+                rows=total_count,
+                limit=limit,
+            )
+        return 0
+
+    if alert_only:
+        capture_anomaly(
+            "retention.cap.exceeded",
+            level="error",
+            org_id=org_id,
+            project_id=project_id,
+            target=target_name,
+            rows=total_count,
+            limit=limit,
+        )
+        logger.error(
+            "event=retention_cap_exceeded org_id=%s target=%s rows=%d limit=%d "
+            "-- alert only, nothing deleted",
+            org_id,
+            target_name,
+            total_count,
+            limit,
+        )
+        return 0
+
+    delete_count = delete_count_for_retention(total_count)
+    deleted = storage.delete_oldest_retention_target_rows(  # type: ignore[reportAttributeAccessIssue]
+        target_name, delete_count
+    )
+    capture_anomaly(
+        "retention.cap.enforced",
+        org_id=org_id,
+        project_id=project_id,
+        target=target_name,
+        rows_before=total_count,
+        deleted=deleted,
+        limit=limit,
+    )
+    logger.info(
+        "Cleaned up %d oldest %s row(s) (total was %d, limit %d)",
+        deleted,
+        target_name,
+        total_count,
+        limit,
+    )
+    return deleted

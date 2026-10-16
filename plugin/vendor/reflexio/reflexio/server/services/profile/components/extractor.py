@@ -1,0 +1,629 @@
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel
+
+from reflexio.models.api_schema.internal_schema import RequestInteractionDataModel
+from reflexio.models.api_schema.service_schemas import (
+    UserProfile,
+)
+from reflexio.models.config_schema import ProfileExtractorConfig
+from reflexio.models.profile_id import new_profile_id
+from reflexio.server.api_endpoints.request_context import RequestContext
+from reflexio.server.env_utils import env_bool
+from reflexio.server.llm._litellm_types import ProviderRequestGuardError
+from reflexio.server.llm.litellm_client import LiteLLMClient
+from reflexio.server.llm.token_accounting import RunTokenTotals, sum_trace_tokens
+from reflexio.server.services.deferred_learning_plan import ExtractorBookmarkAdvance
+from reflexio.server.services.extraction.input_preparation import SourceSpan
+from reflexio.server.services.extraction.outcome import ExtractionOutcome
+from reflexio.server.services.extraction.overflow_coordinator import (
+    current_overflow_coordinator,
+)
+from reflexio.server.services.extraction.overflow_pipeline import OverflowExtractionCall
+from reflexio.server.services.extraction.overflow_presentation import (
+    current_overflow_presentation,
+)
+from reflexio.server.services.extraction.resumable_agent import (
+    run_resumable_extraction_agent,
+)
+from reflexio.server.services.extractor_config_utils import get_extractor_name
+from reflexio.server.services.extractor_interaction_utils import (
+    get_effective_source_filter,
+    get_extractor_window_params,
+)
+from reflexio.server.services.operation_state_utils import OperationStateManager
+
+if TYPE_CHECKING:
+    from reflexio.server.services.profile.service import (
+        ProfileGenerationServiceConfig,
+    )
+from reflexio.server.llm.model_defaults import ModelRole, resolve_model_name
+from reflexio.server.services.profile.profile_generation_service_utils import (
+    PROFILE_SOURCE_EVIDENCE_INSTRUCTION,
+    ProfileTimeToLive,
+    StructuredProfilesOutput,
+    calculate_expiration_timestamp,
+    construct_profile_extraction_messages_from_sessions,
+)
+from reflexio.server.services.service_utils import (
+    extract_interactions_from_request_interaction_data_models,
+    format_sessions_to_history_string,
+    log_llm_messages,
+)
+from reflexio.server.site_var.site_var_manager import SiteVarManager
+
+logger = logging.getLogger(__name__)
+PROFILE_EXTRACTION_TIMEOUT_SECONDS = 300
+PROFILE_EXTRACTION_MAX_RETRIES = 2
+
+# Maximum number of existing profiles to include in extraction prompt for context
+MAX_EXISTING_PROFILES_FOR_CONTEXT = 5
+
+
+def _profile_evidence_validation_errors(
+    output: BaseModel, spans: tuple[SourceSpan, ...]
+) -> list[str]:
+    """A source quote must occur in one contiguous original field, never a splice."""
+    if not isinstance(output, StructuredProfilesOutput):
+        return ["Return the supplied profile extraction schema."]
+    fields: dict[tuple[int, str, str], list[SourceSpan]] = {}
+    for span in spans:
+        fields.setdefault(
+            (span.interaction_id, span.request_id, span.field), []
+        ).append(span)
+    contiguous_texts = []
+    for offsets in fields.values():
+        run_start, previous_end, text = -1, -1, ""
+        for span in sorted(offsets, key=lambda item: (item.start, -item.end)):
+            if span.start > previous_end:
+                if text:
+                    contiguous_texts.append(text)
+                run_start, previous_end, text = span.start, span.end, span.text
+                continue
+            overlap = min(previous_end, span.end) - span.start
+            if (
+                text[span.start - run_start : span.start - run_start + overlap]
+                != span.text[:overlap]
+            ):
+                return ["Visible original evidence disagrees at overlapping offsets."]
+            text += span.text[overlap:]
+            previous_end = max(previous_end, span.end)
+        if text:
+            contiguous_texts.append(text)
+    return [
+        f"profiles[{index}]: quote exact visible original evidence in source_span."
+        for index, profile in enumerate(output.profiles or [])
+        if not profile.source_span
+        or not profile.source_span.strip()
+        or not any(profile.source_span in text for text in contiguous_texts)
+    ]
+
+
+class ProfileExtractor:
+    """
+    Extract user profile information from interactions.
+
+    This class analyzes user interactions to extract new user profile information.
+    It focuses purely on extraction — deduplication against existing profiles
+    is handled separately by ProfileConsolidator.
+    """
+
+    def __init__(
+        self,
+        request_context: RequestContext,
+        llm_client: LiteLLMClient,
+        extractor_config: ProfileExtractorConfig,
+        service_config: ProfileGenerationServiceConfig,
+        agent_context: str,
+    ):
+        """
+        Initialize the profile extractor.
+
+        Args:
+            request_context: Request context with storage and prompt manager
+            llm_client: Unified LLM client supporting both OpenAI and Claude
+            extractor_config: Profile extractor configuration from YAML
+            service_config: Runtime service configuration with request data
+            agent_context: Context about the agent
+        """
+        self.request_context = request_context
+        self.client = llm_client
+        self.config: ProfileExtractorConfig = extractor_config
+        self.service_config: ProfileGenerationServiceConfig = service_config
+        self.agent_context = agent_context
+        self._last_resumable_run_id: str | None = None
+        self._last_resumable_token_totals: RunTokenTotals | None = None
+        self._last_model_provenance = None
+
+        # Get LLM config overrides from configuration
+        config = self.request_context.configurator.get_config()
+        llm_config = config.llm_config if config else None
+
+        # Resolve model names: config override → site var → auto-detect
+        model_setting = SiteVarManager().get_site_var("llm_model_setting")
+        site_var = model_setting if isinstance(model_setting, dict) else {}
+        api_key_config = self.request_context.configurator.get_config().api_key_config
+
+        self.should_run_model_name = resolve_model_name(
+            ModelRole.SHOULD_RUN,
+            site_var_value=site_var.get("should_run_model_name"),
+            config_override=llm_config.should_run_model_name if llm_config else None,
+            api_key_config=api_key_config,
+        )
+        self.default_generation_model_name = resolve_model_name(
+            ModelRole.GENERATION,
+            site_var_value=site_var.get("default_generation_model_name"),
+            config_override=llm_config.generation_model_name if llm_config else None,
+            api_key_config=api_key_config,
+        )
+
+    def _create_state_manager(self) -> OperationStateManager:
+        """
+        Create an OperationStateManager for this extractor.
+
+        Returns:
+            OperationStateManager configured for profile_extractor
+        """
+        return OperationStateManager(
+            self.request_context.storage,  # type: ignore[reportArgumentType]
+            self.request_context.org_id,
+            "profile_extractor",
+        )
+
+    def _get_interactions(self) -> list[RequestInteractionDataModel] | None:
+        """
+        Get interactions for this extractor based on its config.
+
+        Handles:
+        - Getting window parameters (extractor override or global fallback)
+        - Source filtering based on extractor config
+        - Time range filtering for rerun flows
+
+        Note: Stride checking is handled upstream by BaseGenerationService._filter_configs_by_stride()
+        before the extractor is created.
+
+        Returns:
+            List of request interaction data models, or None if source filter skips this extractor
+        """
+        if self.service_config.window_interactions is not None:
+            return self.service_config.window_interactions
+
+        # Get global config values
+        config = self.request_context.configurator.get_config()
+        global_window_size = getattr(config, "window_size", None) if config else None
+        global_stride_size = getattr(config, "stride_size", None) if config else None
+
+        # Get effective window_size for this extractor
+        window_size, _ = get_extractor_window_params(
+            self.config,
+            global_window_size,
+            global_stride_size,
+        )
+
+        # Get effective source filter (None = get ALL sources)
+        should_skip, effective_source = get_effective_source_filter(
+            self.config,
+            self.service_config.source,
+        )
+        if should_skip:
+            return None
+
+        storage = self.request_context.storage
+
+        # Get window interactions with time range filter
+        session_data_models, _ = storage.get_last_k_interactions_grouped(  # type: ignore[reportOptionalMemberAccess]
+            user_id=self.service_config.user_id,
+            k=window_size,
+            sources=effective_source,
+            start_time=self.service_config.rerun_start_time,
+            end_time=self.service_config.rerun_end_time,
+        )
+        return session_data_models
+
+    def run(self) -> list[UserProfile] | ExtractionOutcome[UserProfile] | None:
+        """
+        Extract profiles from request interaction groups.
+
+        This extractor handles its own data collection:
+        1. Gets interactions based on its config (window size, source filtering)
+        2. Applies time range filter for rerun flows
+        3. Calls LLM to extract profiles
+        4. Converts raw extraction to UserProfile objects
+        5. Defers the stride-bookmark advance onto the outcome (applied in persist)
+
+        Returns:
+            None when there are no interactions to process; otherwise an
+            ExtractionOutcome carrying the extracted profiles, the resumable
+            run_id (when set), and the deferred bookmark advance.
+        """
+        # Collect interactions using extractor's own window_size/stride_size settings
+        request_interaction_data_models = self._get_interactions()
+        if request_interaction_data_models and self.request_context.org_id == "claude-smart":
+            request_interaction_data_models = self.request_context.storage.scene_filter_interactions(request_interaction_data_models)
+        if not request_interaction_data_models:
+            return None
+
+        # Limit existing profiles to most recent for context
+        existing_profiles = self.service_config.existing_data or []
+        context_profiles = sorted(
+            existing_profiles,
+            key=lambda p: p.last_modified_timestamp,
+            reverse=True,
+        )[:MAX_EXISTING_PROFILES_FOR_CONTEXT]
+
+        try:
+            raw_profiles = self._generate_raw_updates_from_sessions(
+                request_interaction_data_models=request_interaction_data_models,
+                existing_profiles=context_profiles,
+            )
+        except ProviderRequestGuardError:
+            raise
+        except Exception as e:
+            logger.error(
+                "event=profile_extract_failed user_id=%s extractor_name=%s error_type=%s error=%s",
+                self.service_config.user_id,
+                get_extractor_name(self.config),
+                type(e).__name__,
+                str(e),
+            )
+            raise RuntimeError(
+                f"Profile extraction failed for user {self.service_config.user_id}"
+            ) from e
+
+        # Log only the count — the raw profile dicts are extracted Customer
+        # Content, and INFO records may reach external telemetry. Keep the record
+        # content-free by reporting only the number of generated profiles.
+        logger.info(
+            "Generated raw profiles: count=%d", len(raw_profiles) if raw_profiles else 0
+        )
+        source_interaction_ids = [
+            interaction.interaction_id
+            for request_model in request_interaction_data_models
+            for interaction in request_model.interactions
+            if interaction.interaction_id
+        ]
+        user_profiles = self._convert_raw_to_user_profiles(
+            raw_profiles=raw_profiles or [],
+            user_id=self.service_config.user_id,
+            request_id=self.service_config.request_id,
+            source_interaction_ids=source_interaction_ids,
+        )
+        # Defer the stride-bookmark advance onto the outcome instead of
+        # self-advancing here (F1): the advance is applied downstream — inside
+        # the persist fence on the durable path, or in ``.run()``'s persist
+        # half — so it stays atomic with the profile row writes it corresponds
+        # to. Only produced when output was generated (bookmark-iff-rows).
+        bookmark_advance: ExtractorBookmarkAdvance | None = None
+        if raw_profiles:
+            bookmark_advance = ExtractorBookmarkAdvance(
+                extractor_name=get_extractor_name(self.config),
+                processed_interactions=extract_interactions_from_request_interaction_data_models(
+                    request_interaction_data_models
+                ),
+                user_id=self.service_config.user_id,
+            )
+
+        # Always return an ExtractionOutcome so the bookmark advance rides along
+        # even in the non-resumable case. A resumable run must also surface its
+        # run_id so the generation service can finalize the _agent_runs row
+        # (FINALIZED_PENDING_TOOL when the agent created a follow-up ask and
+        # finished with empty output); dropping it would orphan the run in
+        # AGENT_COMPLETED and sever the resolve -> resume chain.
+        return ExtractionOutcome.completed(
+            user_profiles,
+            run_id=self._last_resumable_run_id,
+            token_totals=self._last_resumable_token_totals,
+            bookmark_advance=bookmark_advance,
+            model_provenance=self._last_model_provenance,
+        )
+
+    def _convert_raw_to_user_profiles(
+        self,
+        raw_profiles: list[dict],
+        user_id: str,
+        request_id: str,
+        source_interaction_ids: list[int] | None = None,
+    ) -> list[UserProfile]:
+        """
+        Convert raw profile dicts from LLM to UserProfile objects.
+
+        Args:
+            raw_profiles: List of profile dicts with content, time_to_live, and optional metadata
+            user_id: User ID
+            request_id: Request ID
+            source_interaction_ids: Stored interaction ids used as the extraction window
+
+        Returns:
+            List of UserProfile objects
+        """
+        new_profiles = []
+        profile_source_interaction_ids = list(source_interaction_ids or [])
+        for profile_content in raw_profiles:
+            if (
+                not isinstance(profile_content, dict)
+                or "content" not in profile_content
+            ):
+                logger.warning(
+                    "Invalid profile content: expected a dict with a 'content' key, got %s "
+                    "(content omitted from logs)",
+                    type(profile_content).__name__,
+                )
+                continue
+
+            if self.request_context.org_id == "claude-smart" and not profile_content.get("scenes"):
+                continue
+
+            # Canonical provenance belongs on the profile, not in custom data.
+            custom_features = {
+                k: v
+                for k, v in profile_content.items()
+                if k
+                not in {
+                    "content",
+                    "time_to_live",
+                    "source_span",
+                    "notes",
+                    "reader_angle",
+                }
+            }
+
+            now_ts = int(datetime.now(UTC).timestamp())
+            ttl = ProfileTimeToLive(profile_content.get("time_to_live", "infinity"))
+
+            added_profile = UserProfile(
+                profile_id=new_profile_id(),
+                user_id=user_id,
+                content=profile_content["content"],
+                last_modified_timestamp=now_ts,
+                generated_from_request_id=request_id,
+                profile_time_to_live=ttl,
+                expiration_timestamp=calculate_expiration_timestamp(now_ts, ttl),
+                custom_features=custom_features or None,
+                extractor_names=None,
+                source_interaction_ids=profile_source_interaction_ids,
+                source_span=profile_content.get("source_span"),
+                notes=profile_content.get("notes"),
+                reader_angle=profile_content.get("reader_angle"),
+            )
+
+            if self.request_context.org_id == "claude-smart":
+                from reflexio.models.api_schema.service_schemas import Status
+                added_profile.source_span = added_profile.notes = added_profile.reader_angle = None
+                added_profile.source_interaction_ids = []
+                if profile_content.get("evidence_basis") != "explicit":
+                    added_profile.status = Status.PENDING
+
+            new_profiles.append(added_profile)
+            coordinator = current_overflow_coordinator.get()
+            if coordinator is not None:
+                coordinator.candidate_models[str(added_profile.profile_id)] = (
+                    coordinator.candidate_model(profile_content)
+                )
+        return new_profiles
+
+    def _generate_raw_updates_from_sessions(
+        self,
+        request_interaction_data_models: list[RequestInteractionDataModel],
+        existing_profiles: list[UserProfile],
+    ) -> list[dict]:
+        """
+        Generate raw profile extractions from request interaction groups.
+
+        Args:
+            request_interaction_data_models: List of request interaction groups
+            existing_profiles: List of existing user profiles for context
+
+        Returns:
+            list[dict]: List of profile dicts with content, time_to_live, and optional metadata
+        """
+        # Check if mock mode is enabled
+        if env_bool("MOCK_LLM_RESPONSE", default=False):
+            return self._generate_mock_profiles(
+                request_interaction_data_models=request_interaction_data_models,
+            )
+
+        messages = construct_profile_extraction_messages_from_sessions(
+            prompt_manager=self.request_context.prompt_manager,
+            request_interaction_data_models=request_interaction_data_models,
+            agent_context_prompt=self.agent_context,
+            context_prompt=(
+                self.config.context_prompt.strip() if self.config.context_prompt else ""
+            ),
+            extraction_definition_prompt=self.config.extraction_definition_prompt.strip(),
+            existing_profiles=existing_profiles,
+        )
+
+        messages_dict = messages
+        if self.request_context.org_id == "claude-smart":
+            import json
+            from reflexio.server.services.profile.scene_policy import POLICY
+            catalog = self.request_context.storage.scene_catalog()
+            messages_dict.append({"role": "system", "content": POLICY + "\n匹配目录：" + json.dumps(catalog, ensure_ascii=False)})
+        session_count = len(request_interaction_data_models)
+        interaction_count = sum(
+            len(data_model.interactions)
+            for data_model in request_interaction_data_models
+        )
+        history_chars = len(
+            format_sessions_to_history_string(request_interaction_data_models)
+        )
+        logger.info(
+            "event=profile_extract_llm_start user_id=%s extractor_name=%s sessions=%d interactions=%d history_chars=%d existing_profiles=%d model=%s timeout=%d max_retries=%d response_format=%s",
+            self.service_config.user_id,
+            get_extractor_name(self.config),
+            session_count,
+            interaction_count,
+            history_chars,
+            len(existing_profiles),
+            self.default_generation_model_name,
+            PROFILE_EXTRACTION_TIMEOUT_SECONDS,
+            PROFILE_EXTRACTION_MAX_RETRIES,
+            "StructuredProfilesOutput",
+        )
+
+        log_llm_messages(logger, "Profile extraction", messages_dict)
+
+        coordinator = current_overflow_coordinator.get()
+
+        def overflow_call() -> OverflowExtractionCall:
+            presentation = current_overflow_presentation.get()
+            if presentation is None:
+                raise RuntimeError("Profile chunk lacks its prepared source")
+            chunk_messages = construct_profile_extraction_messages_from_sessions(
+                prompt_manager=self.request_context.prompt_manager,
+                request_interaction_data_models=request_interaction_data_models,
+                agent_context_prompt=coordinator.agent_context
+                if coordinator
+                else self.agent_context,
+                context_prompt=self.config.context_prompt.strip()
+                if self.config.context_prompt
+                else "",
+                extraction_definition_prompt=self.config.extraction_definition_prompt.strip(),
+                existing_profiles=existing_profiles,
+            )
+            chunk_messages.append(
+                {
+                    "role": "system",
+                    "content": PROFILE_SOURCE_EVIDENCE_INSTRUCTION,
+                }
+            )
+            if self.request_context.org_id == "claude-smart":
+                chunk_messages.append(messages_dict[-1])
+            return OverflowExtractionCall(
+                chunk_messages,
+                StructuredProfilesOutput,
+                lambda output: [] if self.request_context.org_id == "claude-smart" else _profile_evidence_validation_errors(
+                    output, presentation.visible_spans
+                ),
+            )
+
+        all_spans = (
+            tuple(
+                span
+                for chunk in coordinator.require_prepared().chunks
+                for span in (*chunk.neighbors, *chunk.spans)
+            )
+            if coordinator
+            else ()
+        )
+
+        def validate_final(output: BaseModel) -> list[str]:
+            if self.request_context.org_id == "claude-smart":
+                return []
+            if (
+                coordinator is not None
+                and coordinator.saved_run is not None
+                and coordinator.saved_run.committed_output is not None
+                and not coordinator.checkpoint.get("extraction_policy")
+                and isinstance(output, StructuredProfilesOutput)
+            ):
+                for index, profile in enumerate(output.profiles or [], 1):
+                    coordinator.verified_adopted_record(index)
+                    if profile.source_span:
+                        errors = _profile_evidence_validation_errors(
+                            StructuredProfilesOutput(profiles=[profile]), all_spans
+                        )
+                        if errors:
+                            return errors
+                return []
+            spans = (
+                coordinator.carried_source_spans
+                if coordinator is not None
+                and coordinator.carried_source_spans is not None
+                else all_spans
+            )
+            return _profile_evidence_validation_errors(output, spans)
+
+        result = run_resumable_extraction_agent(
+            request_context=self.request_context,
+            client=self.client,
+            extractor_kind="profile",
+            user_id=self.service_config.user_id,
+            request_id=self.service_config.request_id,
+            agent_version=None,
+            source=self.service_config.source,
+            request_interaction_data_models=request_interaction_data_models,
+            extractor_config=self.config,
+            service_config=self.service_config,
+            agent_context=self.agent_context,
+            messages=messages_dict,
+            output_schema=StructuredProfilesOutput,
+            log_label="Profile extraction",
+            overflow_call_factory=overflow_call if coordinator else None,
+            overflow_final_validator=validate_final if coordinator else None,
+        )
+        self._last_resumable_run_id = result.run_id
+        self._last_resumable_token_totals = sum_trace_tokens(result.trace)
+        self._last_model_provenance = result.model_provenance
+        if not isinstance(result.output, StructuredProfilesOutput):
+            if self.service_config.extraction_window_id is not None:
+                raise RuntimeError(
+                    f"Profile extraction did not finish: {result.finished_reason}"
+                )
+            logger.warning(
+                "Profile extraction did not finish: %s", result.finished_reason
+            )
+            return []
+        return [p.model_dump() for p in (result.output.profiles or [])]
+
+    def _generate_mock_profiles(
+        self,
+        request_interaction_data_models: list[RequestInteractionDataModel],
+    ) -> list[dict]:
+        """
+        Generate mock profile extractions for testing.
+
+        Args:
+            request_interaction_data_models: List of request interaction groups
+
+        Returns:
+            list[dict]: Mock profile dicts
+        """
+        interactions = extract_interactions_from_request_interaction_data_models(
+            request_interaction_data_models
+        )
+
+        if not interactions:
+            return []
+
+        sample_content = (
+            interactions[-1].content[:50]
+            if interactions[-1].content
+            else "sample interaction"
+        )
+
+        # Capture additional context that contains helpful keywords
+        highlight_keywords = {
+            "software",
+            "solution",
+            "product",
+            "company",
+            "service",
+        }
+        highlighted_snippet = next(
+            (
+                interaction.content[:80]
+                for interaction in reversed(interactions)
+                if interaction.content
+                and any(
+                    keyword in interaction.content.lower()
+                    for keyword in highlight_keywords
+                )
+            ),
+            "",
+        )
+
+        summary_parts = [f"User mentioned: {sample_content}"]
+        if highlighted_snippet and highlighted_snippet not in sample_content:
+            summary_parts.append(f"Key context: {highlighted_snippet}")
+
+        mock_profile = {
+            "content": " ".join(summary_parts),
+            "time_to_live": "one_month",
+        }
+
+        return [mock_profile]

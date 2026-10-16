@@ -1,0 +1,816 @@
+# /reflexio/server
+Description: FastAPI backend server that processes user interactions to generate profiles, extract playbooks, and evaluate agent success
+
+`slow_request_diagnostics.py` observes `/api/search_profiles` and `/api/account`
+through the existing timeout middleware. After 20 seconds it emits
+`event=slow_request_stacks` with the route, correlation ID and thread frame
+locations. It omits local values, source lines, request bodies and credentials.
+Snapshots are limited to 128 threads, 12 frames per thread and 64 KiB of ASCII
+text, with at most one snapshot per process per minute. Completed requests
+cancel their diagnostic task; diagnostic failures do not replace responses.
+The observer does not interrupt work or change timeout or billing behavior.
+Emission is best-effort while the event loop remains responsive. The snapshot
+covers process threads; it does not map each thread to the correlation ID or
+capture suspended async coroutines. A missing snapshot does not rule out a stall.
+
+## Table of Contents
+
+`background_work.py` exposes a neutral worker-context marker for deployments
+that reserve shared database capacity for foreground requests. Worker thread
+entry points mark themselves; the marker does not create connections, propagate
+tenant identity, or alter embedded Python cleanup behavior. A deployment's
+database infrastructure decides how to apply the admission class.
+
+It also owns the failure-reporting policy for background work.
+`report_background_failure(logger, event, exc, *, scope, detail=None)` logs a
+bug at ERROR with its traceback, and a transient infrastructure failure (as
+judged by the classifier a deployment registers with
+`configure_transient_failure_classifier`; with none registered, every failure
+is an ERROR) at WARNING. A transient failure extends the streak for its
+`scope`; the streak escalates to ERROR once it holds 3 consecutive failures
+spanning at least 300s, and `report_background_success(scope)` ends it (so does
+an hour with no failure, so a unit that went idle cannot carry a stale streak
+into a later blip). Every
+failure scope therefore needs a success report with the same scope, made only
+where that same unit actually ran and succeeded, and two failure sites in one
+module must not share a scope prefix; `tests/server/test_background_failure_pairing.py`
+enforces the scope shapes (not the placement). Only work that is retried
+within minutes belongs on this policy (daily and hourly jobs log ERROR directly): one-shot callbacks (tagging, group evaluation, the
+playbook optimizer, the aggregation claim notification) stay at ERROR. Accepted
+limit: the streak is process-local, so if an outage also restarts tasks faster
+than every 300s, background failures stay at WARNING; request-path errors and
+health alarms still page in that case.
+
+
+- [Main Entry Points](#main-entry-points)
+- [Cache](#cache)
+- [API Endpoints](#api-endpoints)
+- [Extension Registry](#extension-registry)
+- [LLM Client](#llm-client)
+- [Prompts](#prompts)
+- [Site Variables](#site-variables)
+- [Services](#services)
+  - [Orchestrator](#orchestrator)
+  - [Base Infrastructure](#base-infrastructure)
+  - [Profile Generation](#profile-generation)
+  - [Playbook Extraction](#playbook-extraction)
+  - [Agent Success Evaluation](#agent-success-evaluation)
+  - [Durable Learning Queue](#durable-learning-queue)
+  - [Async Extraction](#async-extraction)
+  - [Shadow Comparison and Evaluation Overview](#shadow-comparison-and-evaluation-overview)
+  - [Playbook Optimizer and Braintrust](#playbook-optimizer-and-braintrust)
+  - [Lineage](#lineage)
+  - [Query Reformulator](#query-reformulator)
+  - [Unified Search Service](#unified-search-service)
+  - [Storage](#storage)
+  - [Configurator](#configurator)
+- [Architecture Pattern](#architecture-pattern)
+  - [Request Flow](#request-flow)
+  - [Service Pattern](#service-pattern)
+  - [Requirements / Problems to Avoid](#requirements--problems-to-avoid)
+- [See Also](#see-also)
+
+## Main Entry Points
+
+
+- **API composer**: `api.py` - `create_app()` factory, middleware/capability wiring, OpenAPI auth decoration, and `core_router` aggregation
+- **Search request runtime**: `search_runtime.py` - HTTP deadline, unsampled phase timing, bounded worker ownership and connection cancellation; embedded calls have no request scope
+- **Domain routes**: `routes/` - FastAPI route modules; add new public API surfaces here and include their routers in `api.py`
+- **Endpoint Helpers**: `api_endpoints/` - Shared handlers/helpers plus `RequestContext` used by route modules
+- **Extension Registry**: `extensions.py` - Capability and service registry for optional OSS/enterprise integrations
+- **Core Service**: `services/generation_service.py` - Main orchestrator
+- **Durable Learning**: `services/durable_learning/` - durable sliding-window admission, scheduling and extraction
+
+## Purpose
+
+
+Compose the shared HTTP API, resolve request dependencies, and coordinate durable learning, session evaluation, retrieval, and optional deployment capabilities.
+
+## Cache
+
+
+**Directory**: `cache/`
+
+| File | Purpose |
+|------|---------|
+| `reflexio_cache.py` | TTL-cached Reflexio instances (1 hour TTL, max 100 orgs) |
+
+**Key Functions**:
+
+- `get_reflexio(org_id)` - Get or create cached instance
+- `prefetch_config_version(org_id)` - Check a warm instance concurrently with independent search-request reads using the shared search executor and deadline. The request memo retains the fresh version; `get_reflexio` still owns invalidation and reconstruction. Cold and non-search requests are unchanged.
+- `invalidate_reflexio_cache(org_id)` - Invalidate after config changes
+- `clear_reflexio_cache()` - Clear entire cache (testing/admin)
+
+**Pattern**: **ALWAYS use `get_reflexio()`** instead of `Reflexio()` directly in API endpoints
+
+## API Endpoints
+
+
+**Directory**: `api_endpoints/`
+
+**Route modules** live in `routes/` and are grouped by domain. `api.py` remains the composition root: it creates `core_router`, includes each domain router, and mounts the aggregate router into the FastAPI app. **Detailed handler documentation**: See [`api_endpoints/README.md`](api_endpoints/README.md) for the `RequestContext` contract and helper map.
+
+| Route file | Purpose |
+|------|---------|
+| `routes/system.py` | Root/health/version and operation status/cancel surfaces. |
+| `routes/interactions.py` | Publish, request/session/interaction retrieval, direct interaction writes, and clear-data operations. |
+| `routes/profiles.py` | Profile retrieval, statistics, rerun/manual generation, upgrade/downgrade, update/delete lifecycle routes. |
+| `routes/playbooks.py` | User/agent playbook retrieval, aggregation, lifecycle, status/update/delete, and application stats routes. |
+| `routes/search.py` | Unified search and entity-specific search/rerank routes. |
+| `routes/experiments.py` | Single-active retrieval experiment lifecycle and user-clustered session outcome reporting. |
+| `routes/provenance.py` | Learning provenance and approval routes. |
+| `routes/evaluation.py` | Evaluation overview, regenerate jobs, grade-on-demand, shadow comparisons, pending tool calls, and stall-state routes. |
+| `routes/braintrust.py` | Braintrust connection/project/status/sync routes. |
+| `routes/config.py` | Config read/write and account identity routes. |
+
+| File | Purpose |
+|------|---------|
+| `request_context.py` | RequestContext (bundles org_id, storage, configurator, prompt_manager) |
+| `publisher_api.py` | Publishing interactions plus direct create/update/delete helpers for profiles, playbooks, requests, sessions, and clear-data operations |
+| `account_api.py` | Account/config identity helpers used by `/api/whoami` and related account surfaces |
+| `health_api.py` | `/health/live` (liveness), `/healthz` (deprecated alias) and `/healthz/eval` health checks |
+| `pending_tool_call_api.py` | Pending tool-call and human-clarification routes for resumable extraction |
+| `stall_state_api.py` | Stall-state read/update routes |
+| `precondition_checks.py` | Request validation |
+
+**Key Endpoints**:
+
+- **Health/version**: `GET /`, `GET /health/live`, `GET /health/ready`, `GET /health` and `GET /healthz` (deprecated aliases), `GET /healthz/eval`, `GET /meta/version`
+- **Identity/config**: `GET /api/whoami`, `GET /api/my_config`, `GET /api/get_config`, `POST /api/set_config`, `POST /api/update_config`
+- **Provenance**: `POST /api/get_learning_provenance`
+- **Publish/direct writes**: `POST /api/publish_interaction`, `POST /api/add_user_profile`, `POST /api/add_user_playbook`, `POST /api/add_agent_playbook`
+- **Retrieval**: `POST /api/get_requests`, `POST /api/get_interactions`, `GET /api/get_all_interactions`, `GET /api/learning_status`, `POST /api/get_profiles`, `GET /api/get_all_profiles`, `POST /api/get_user_playbooks`, `POST /api/get_agent_playbooks`, `POST /api/get_agent_success_evaluation_results`, `POST /api/get_retrieved_learning_evaluation_results`
+- **Search/stats**: `POST /api/search`, `POST /api/search_profiles`, `POST /api/rerank_user_profiles`, `POST /api/search_interactions`, `POST /api/search_user_playbooks`, `POST /api/search_agent_playbooks`, `GET /api/storage_stats`, `GET /api/get_profile_statistics`, `POST /api/get_dashboard_stats`, `POST /api/get_playbook_application_stats`
+- **Retrieval experiments**: `GET/POST /api/retrieval_experiments`, `POST /api/retrieval_experiments/stop`, `GET /api/retrieval_experiments/{experiment_id}/results`
+- **Profile lifecycle**: `POST /api/rerun_profile_generation`, `POST /api/manual_profile_generation`, `POST /api/upgrade_all_profiles`, `POST /api/downgrade_all_profiles`, `GET /api/profile_change_log`, `PUT /api/update_user_profile`, `DELETE /api/delete_profile`, `DELETE /api/delete_profiles_by_ids`, `DELETE /api/delete_all_profiles`
+- **Playbook lifecycle**: `POST /api/review_user_playbooks`, `POST /api/rerun_playbook_generation`, `POST /api/manual_playbook_generation`, `POST /api/run_playbook_aggregation`, `GET /api/playbook_aggregation_change_logs`, `POST /api/upgrade_all_user_playbooks`, `POST /api/downgrade_all_user_playbooks`, `PUT /api/update_agent_playbook_status`, `PUT /api/update_agent_playbook`, `PUT /api/update_user_playbook`, `DELETE /api/delete_agent_playbook`, `DELETE /api/delete_user_playbook`, `DELETE /api/delete_agent_playbooks_by_ids`, `DELETE /api/delete_user_playbooks_by_ids`, `DELETE /api/delete_all_playbooks`, `DELETE /api/delete_all_user_playbooks`, `DELETE /api/delete_all_agent_playbooks`
+- **Evaluation**: `POST /api/get_evaluation_overview`, `POST /api/evaluations/regenerate`, `GET /api/evaluations/regenerate/{job_id}`, `DELETE /api/evaluations/regenerate/{job_id}`, `POST /api/evaluations/grade_on_demand`, `GET /api/evaluations/shadow_comparisons/recent`
+- **Braintrust**: `POST /api/braintrust/connect`, `POST /api/braintrust/select_projects`, `GET /api/braintrust/status`, `DELETE /api/braintrust/connection`, `POST /api/braintrust/sync`
+- **Operations/admin**: `GET /api/get_operation_status`, `POST /api/cancel_operation`, `POST /api/admin/cache/invalidate`, `POST /api/session_outcome`, `POST /api/get_session_outcomes`, `DELETE /api/delete_interaction`, `DELETE /api/delete_request`, `DELETE /api/delete_session`, `DELETE /api/delete_requests_by_ids`, `DELETE /api/delete_all_interactions`, `POST /api/clear_user_data`
+- **Human clarification/stall state**: `GET /api/pending_tool_calls`, `GET /api/pending_tool_calls/{pending_tool_call_id}`, `POST /api/pending_tool_calls/{pending_tool_call_id}/resolve`, `PATCH /api/pending_tool_calls/{pending_tool_call_id}/answer`, `POST /api/pending_tool_calls/{pending_tool_call_id}/not_applicable`, `POST /api/pending_tool_calls/{pending_tool_call_id}/cancel`, `GET /api/stall_state`, `POST /api/stall_state/notified`
+
+**Authentication Pattern**: The standalone open-source `api:app` uses `default_get_org_id` and `DEFAULT_ORG_ID`, with `LocalAccessMiddleware` limiting no-key data access to loopback peers, hostnames, and browser origins. Setting `REFLEXIO_API_KEY` requires matching Bearer authentication for all data clients. Its launcher binds loopback by default. Embedded hosts composing `create_app()` own their access policy; enterprise deployments supply authenticated org resolution, additional account routers, admin checks, observability hooks, and usage metrics.
+
+**User-playbook exposure boundary**: Authenticated enterprise deployments install `ExposureLedgerRecorder` through their capability registry. In those deployments, `POST /api/search` and `POST /api/search_user_playbooks` synchronously record the final served user-playbook set through `services/search_exposure.py` before metering or releasing success. Shared `create_app()` intentionally installs no default recorder; local/no-auth OSS and custom shared app constructions persist exposures only when their deployment registers `SEARCH_EXPOSURE_RECORDER`. Because that absence is legal, `record_search_exposures()` reports it rather than raising: it returns `SearchExposureOutcome.RECORDED`, `SearchExposureOutcome.RECORDED_UNCORRELATED`, `SearchExposureOutcome.RECORDER_FAILED`, or `SearchExposureOutcome.NO_RECORDER`, so callers that depend on the batch reaching the ledger (corpus reconstruction, replay tooling) can assert on the outcome instead of assuming a silent no-op was a durable write. Only the first two mean the batch is durable.
+
+When a deployment installs `SEARCH_EXPOSURE_RECEIPT_ISSUER`, both routes return its served-version receipts without also calling the legacy recorder. If the issuer is absent, the existing scoped recorder and accepted-response boundary remain active; deployments without either service remain supported.
+
+Unified HTTP search retains its retrieval storage handle in request-owned state keyed by organization and project. Accepted-response finalization copies this state, so an enterprise recorder can reuse the exact store without a cache reload or cold construction. `search_runtime.bounded_operation(seconds)` gives optional recording an isolated I/O deadline: parent disconnects interrupt its borrowers, while operation expiry leaves the accepted answer and later callbacks available. Borrower cleanup remains owned until completion. Direct HTTP user-playbook search uses `search_exposure_scope` only around recording; its retrieval retains its existing timing policy.
+
+A recorder that raises does **not** fail the search. The failure is logged with a traceback, reported as the unthrottled `search_exposure.recorder_failed` anomaly, and returned as `RECORDER_FAILED`; the already-built result set is served and the search is still metered, because the customer received the value the meter counts. This reverses an earlier fail-closed posture that turned a ledger outage into a bare `500` and discarded answers the route had finished building -- an append-only audit row with no live reader (until the offline tuner launches) must not outrank the customer's answer, and the adjacent `enqueue_search_metering` already queues billing off the hot path "without performing database work in the request". Containment is not the end state: it converts a `500` into a silently missing row that cannot be backfilled, and the durable fix is an outbox like metering's. The search routes deliberately ignore the outcome -- they cannot distinguish a supported recorder-less deployment from an enterprise misconfiguration. The direct route skips recording when its final result set is empty.
+
+A batch carrying neither `request_id` nor `session_id` is **recorded and flagged**, not refused, and reports `SearchExposureOutcome.RECORDED_UNCORRELATED`. Those two columns are the only correlation the ledger stores -- `interaction_id` is not a column, it only seasons the deterministic event id -- so the classification is exactly the schema's own `missing_correlation` reason, which fires when both are blank. The stored row labels itself: the `integrity_state` generated column reads `incomplete` with `missing_correlation` in `integrity_reasons`.
+
+Such a row still cannot bind a served playbook to a session -- `request_id` is the only key the evidence loader resolves a session and user from, and there is no reverse lookup from a session -- and it is not inert: every reconstructability gate counts it in the denominator and never in the numerator, and exposure is append-only, so it permanently lowers the org's ratio with no product path to undo it. That cost is accepted deliberately. #488 refused the write to protect the ratio; measured against production on 2026-09-27 no org in the fleet carried a single `request_id`, so the refusal protected a ratio that did not exist and instead took exposure intake to zero fleet-wide for 16 days. A proportional dent beats losing the whole audit trail of which playbooks were served under which fingerprints. Those rows must NOT be filtered out of the coverage denominator -- `coverage_for_reasons` keeps every entry on purpose, so a pipeline that has stopped joining sessions reads as poor coverage instead of disappearing.
+
+Because the rows now land, their absence is no longer the symptom: the bounded `search_exposure.uncorrelated` anomaly (reported once a recorder has accepted the batch) is the only operator-visible signal that a caller is not correlating.
+
+**Pattern**: Core route handlers call `Reflexio` through `get_reflexio(org_id)`; endpoint helper files should not instantiate `Reflexio` directly.
+
+## Extension Registry
+
+
+**File**: `extensions.py`
+
+`CapabilityRegistry` lets deployments register optional routers, startup/shutdown hooks, and cross-cutting services without hardcoding enterprise-only imports into the OSS app. `create_app()` builds the active registry, stores it on `app.state.capability_registry`, installs capability routers/startup/shutdown hooks, and exposes typed service lookup through `ServiceKey`.
+
+**Pattern**: Optional integrations should register capabilities/services at app construction time and consume them through the registry; avoid importing enterprise implementations directly in OSS modules.
+
+### Error reporting hook
+
+
+`error_reporting.py` defines the vendor-neutral `ErrorReporter` protocol and the
+`configure_error_reporter`, `error_tags`, `set_error_tags`, and `capture_anomaly`
+facades. They are no-ops unless a deployment registers an implementation through
+`HookRegistry.set_error_reporter`. Reporter failures are logged and swallowed so
+diagnostics never change product control flow; exceptions raised by code inside an
+`error_tags` block are re-raised unchanged.
+
+## LLM Client
+
+
+**Directory**: `llm/`
+**Entry Point**: `litellm_client.py` - `LiteLLMClient` facade composed from focused mixins
+
+Key files:
+
+- `litellm_client.py`: Stable import surface, client config/credential resolution, and `LiteLLMClient` facade
+- `_litellm_text_generation.py`, `_litellm_embedding.py`, `_litellm_structured_output.py`: Completion/tool-call, embedding, and structured-output mixins
+- `_model_compat.py`: Qualified provider capabilities, request parameter rules, and signed Claude tool-history preservation
+- `_litellm_json_extraction.py`, `_litellm_subprocess.py`, `_provider_concurrency.py`, `_litellm_types.py`: JSON parsing, hard-timeout subprocess snapshots/workers, per-provider concurrency caps (fail-open by default, fail-closed for configured providers), and shared public types/errors
+- `providers/`: Optional local/provider adapters (`claude-code/`, OpenClaw, local embedding, Nomic embedding, and GPU-only multilingual E5); registration is opt-in via environment/config
+- `llm_utils.py`: Helper functions for Pydantic model conversion; retains the compatibility export for `env_utils.positive_int_env`
+- `embedding_policy.py`: Schema-independent model prefixes and retrieval/clustering thresholds; `services.embedding_text` re-exports its public names
+- `embedding_service.py`: Inference HTTP app. Package-root, LLM and rerank public exports load on demand, so importing this daemon does not pull in application clients, schemas or extraction code. Public `from reflexio import ...` and LLM/rerank imports retain their existing objects.
+  Embedding requests carry `priority` (`bulk` by default, `interactive` for searches)
+  and `timeout_ms`; rerank requests carry their remaining deadline. An optional
+  scheduler hook receives bounded embedding/rerank chunks and cancels queued
+  work on disconnect. The ordinary unscheduled daemon remains supported.
+  `REFLEXIO_EMBEDDING_BULK_TIMEOUT_MS` extends only bulk HTTP requests;
+  search requests always retain their active search deadline.
+
+**Features**:
+
+- Uses LiteLLM for multi-provider support (OpenAI, Claude, Azure, OpenRouter, Gemini, custom endpoints, etc.)
+- **Custom endpoint support**: `CustomEndpointConfig` (model, api_key, api_base) takes priority over all other providers for LLM completion calls when configured with non-empty fields (but not embeddings)
+- **Gemini support**: Model names with `gemini/` prefix route through Google Gemini; API key from `api_key_config.gemini`
+- **OpenRouter support**: Model names with `openrouter/` prefix (e.g., `openrouter/openai/gpt-5-nano`) route through OpenRouter; API key from `api_key_config.openrouter`
+- **Z.ai support**: `zai/*` completions default to the coding endpoint at `https://api.z.ai/api/coding/paas/v4` unless a custom endpoint or per-call `api_base` overrides it. Z.ai structured output uses a guarded schema instruction plus JSON-object mode; tool turns leave `response_format` unset and validate the terminal result locally.
+- API keys read from environment variables (OPENAI_API_KEY, ANTHROPIC_API_KEY) or `ApiKeyConfig`
+- Interface: `generate_response()`, `generate_chat_response()`, `get_embedding()`
+- `get_completion_request_contract()` resolves the actual primary route, role,
+  selected generation fields and output cap without dispatch. The ten primary
+  fields preserve `None` for absent values; `generation_policy_digest` binds built
+  every remaining actual built generation parameter (including tools, schema
+  controls and native extensions) by canonical hash, without returning sensitive
+  custom data. Messages, credentials/headers, observations and dispatch timeout/
+  retry controls are excluded; callers bind those separately when relevant.
+  Non-JSON policy values and nonfinite numbers are rejected, never stringified.
+  Legacy hashes can explicitly select the ten fields. API keys
+  and messages are excluded; endpoint URLs may contain credentials, so the
+  descriptor is internal and must not be logged or exposed.
+- `get_completion_model_ladder()` returns an immutable ordered tuple from the
+  native generation resolver, applying role precedence, custom endpoint pinning
+  and fallback deduplication. Pass the same effective overrides as generation;
+  `fallback_models=None` uses configured fallbacks, while `[]` disables them,
+  matching public chat generation. Its length counts transport rungs, not
+  repair/retry attempts. Both
+  descriptors resolve configuration only and never call providers.
+- **Structured Outputs**: Supports Pydantic models via `response_format` parameter
+- **Structured-output repair**: `generate_chat_response(..., response_format=..., structured_output_validator=...)` opts a call into bounded corrective repair. The validator receives the parsed Pydantic object and returns semantic errors; an empty list means valid. Opted-in calls repair malformed, blank, and semantically invalid outputs with one same-model corrective follow-up. If that still fails and `REFLEXIO_LLM_FALLBACK_MODELS` has an eligible network fallback, one final corrective turn is sent to the first eligible fallback model. Exhaustion raises `StructuredOutputRepairError` with the latest raw response and validation errors for programmatic handling; `parsed_output` is the most recent attempt that parsed at all, which may be an earlier attempt when the final response fails parsing — do not treat it as metadata of the latest raw response. Exception text does not include raw output.
+- **Two-level retry model**: transport failures/timeouts walk a reflexio-owned per-rung fallback ladder within a generation turn (`num_retries=0`, primary then configured fallbacks) — the client rebuilds request params for each rung itself rather than delegating to LiteLLM's native `fallbacks` kwarg. Structured-output repair is across turns and is opt-in via `structured_output_validator`. Callers without a validator keep their single same-model parse retry, and that retry is **corrective whenever the parse failure carried validation errors**: the rung's original messages plus a bounded turn naming the failing field paths and pydantic error tags (`decision: missing`, `manifest_role: extra_forbidden`, ...). It never echoes the model's own output — unlike the validator path's repair turn — and it re-keys `extra_headers["Idempotency-Key"]` via `structured_output_repair_idempotency_key` so a provider honouring the header cannot replay the rejected answer. The validator path's repair turn is re-keyed the same way, being a strictly larger change to the request. A parse failure that names nothing — the deliberate "appears truncated" diagnostic — still re-issues identically, key included: its params are rebuilt from the caller's kwargs rather than reusing the dict attempt 1 handed the transport, so a provider that wrote its own `Authorization`/`Content-Type` into that dict cannot have them re-sent as caller intent. A `provider_request_guard` can recognise the corrective shape with `is_structured_output_correction_turn`.
+- **Fallback model dual role**: `REFLEXIO_LLM_FALLBACK_MODELS` now controls both transport availability and the optional final structured-output repair escalation. Entries are comma-separated LiteLLM model names; `local/*` entries and self-references are ignored for chat fallback. Operators should order the first eligible network model as the preferred repair escalation target. A smaller fallback is acceptable because escalated output must still pass schema parsing and the caller's semantic validator. Fallback models may mix providers/transports freely — reflexio rebuilds request params (structured-output strategy, `api_base`, per-rung timeout) for each rung, so a native-JSON-schema primary can fall back to a prompt-backed provider without restriction.
+- **Provider concurrency cap**: `_provider_concurrency.py` wraps remote provider calls with a bounded semaphore keyed by LiteLLM provider, default `REFLEXIO_LLM_PROVIDER_MAX_CONCURRENCY` (fail-open: saturation logs and proceeds rather than parking request threads indefinitely). Providers listed in `REFLEXIO_LLM_FAIL_CLOSED_PROVIDERS` instead fail CLOSED — saturation raises `ProviderCapSaturatedError`, which the reflexio-owned fallback ladder treats as advance-worthy (see `_rung_reason`). `REFLEXIO_LLM_PROVIDER_MAX_CONCURRENCY_OVERRIDES` sets per-provider caps that win over the global default. Tune when parallel extraction/search workloads trigger provider 429 storms.
+- Return types: `str` for text, or `BaseModel` for Pydantic models
+
+**Usage**:
+```python
+from reflexio.server.llm.litellm_client import LiteLLMClient, LiteLLMConfig
+
+# Create client
+config = LiteLLMConfig(model="gpt-4o-mini")
+client = LiteLLMClient(config)
+
+# Text response
+response = client.generate_response("Hello")  # Returns str
+
+# Structured output with Pydantic model
+from pydantic import BaseModel
+class Answer(BaseModel):
+    result: int
+response = client.generate_response("What is 2+2?", response_format=Answer)  # Returns Answer instance
+```
+
+**Rules**:
+
+- **ALWAYS use `LiteLLMClient`**, never import `OpenAIClient` or `ClaudeClient` directly
+- **ALWAYS use Pydantic models** for structured outputs (dict-based schemas are not supported)
+
+## Prompts
+
+
+**Directory**: `prompt/`
+
+**Detailed Documentation**: See [`prompt/prompt_bank/README.md`](prompt/prompt_bank/README.md) for the versioned template system.
+
+Key components:
+
+- `prompt_manager.py`: PromptManager for loading and rendering
+- `prompt_bank/`: Templates by prompt ID with versioned `.prompt.md` files and YAML frontmatter
+
+**Pattern**: Access via `request_context.prompt_manager.render_prompt(prompt_id, variables)`
+
+## Site Variables
+
+
+**Directory**: `site_var/`
+
+**Detailed Documentation**: See [`site_var/README.md`](site_var/README.md) for the full configuration and feature flag system.
+
+| File | Purpose |
+|------|---------|
+| `site_var_manager.py` | SiteVarManager (singleton) - loads JSON/TXT configs |
+| `feature_flags.py` | Per-org feature gating (`is_feature_enabled()`, `get_all_feature_flags()`) |
+
+**Feature Flags**: Config in `site_var_sources/feature_flags.json`. Each flag has global `enabled` toggle and per-org `enabled_org_ids` allowlist. Unknown flags default to enabled (fail-open). Current flags: `resumable_extraction_agent`, `lineage_dual_read_diff`.
+
+Access: `SiteVarManager().get_site_var(key)` for raw values, `feature_flags.is_feature_enabled(org_id, name)` for flag checks
+
+## Services
+
+
+**Directory**: `services/`
+
+**Detailed Documentation**: See [`services/README.md`](services/README.md) for the per-directory file index across generation, evaluation, async extraction, search, and persistence.
+
+**Service Boundary**: The service layer owns LLM orchestration, extraction, evaluation, optimization, search preparation, storage access, and long-running operation state. API endpoints should validate/authenticate requests, build `RequestContext`, and delegate into `Reflexio` or focused service helpers rather than embedding business logic.
+
+**Encapsulated Components**:
+
+- **Publish pipeline**: `generation_service.py` coordinates interaction persistence, profile generation, playbook generation, and deferred evaluation scheduling.
+- **External source admission**: `services/external_admission.py` defines the optional library-only transaction participant. Its claim and receipt writes join the canonical storage commit scope; exceptions roll back all writes. Exact replay returns original IDs before embedding preparation and without repeating evaluation scheduling; a miss is fenced again at final admission. Final admission rechecks current stall policy, honors explicit stall overrides, and returns the warning matching that policy. The default publish API is unchanged.
+- **Profile memory**: `profile/` extracts, deduplicates, and applies user profile updates.
+- **Playbook memory**: `playbook/` extracts and consolidates user playbooks, durably schedules bounded same-version aggregation, and reconstructs aggregation change logs from lineage.
+- **Evaluation**: `agent_success_evaluation/service.py`, `agent_success_evaluation/runner.py`, `agent_success_evaluation/scheduler.py`, `agent_success_evaluation/components/evaluator.py`, `shadow_comparison/`, and `evaluation_overview/` handle session grading, per-turn shadow verdicts, regeneration jobs, and dashboard-facing rollups.
+- **Durable learning queue**: `durable_learning/scheduler.py` and `durable_learning/worker.py` drain configured windows from admitted streams and report cursor coverage through `GET /api/learning_status`.
+- **Async clarification**: `extraction/` manages resumable agent runs, pending tool calls, and prior-answer search.
+- **Search preparation**: `pre_retrieval/` and `unified_search_service.py` handle query reformulation, document expansion, embeddings, and cross-entity search orchestration.
+- **Retrieval experiments**: `retrieval_experiment.py` owns deterministic organization/experiment/user assignment, publish-attribution validation, and session-outcome metrics with user-clustered confidence intervals. Search routes bypass retrieval for holdout but return assignment metadata; publish persists only the experiment ID and assigned arm.
+- **Optimization/integrations**: `playbook_optimizer/` and `braintrust/` run candidate playbook optimization, rollout support, and Braintrust export/sync.
+- **Lineage**: `lineage/` resolves active records across superseded chains and schedules tombstone garbage collection for profile/playbook storage.
+- **Governance**: `governance/` defines subject-reference contracts and retention/barrier policy helpers used by storage and lineage paths.
+- **Persistence/config**: `storage/`, `configurator/`, and `operation_state_utils.py` provide storage abstractions, config loading, locks, bookmarks, progress, and cancellation.
+- **Usage metering**: `metering_events.py` converts learning/search signals into optional `usage_events` without importing enterprise types; `services/search_metering_worker.py` keeps search-side writes off the customer response path with a bounded, fail-open process-local queue.
+
+### Orchestrator
+
+
+**File**: `generation_service.py` - GenerationService
+
+Automatic publish flow:
+1. Prepare embeddings, then atomically admit interactions and wake `(org_id, user_id)` work through `durable_learning/admission.py`.
+2. Background workers extract configured windows and commit outputs, cursor coverage and effect receipts under a renewable user lease.
+3. Schedule deferred agent success evaluation when `session_id` is present.
+
+`generation_service.py` also owns manual generation. Manual and resumed extraction
+share the automatic worker's user lease. Provider retry/fallback remains in the
+existing extractor stack; HTTP waiting does not own an extraction slot.
+
+Called by API endpoints via `Reflexio`
+
+**Profile Timeout Troubleshooting**:
+
+- Inspect `services/profile/components/extractor.py` and `llm/litellm_client.py` for generation and provider timeout handling.
+- Look for structured events in logs:
+  - `event=profile_extract_llm_start` / `event=profile_extract_llm_end`
+  - `event=llm_request_start` / `event=llm_request_end`
+  - `event=profile_extract_failed`
+- If all extractors fail for a user during rerun/manual operations, the user is now marked in `failed_user_ids` instead of silently completing with zero generated items.
+
+### Base Infrastructure
+
+
+- `base_generation_service.py`: Stable `BaseGenerationService` import surface plus service-specific orchestration hooks (parallel extractor execution via ThreadPoolExecutor, `EXTRACTOR_TIMEOUT_SECONDS = 300` per-extractor safety timeout)
+- `base_generation/`: Mixins for batch progress, config filtering, extraction lifecycle, should-run prechecks, status transitions, and usage billing that keep `base_generation_service.py` navigable without changing caller imports
+- `extractor_config_utils.py`: Shared utility for filtering extractor configs by source, `allow_manual_trigger`, and extractor names
+- `extractor_interaction_utils.py`: Per-extractor utilities for stride_size checking and source filtering
+- `operation_state_utils.py`: Centralized `OperationStateManager` for all `_operation_state` table interactions (progress tracking, concurrency locks, extractor/aggregator bookmarks, simple locks)
+- `deduplication_utils.py`: Shared utilities for LLM-based deduplication (used by ProfileConsolidator and PlaybookConsolidator)
+- `service_utils.py`: Utilities (`construct_messages_from_interactions()`, `format_interactions_to_history_string()` (prepends tool usage info when `tools_used` is present), `extract_json_from_string()`, `log_model_response()` for colored LLM response logging)
+
+**Operation State Management** (via `OperationStateManager` in `operation_state_utils.py`):
+
+- Centralized manager for all `_operation_state` table interactions with 6 use cases:
+  1. **Progress tracking**: Rerun + manual batch operations (key: `{service}::{org_id}::progress`)
+  2. **Concurrency lock**: Atomic lock with request queuing (key: `{service}::{org_id}[::scope_id]::lock`)
+  3. **Extractor bookmark**: Track last-processed interactions per extractor (key: `{service}::{org_id}[::scope_id]::{name}`)
+  4. **Aggregator bookmark**: Legacy aggregator bookmarks; active incremental aggregation uses `storage_base/playbook/_aggregation.py`
+  4b. **Cluster fingerprints**: Track cluster membership fingerprints for change detection (key: `{service}::{org_id}::{name}[::version]::clusters`)
+  5. **Simple lock**: Non-queuing lock for cleanup operations
+  6. **Cancellation**: Cooperative cancellation for batch operations (`request_cancellation()`, `is_cancellation_requested()`, `mark_cancelled()`). Uses separate DB row (key: `{service}::{org_id}::cancellation`) to avoid lost-update race conditions with progress updates.
+- Stale lock timeout: 5 minutes (assumes crashed if lock held longer)
+- Automatic, manual, and resumed extraction share `durable_learning/user_lease.py` ownership. Operation-state locks/bookmarks remain for their scoped legacy and batch workflows; they are not the automatic stream scheduler.
+
+### Profile Generation
+
+
+**Directory**: `services/profile/`
+
+Key files:
+
+- `service.py`: Service orchestrator and profile persistence/finalization
+- `components/extractor.py`: Extractor that generates profile updates
+- `components/consolidator.py`: Consolidates newly extracted profiles against existing DB profiles using LLM
+
+**Flow**: Interactions → ProfileExtractor (extraction-only) → ProfileConsolidator (deduplicates new vs existing DB profiles) → ProfileGenerationService → Storage
+
+**Generation Modes** (detailed comparison):
+
+| Aspect | Regular | Rerun | Manual Regular |
+|--------|---------|-------|----------------|
+| **Trigger** | Auto (on publish) | Manual (API) | Manual (API) |
+| **Stride Check** | Yes (skips if below threshold) | No (always runs) | No (always runs) |
+| **Interactions** | Window-sized (last k) | Window-sized (last k) | Window-sized (last k) |
+| **Time Range Filter** | No | Yes (optional start/end) | No |
+| **Pre-processing** | None | None | None |
+| **Existing Profile Context** | All profiles loaded | Only PENDING profiles loaded | All profiles loaded |
+| **Output Status** | CURRENT | PENDING | CURRENT |
+| **Scope** | Single user | Batch (all matching users, with progress) | Batch (all/single user, with progress) |
+| **Use Case** | Normal operation | Test prompt changes | Force regeneration |
+
+**Note**: All modes use `window_size` (per-extractor override or global). The key difference is that Regular checks stride_size before running, while Rerun/Manual always run. When no window is configured, rerun/manual falls back to `k=1000`.
+
+**Constructor Flags** (`ProfileGenerationService`):
+
+- `allow_manual_trigger`: Include `manual_trigger=True` extractors (default: False)
+- `output_pending_status`: Set output profiles to PENDING status (default: False)
+
+**Profile Versioning Workflow**:
+
+Users can regenerate and manage profile versions using a four-state system:
+
+1. **CURRENT** (status=None): Active profiles shown to users
+2. **PENDING** (status="pending"): Newly generated profiles awaiting review
+3. **ARCHIVED** (status="archived"): Previous version of profiles
+4. **ARCHIVE_IN_PROGRESS** (status="archive_in_progress"): Temporary status during downgrade operation
+
+**Rerun Workflow**:
+```
+1. Rerun Generation → Creates PENDING profiles (existing CURRENT unchanged)
+2. Review PENDING → Compare new vs current profiles
+3. Upgrade → CURRENT→ARCHIVED, PENDING→CURRENT, delete old ARCHIVED
+4. OR Downgrade → CURRENT→ARCHIVED (restore previous version), ARCHIVED→CURRENT (swap)
+```
+
+**Upgrade Process** (3 atomic steps):
+1. Archive all CURRENT profiles → ARCHIVED
+2. Promote all PENDING profiles → CURRENT
+3. Delete all old ARCHIVED profiles
+
+**Downgrade Process** (3 atomic steps):
+1. Mark all CURRENT profiles → ARCHIVE_IN_PROGRESS (temporary)
+2. Restore all ARCHIVED profiles → CURRENT
+3. Complete archiving: ARCHIVE_IN_PROGRESS → ARCHIVED
+
+**Use Cases**:
+
+- Test prompt changes without affecting production profiles
+- Review AI-generated updates before deployment
+- Rollback to previous profile version if needed
+
+### Playbook Extraction
+
+
+**Directory**: `services/playbook/`
+
+**Detailed Documentation**: See [`services/playbook/README.md`](services/playbook/README.md) for detailed component documentation.
+
+Key files:
+
+- `service.py`: Service orchestrator
+- `components/extractor.py`: Extractor that extracts user playbooks
+- `aggregation_trigger.py` / `aggregation_scheduler.py`: Durably signal, claim, lease, and retry bounded per-version aggregation work
+- `components/aggregator.py`: Matches same-version centroids, clusters unmatched residuals, and generates agent playbooks
+- `components/consolidator.py`: Reconciles newly extracted playbooks against existing DB playbooks using LLM
+- `review_service.py`: Re-reviews current user playbooks selected by created-at bounds and commits each completed decision newest-first
+
+**Flow**:
+
+- Interactions → PlaybookExtractor (extraction-only) → PlaybookConsolidator (consolidates new vs existing DB playbooks) → UserPlaybook (with optional `blocking_issue`) → Storage
+- UserPlaybook write → durable hourly-coalesced signal → PlaybookAggregationScheduler → fixed-page invalidation drain → same-version centroid match → one current-agent-plus-bounded-delta refresh per changed cluster → bounded residual clustering → AgentPlaybook → Storage
+- `POST /api/run_playbook_aggregation` → fenced, capped administrative full rerun
+
+**Tool Analysis**: PlaybookExtractor reads `tool_can_use` from root `Config` and passes it to prompts for tool usage analysis and blocking issue detection.
+
+**Rerun Behavior**: Groups interactions by `user_id` for per-user playbook extraction (fetches all users, then processes each user's interactions together)
+
+**Durable Playbook Aggregation** (`aggregation_scheduler.py`, `components/aggregator.py`):
+
+Automatic aggregation never rescans the full corpus. Each fenced unit admits
+undisposed CURRENT rows, batches compatible rows by same-version agent-playbook
+centroid, regenerates each changed agent playbook once from its current text plus
+at most 100 newest delta members, attaches the complete delta, and clusters only
+unmatched residuals. The replacement embedding
+becomes the next centroid. A drained version uses the configured one-hour
+minimum; new writes preserve that due time and coalesce, while unfinished backlog
+continues promptly. `REFLEXIO_MAX_CLUSTERING_PLAYBOOKS`
+is the scheduled unit budget and the administrative rerun safety cap, not a
+maximum supported corpus size. See the [playbook service map](services/playbook/README.md)
+for storage contracts and failure dispositions.
+
+**Change Log Tracking**: The legacy `playbook_aggregation_change_logs` table is retired (Track B, 2026-06-24) — the aggregator no longer writes it. The change-log view served by `GET /api/playbook_aggregation_change_logs` is reconstructed on demand from `lineage_event` rows via `reconstruct_playbook_aggregation_change_log` (`lib/_agent_playbook.py`): each run's `op=aggregate` events form the "added" side and its `status_change→superseded` events form the "removed" side, grouped by `request_id`. Per-row `updated` pairing is not reconstructed (`updated_agent_playbooks=[]`, a tolerated parity delta).
+
+**Generation Modes** (detailed comparison):
+
+| Aspect | Regular | Rerun | Manual Regular |
+|--------|---------|-------|----------------|
+| **Trigger** | Auto (on publish) | Manual (API) | Manual (API) |
+| **Stride Check** | Yes (skips if below threshold) | No (always runs) | No (always runs) |
+| **Interactions** | Window-sized (last k) | Window-sized (last k) | Window-sized (last k) |
+| **Time Range Filter** | No | Yes (optional start/end) | No |
+| **Pre-processing** | None | Deletes existing PENDING user playbooks | None |
+| **Output Status** | CURRENT | PENDING | CURRENT |
+| **Scope** | Single user | Batch (all matching users, with progress) | Batch (all/single user, with progress) |
+| **Use Case** | Normal operation | Test prompt changes | Force regeneration |
+
+**Note**: All modes use `window_size` (per-extractor override or global). The key difference is that Regular checks stride_size before running, while Rerun/Manual always run. When no window is configured, rerun/manual falls back to `k=1000`.
+
+**Constructor Flags** (`PlaybookGenerationService`):
+
+- `allow_manual_trigger`: Include `manual_trigger=True` extractors (default: False)
+- `output_pending_status`: Set output user playbooks to PENDING status (default: False)
+
+**User Playbook Versioning Workflow**:
+
+Similar to profiles, user playbooks support versioning:
+
+1. **CURRENT** (status=None): Active user playbooks
+2. **PENDING** (status="pending"): Newly generated user playbooks awaiting review
+3. **ARCHIVED** (status="archived"): Previous version of user playbooks
+
+**Rerun Workflow**:
+```
+1. Rerun Playbook Generation → Creates PENDING user playbooks
+2. Review PENDING → Compare new vs current
+3. Upgrade → CURRENT→ARCHIVED, PENDING→CURRENT, delete old ARCHIVED
+4. OR Downgrade → Swap ARCHIVED↔CURRENT
+```
+
+### Agent Success Evaluation
+
+
+**Directory**: `services/agent_success_evaluation/`
+
+Key files:
+
+- `service.py`: `AgentSuccessEvaluationService`, the request-path service orchestrator (tracks run outcome flags: `last_run_result_count`, `has_run_failures()`)
+- `components/evaluator.py`: `AgentSuccessEvaluator`, evaluates success at session level (all interactions as one group)
+- `agent_success_evaluation_constants.py`: Output schema (`AgentSuccessEvaluationOutput`)
+- `agent_success_evaluation_utils.py`: Message construction utilities
+- `scheduler.py`: `GroupEvaluationScheduler` singleton - min-heap priority queue with daemon thread, defers evaluation until 10 min after last request in session
+- `runner.py`: `run_group_evaluation()` - fetches all requests/interactions for a session, builds `RequestInteractionDataModel` list, runs `service.py`, then the retrieved-learning phase; returns `GroupEvaluationOutcome` (per-family statuses)
+- `components/retrieved_learning_evaluator.py`: `RetrievedLearningEvaluator` - per-learning relevance/impact judges over `Interaction.retrieved_learnings`; results replace the session's `retrieved_learning_evaluation` snapshot atomically (generation + session-fingerprint fenced, see `services/storage/storage_base/retrieved_learning_state.py`)
+- `services/storage/storage_base/evaluation_state_keys.py`: single source of truth for the three evaluation `_operation_state` key formats (agent-success marker, grade-on-demand cache, retrieved-learning state) shared by producers and governance erasure
+
+**Flow**: Interactions → `agent_success_evaluation/scheduler.py` → `agent_success_evaluation/runner.py` → `agent_success_evaluation/service.py` → `agent_success_evaluation/components/evaluator.py` → `AgentSuccessEvaluationResult` → Storage → deferred `tagging/` pass when `AgentSuccessConfig.tagging_definition_prompt` is configured
+
+**Session-Level Evaluation**: Evaluator treats one user's `request_interaction_data_models` in a session as a single conversation. Sampling rate checked once per session (not per-request). Results are keyed by `(user_id, session_id, evaluation_name)` so reused session IDs across users do not clobber each other.
+
+**Tool Context**: Reads `tool_can_use` from root `Config` level (shared with playbook extraction).
+
+**Shadow Comparison**: Session-level shadow comparison was retracted in F1 because multi-turn shadow content suffers from trajectory contamination (turn 2+ user messages react to the regular response, not the shadow). The `regular_vs_shadow` field on `AgentSuccessEvaluationResult` is preserved as a nullable historical column but is always `None` on newly produced rows. Per-turn shadow comparison is scheduled from the publish path whenever an assistant interaction carries `shadow_content`; it lives in a dedicated `services/shadow_comparison/` judge that writes verdicts to a separate table, independent of session-level evaluation sampling.
+
+### Durable Learning Queue
+
+
+**Directory**: `services/durable_learning/`
+
+Key files:
+
+- `admission.py`: Atomic publish admission and eligibility snapshots.
+- `scheduler.py` / `worker.py`: Always-on discovery, bounded worker turns and renewable user leases.
+- `window_executor.py` / `window_codec.py`: Model execution, saved outcomes and frozen window policies.
+- `user_lease.py`: Shared ownership for automatic, manual and resumed extraction.
+- `waiting.py` / `local.py`: Bounded HTTP coverage waits, standalone-library recovery and post-admission scheduler wake-ups.
+- `server/scheduling.py`: Shared interruptible polling, with wake signals retained during a tick and bounded stop joins.
+- `services/storage/storage_base/_extraction_stream.py`: Shared admission/cursor/window state machine; SQLite and enterprise PostgreSQL supply backend adapters.
+
+**Pattern**: Success follows durable admission. Workers consume the first W eligible
+interactions, then S new inputs per window, independently of request boundaries.
+Model calls run outside writer transactions; outputs, cursor advancement and effect
+receipts commit together under a lease fence. Incomplete tails wait for input or a
+force barrier. Billing/finalization retry durably; derived dispatch remains best
+effort. `GET /api/learning_status` reads required cursor coverage.
+
+### Async Extraction
+
+
+**Directory**: `services/extraction/`
+
+Key files:
+
+- `extraction/resumable_agent.py`: Resumable extraction agent runtime
+- `extraction/resume_scheduler.py` and `extraction/resume_worker.py`: Background scheduling/worker loop for paused extraction runs
+- `extraction/pending_tool_call_dispatch.py` and `extraction/prior_answer_search.py`: Tool surface and prior-answer context for async extraction agents
+- `extraction/agent_run_records.py`: Persistence helpers for extraction-agent run state
+
+**Pattern**: Synchronous profile/playbook/evaluation services still follow `BaseGenerationService`; async extraction is a shared runtime package that uses resumable agent-run records and worker scheduling so long-running or tool-mediated extraction can continue outside the request path.
+
+### Shadow Comparison and Evaluation Overview
+
+
+**Directories**: `services/shadow_comparison/`, `services/evaluation_overview/`
+
+Key files:
+
+- `shadow_comparison/judge.py`: Per-turn regular-vs-shadow judge
+- `shadow_comparison/dispatcher.py` and `shadow_comparison/worker.py`: Publish-time dispatch and bounded background execution for shadow verdict writes
+- `shadow_comparison/outcome.py`: Verdict outcome model helpers
+- `evaluation_overview/service.py`: Aggregates evaluation-page metrics
+- `evaluation_overview/components/hero_state.py`, `evaluation_overview/components/distribution.py`, `evaluation_overview/components/rule_attribution.py`, `evaluation_overview/components/shadow_aggregation.py`: Focused aggregation helpers
+- `evaluation_overview/eval_sampler.py`: Evaluation sampling helpers that remain root-level
+
+**Pattern**: Session-level agent success evaluation remains in `agent_success_evaluation/`; dashboard-facing rollups and per-turn shadow verdict analysis live in these companion directories.
+
+### Playbook Optimizer and Braintrust
+
+
+**Directories**: `services/playbook_optimizer/`, `services/braintrust/`
+
+Key files:
+
+- `playbook_optimizer/optimizer.py`: Scenario-based playbook optimization loop
+- `playbook_optimizer/scheduler.py` and `rollout.py`: Scheduling and rollout helpers
+- `playbook_optimizer/judge.py`, `models.py`, `scenario_resolver.py`: Evaluation and scenario resolution models
+- `playbook_optimizer/assistant_webhook.py`: Assistant-facing webhook entry point for optimizer runs
+- `braintrust/service.py`, `braintrust/client.py`, `_cron.py`: Braintrust export/sync support
+
+**Pattern**: These are evaluation/optimization integrations around the core playbook pipeline. Keep production extraction changes in `services/playbook/`; use optimizer/Braintrust modules for experiments, rollouts, and external eval sync.
+
+### Lineage
+
+
+**Directory**: `services/lineage/`
+
+| File | Purpose |
+|------|---------|
+| `resolve.py` | Helpers for resolving current records across supersede chains and status transitions. |
+| `gc_scheduler.py` | Tombstone garbage-collection scheduler for lineage-aware storage cleanup. |
+
+**Pattern**: profile/playbook update paths preserve lineage metadata in storage; service code asks lineage helpers to find current records rather than walking superseded chains ad hoc.
+
+### Query Reformulator
+
+
+**File**: `services/pre_retrieval/_query_reformulator.py` - `QueryReformulator`
+
+Reformulates user search queries into clean, normalized natural language for improved search recall. Resolves conversation context, expands abbreviations, fixes grammar. Enabled per-request via `enable_reformulation` parameter.
+
+- Uses `pre_retrieval_model_name` from `llm_model_setting.json` (fast, cheap model)
+- Supports conversation-aware reformulation via `conversation_history` (list of `ConversationTurn`)
+- Plain-text LLM output with robust extraction/validation
+- Falls back to original query on any failure
+- Prompt: `prompt_bank/query_reformulation/`
+
+### Unified Search Service
+
+
+**File**: `services/unified_search_service.py` - `run_unified_search()`
+
+Searches across all entity types (profiles, agent_playbooks, user_playbooks) in parallel via a two-phase approach:
+
+- **Phase A**: Query rewriting + embedding generation (parallel via ThreadPoolExecutor)
+- **Phase B**: Entity searches across all types (parallel via ThreadPoolExecutor, 3 workers)
+
+Pre-computed embeddings passed to storage methods via `query_embedding` parameter to avoid redundant embedding calls.
+
+### Storage
+
+
+**Directory**: `services/storage/`
+
+| File | Purpose |
+|------|---------|
+| `storage_base/` | BaseStorage interface split by domain. Legacy facades (`_profiles.py`, `_playbook.py`, `_agent_run.py`, etc.) preserve imports while subpackages (`profiles/`, `playbook/`, `agent_run/`, `governance/`) hold focused abstract store contracts. |
+| `sqlite_storage/` | SQLite-backed implementation split across matching facades and subpackages (`profiles/`, `playbook/`, `agent_run/`, `governance/`, `base/`), including governance-aware retention/barrier handling, lineage/tombstone support, and durable incremental playbook-aggregation state. |
+| `governance_validation.py` | Shared validation helpers for subject references and governance contracts before storage writes. |
+| `retention.py`, `retention_mixin.py` | Data retention and cleanup helpers |
+| `constants.py`, `error.py` | Storage constants and shared errors |
+
+**Pattern**: **NEVER import storage implementations directly** - Always use `request_context.storage`
+
+**Key Methods**:
+
+- CRUD: profiles, interactions, playbooks, results, requests, playbook aggregation change logs
+- `get_sessions(offset, top_k, session_id)` → `dict[str, list[RequestInteractionDataModel]]` (groups by session_id; paginates per-session — `top_k`/`offset` count sessions, and each returned session includes all of its requests)
+- `get_rerun_user_ids(user_id, start_time, end_time, source, agent_version)` → `list[str]` - Get distinct user IDs matching filters for rerun workflows (pushes filtering to storage layer)
+- `get_agent_playbooks(status_filter=..., playbook_status_filter=...)` - Filter by playbook status and approval status
+- `save_agent_playbooks()` → returns `list[AgentPlaybook]` with `agent_playbook_id` populated (callers can ignore return)
+- Selective playbook operations (used by cluster change detection):
+  - `archive_agent_playbooks_by_ids(agent_playbook_ids)` - Archive specific agent playbooks by ID (skips APPROVED)
+  - `restore_archived_agent_playbooks_by_ids(agent_playbook_ids)` - Restore archived agent playbooks by ID
+  - `delete_agent_playbooks_by_ids(agent_playbook_ids)` - Delete agent playbooks by ID
+  - `delete_user_playbooks_by_ids(user_playbook_ids)` - Delete user playbooks by ID
+- Vector search via LiteLLMClient embeddings
+- Operation state: `get_operation_state()`, `upsert_operation_state()`, `get_operation_state_with_new_request_interaction()`, `try_acquire_in_progress_lock()`
+- All operation state interactions are managed through `OperationStateManager` (in `operation_state_utils.py`)
+- Profile status: `Status` enum (CURRENT=None, PENDING, ARCHIVED)
+
+### Configurator
+
+
+**Directory**: `services/configurator/`
+
+Key files:
+
+- `configurator.py`: DefaultConfigurator - loads YAML config, creates storage
+- `local_file_config_storage.py`: Local file-based config storage
+**Config Storage Priority** (in `DefaultConfigurator`):
+1. **Local** - If `base_dir` is explicitly provided (testing)
+2. **Local File** - Default fallback
+
+**Path Handling**: LocalFileConfigStorage automatically converts relative paths to absolute using `os.path.abspath()`
+
+Access: `request_context.configurator`
+
+## Architecture Pattern
+
+
+### Request Flow
+
+
+```text
+routes/ -> RequestContext + get_reflexio() -> ../lib/reflexio_lib.py
+  -> generation_service.py -> durable_learning/admission.py
+     -> scheduler/worker -> frozen extraction window
+        -> profile/ or playbook/ -> fenced outputs + cursor + effect receipt
+     -> agent_success_evaluation/scheduler.py -> runner.py -> evaluation storage
+  -> unified_search_service.py -> pre_retrieval/ + storage/ + retrieval/
+```
+
+Provider calls occur outside storage transactions. Durable workers, manual
+operations, and resumed extraction share the same user lease; HTTP response
+waiting only observes committed cursor coverage.
+
+### Service Pattern
+
+
+Generation services follow `BaseGenerationService`; focused search and read-side services have their own entry points:
+1. Load extractor configs from YAML
+2. Load generation service config from request (runtime parameters)
+3. Filter extractors by source, `allow_manual_trigger`, and extractor names (via `extractor_config_utils`)
+4. Create extractors with both configs
+5. Run extractors in parallel (ThreadPoolExecutor)
+6. Process and save results to storage
+
+**Extractor Pattern**: Multiple extractors run in parallel, each handling its own data collection. Each extractor:
+
+- Receives **ExtractorConfig** (from YAML): Static configuration like prompts and settings
+- Receives **GenerationServiceConfig** (from request): Runtime parameters like user_id, source
+- **Collects its own interactions** using `extractor_interaction_utils.py`:
+  - Gets per-extractor window_size/stride_size parameters (override or global fallback)
+  - Applies source filtering based on `request_sources_enabled`
+  - Checks stride_size threshold before running
+  - Updates per-extractor bookmark state after processing (via `OperationStateManager`)
+
+**Per-Extractor Window Overrides**: Each extractor config can override global window settings:
+
+- `window_size_override`: Override global `window_size` for this extractor
+- `stride_size_override`: Override global `stride_size` for this extractor
+- Each extractor applies its own override or falls back to global values
+
+## Requirements / Problems to Avoid
+
+
+**Reflexio Instances**:
+
+- **NEVER instantiate `Reflexio()` directly** in API endpoints
+- **ALWAYS use**: `get_reflexio(org_id)` from `cache/reflexio_cache.py`
+- Cache invalidated automatically on config changes
+
+**Storage**:
+
+- **NEVER import storage implementations directly**
+- **ALWAYS use**: `request_context.storage` (type: BaseStorage)
+
+**LLM**:
+
+- **NEVER import OpenAIClient/ClaudeClient directly**
+- **ALWAYS use**: `LiteLLMClient` (uses LiteLLM for multi-provider support)
+
+**Prompts**:
+
+- **NEVER hardcode prompts**
+- **ALWAYS use**: `request_context.prompt_manager.render_prompt(prompt_id, variables)`
+- Prompts versioned in `prompt/prompt_bank/`
+
+## See Also
+
+
+- [Code Map (root README)](../README.md) -- high-level overview of all Reflexio components
+- [API Endpoints README](api_endpoints/README.md) -- RequestContext contract and handler/helper map
+- [Services README](services/README.md) -- per-directory index of the business-logic layer
+- [Prompt Bank README](prompt/prompt_bank/README.md) -- versioned prompt template system
+- [Playbook Service README](services/playbook/README.md) -- playbook extraction, aggregation, and deduplication pipeline
+- [Site Variables README](site_var/README.md) -- global configuration and feature flags
+
+## Cached host readiness
+
+Standalone `GET /health` keeps its existing healthy response. Application hosts
+can set `app.state.readiness_provider` to a callable returning `ReadinessResponse`
+from `models/api_schema/readiness.py`; the route reads that cached snapshot and
+returns 503 for unhealthy hosts. The provider performs no dependency I/O during
+a health request.
+
+| Path | Meaning | Status |
+| --- | --- | --- |
+| `GET /health/live` | Liveness: the process is up and its event loop is serving. Async, no I/O, always 200 while alive. | current |
+| `GET /health/ready` | Readiness: the cached snapshot above; 200 ready, 503 not ready, `Cache-Control: no-store`. | current |
+| `GET /health` | Same handler as `/health/ready`. | deprecated alias |
+| `GET /healthz` | Liveness with per-process metrics (pid, uptime, request count, RSS). | deprecated alias |
+
+Anything that kills or replaces a process on a failed check (a container
+health check, or a load balancer whose failures make the orchestrator replace
+tasks) must probe `/health/live`; probing readiness there turns a dependency
+blip into replaced processes. Routing and uptime decisions use `/health/ready`.
+
+Hosts can raise `ReadinessUnavailableError` for temporarily unqualified vector
+operations. Resumable extraction keeps these runs queued without spending the
+retry budget; resume refunds remain protected by the claim and user lease fence.
+
+### Session-outcome error handling
+
+The library's `mark_session_outcome` propagates `TypeError` and `AttributeError`
+so programming defects are not reported as unavailable storage. Storage failures
+still return `success=False` with `reason=storage_error`. This applies equally
+when internal trajectory cutover arguments are supplied; a moved prefix remains
+a structured `conflicting_finalization` response. Other storage-guarded library
+methods retain their existing error-handling behavior.
+
+SQLite evaluation-ID lookup accepts an unnamed (`None`) evaluator for older or
+directly inserted records, using NULL-safe equality while preserving user,
+session, and agent-version filtering. Normal evaluations use the configured
+singleton evaluator identity. This compatibility guarantee is SQLite-specific;
+other storage adapters must explicitly support nullable identities before
+callers rely on it there.

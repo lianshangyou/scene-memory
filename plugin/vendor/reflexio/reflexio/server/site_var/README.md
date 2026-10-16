@@ -1,0 +1,90 @@
+# /reflexio/server/site_var
+Description: Global configuration manager for site-wide variables and per-org feature flags
+
+> Part of the [Reflexio Server](../README.md).
+
+## Main Entry Points
+
+
+- **Manager**: `site_var_manager.py` - `SiteVarManager` (singleton)
+- **Feature Flags**: `feature_flags.py` - Per-org feature gating helpers
+- **Sources**: `site_var_sources/` - JSON/TXT config files
+
+## Purpose
+
+
+1. **Global settings** - Model names, embedding models, and retrieval defaults
+2. **Feature flags** - Per-org feature gating (global enable or per-org allowlist)
+3. **Dual storage** - File-based with optional Redis caching
+4. **Auto-fallback** - Redis → File system graceful degradation
+
+## Feature Flags
+
+
+**File**: `feature_flags.py`
+**Config**: `site_var_sources/feature_flags.json`
+
+Per-org feature gating with fail-open defaults. Each flag supports global enable or per-org allowlist.
+
+```python
+from reflexio.server.site_var.feature_flags import is_feature_enabled, get_all_feature_flags
+
+is_feature_enabled(org_id, "resumable_extraction_agent")  # Single flag check
+get_all_feature_flags(org_id)               # All flags as dict[str, bool]
+```
+
+**Config format** (`feature_flags.json`):
+```json
+{
+    "resumable_extraction_agent": {
+        "enabled": true,
+        "enabled_org_ids": []
+    }
+}
+```
+
+**Resolution logic**: Enabled if `enabled=True` (global) OR `org_id` in `enabled_org_ids`. Unknown flags default to enabled (fail-open).
+
+**Current flags**: `resumable_extraction_agent`, `lineage_dual_read_diff`.
+
+## Usage
+
+
+```python
+from reflexio.server.site_var.site_var_manager import SiteVarManager
+
+manager = SiteVarManager()
+config = manager.get_site_var("llm_model_setting")  # Returns dict or string
+```
+
+## File Structure
+
+
+```
+site_var/
+├── site_var_manager.py        # SiteVarManager (singleton)
+├── feature_flags.py           # Per-org feature flag helpers
+└── site_var_sources/
+    ├── llm_model_setting.json # Provider/model defaults
+    ├── search_settings.json   # Default retrieval mode and hybrid search weights
+    └── feature_flags.json     # Feature flag config (per-flag enable + org allowlist)
+```
+
+## Architecture Pattern
+
+
+- **JSON priority**: `.json` files take precedence over `.txt`
+- **Variable name**: Filename without extension
+- **Redis optional**: Enable via `SiteVarManager(enable_redis=True)`
+- **Feature flags**: Loaded via SiteVarManager, resolved per-org at request time
+
+## Requirements / Problems to Avoid
+
+
+- **Unknown flags are enabled by default**; do not use feature flags as an authorization boundary.
+- **Keep source names aligned with lookup keys**; a JSON filename without its extension is the site-variable key.
+
+## See Also
+
+
+- [Server README](../README.md) -- FastAPI backend component overview

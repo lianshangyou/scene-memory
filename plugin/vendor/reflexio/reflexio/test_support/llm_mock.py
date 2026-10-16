@@ -1,0 +1,429 @@
+"""Global LiteLLM mock for reflexio test suites.
+
+Patches ``litellm.completion`` with a deterministic mock that returns
+JSON responses based on prompt content heuristics. E2E tests are
+excluded from the session-level autouse so they can make real API
+calls — but an e2e test that wants determinism can opt in via the
+``patched_litellm`` context manager (or the matching ``mock_llm``
+pytest fixture wired into the e2e conftest).
+
+Response payloads are sourced from the model registry
+(``llm_model_registry.py``) so they always validate against the Pydantic
+models that services expect.
+
+Usage in conftest.py::
+
+    from reflexio.test_support.llm_mock import configure_llm_mock, cleanup_llm_mock
+
+    def pytest_configure(config):
+        configure_llm_mock(config)
+
+    def pytest_unconfigure(config):
+        cleanup_llm_mock(config)
+
+Opt-in usage in one e2e test::
+
+    from reflexio.test_support.llm_mock import patched_litellm
+
+    def test_something_e2e():
+        with patched_litellm():
+            ...  # litellm.completion is mocked for the duration
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import MagicMock, NonCallableMock, patch
+
+from reflexio.models.structured_output import find_schema_keyword as _find_schema_key
+from reflexio.server.env_utils import env_bool
+from reflexio.test_support.llm_model_registry import get_model_registry
+
+_LEARNING_REF_PATTERN = re.compile(r'"learning_ref":\s*"([^"]+)"')
+
+
+def _extract_learning_refs(prompt_content: str) -> list[str]:
+    """Extract unique learning_refs from a judge prompt, preserving order.
+
+    The retrieved-learning judges validate exact per-ref coverage, so the
+    mock must echo the refs actually listed in the prompt rather than a
+    static payload. Only the ``[Retrieved Learnings]`` payload section is
+    scanned — the prompt's ``[Output]`` example also contains a
+    ``"learning_ref"`` placeholder line that must not be echoed.
+    """
+    start = prompt_content.find("[Retrieved Learnings]")
+    if start != -1:
+        end = prompt_content.find("[Output]", start)
+        prompt_content = prompt_content[start : end if end != -1 else None]
+    seen: list[str] = []
+    for ref in _LEARNING_REF_PATTERN.findall(prompt_content):
+        if ref not in seen:
+            seen.append(ref)
+    return seen
+
+
+def _create_mock_completion(
+    prompt_content: str, parse_structured_output: bool = False
+) -> MagicMock:
+    """Create a mock LiteLLM completion response.
+
+    Routes on prompt content heuristics; payloads come from the model
+    registry to guarantee schema validity.
+    """
+    registry = get_model_registry()
+
+    if "Output just a boolean value" in prompt_content:
+        content = str(registry["boolean_evaluation"].minimal_valid)
+    elif "[Retrieved Learning Relevance Evaluation]" in prompt_content:
+        # Echo the refs listed in the prompt — the judge validates exact
+        # coverage, so a static payload would always fail validation.
+        refs = _extract_learning_refs(prompt_content)
+        content = json.dumps(
+            {
+                "verdicts": [
+                    {
+                        "learning_ref": ref,
+                        "is_relevant": True,
+                        "relevance_reason": "Applies to the session task.",
+                    }
+                    for ref in refs
+                ]
+            }
+            if refs
+            else registry["retrieved_learning_relevance"].minimal_valid
+        )
+    elif "[Retrieved Learning Impact Evaluation]" in prompt_content:
+        refs = _extract_learning_refs(prompt_content)
+        content = json.dumps(
+            {
+                "verdicts": [
+                    {
+                        "learning_ref": ref,
+                        "impact": "positive",
+                        "impact_reason": "The response followed this learning.",
+                    }
+                    for ref in refs
+                ]
+            }
+            if refs
+            else registry["retrieved_learning_impact"].minimal_valid
+        )
+    elif "policy consolidation" in prompt_content:
+        content = json.dumps(registry["playbook_aggregation"].minimal_valid)
+    elif (
+        "is_success to True" in prompt_content
+        and "is_escalated to True" in prompt_content
+    ):
+        # Anchor on two markers from the agent_success_evaluation prompt
+        # body — present in every variant of the success-eval prompt.
+        content = json.dumps(registry["agent_success_evaluation"].minimal_valid)
+    elif '"playbooks"' in prompt_content:
+        # Anchor on the schema marker every playbook-extraction prompt MUST
+        # describe (the JSON output key the LLM is told to return). This is
+        # intrinsic to the schema, not stylistic, so it survives prompt
+        # rewrites better than matching on a tagline like "policy mining".
+        content = json.dumps(registry["playbook_extraction"].minimal_valid)
+    elif '"tags"' in prompt_content:
+        content = json.dumps(registry["tagging"].minimal_valid)
+    elif "standalone_query" in prompt_content:
+        # Query-reformulation prompt (v2+, structured) — anchored on its
+        # primary output field name, which the prompt must describe.
+        content = json.dumps(registry["query_reformulation"].minimal_valid)
+    elif parse_structured_output:
+        content = json.dumps(registry["profile_extraction"].minimal_valid)
+    else:
+        default_payload = json.dumps(registry["profile_update"].minimal_valid)
+        content = f"```json\n{default_payload}\n```"
+
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.content = content
+    # Explicitly clear tool_calls: structured-output extraction now passes
+    # ``tools=`` (ask_human) alongside ``response_format``, so the client's
+    # tool-calling branch inspects ``message.tool_calls``. Without this, a bare
+    # MagicMock attribute would read as truthy and be misparsed as a tool call.
+    mock_response.choices[0].message.tool_calls = None
+    mock_response.choices[0].finish_reason = "stop"
+    return mock_response
+
+
+def _assert_response_format_strict_compatible(kwargs: dict[str, Any]) -> None:
+    """Guard every structured-output call: a ``json_schema`` response_format sent
+    to the provider must be OpenAI strict-mode compatible (no ``oneOf`` /
+    ``discriminator``). Pydantic discriminated unions emit ``oneOf``, which strict
+    structured-output endpoints reject with a 400 — a
+    failure the canned mock would otherwise hide. Raw Pydantic-class
+    response_format (the unsupported-provider passthrough) is skipped: that path
+    is handled by LiteLLM/the provider, not by an explicit strict schema.
+    """
+    response_format = kwargs.get("response_format")
+    if not isinstance(response_format, dict):
+        return
+    if response_format.get("type") != "json_schema":
+        return
+    schema = response_format.get("json_schema", {}).get("schema")
+    if not isinstance(schema, dict):
+        return
+    for banned in ("oneOf", "discriminator"):
+        if _find_schema_key(schema, banned):
+            raise AssertionError(
+                f"response_format json_schema contains '{banned}' — OpenAI strict "
+                "structured outputs reject it. Normalize via make_strict_json_schema "
+                "before sending."
+            )
+
+
+def _mock_completion(*args: Any, **kwargs: Any) -> MagicMock:
+    """Mock implementation for litellm.completion."""
+    _assert_response_format_strict_compatible(kwargs)
+    messages = kwargs.get("messages", args[0] if args else [])
+    prompt_content = ""
+    for message in messages:
+        if isinstance(message, dict) and "content" in message:
+            prompt_content += str(message["content"])
+
+    # Extraction now delivers its result as a native structured response
+    # (response_format=output_schema): the tool loop reads the final answer from
+    # message CONTENT (parsed into the schema), with ask_human /
+    # attach_pending_info_request available only as optional intermediate tools.
+    # So whenever a response_format is requested, emit structured content with no
+    # tool call — the common "finish" path. Tests that exercise an intermediate
+    # tool call (ask_human) install explicit responses via ``side_effect`` using
+    # ``make_tool_call_response``; they don't rely on this default router.
+    parse_structured = kwargs.get("response_format") is not None
+    return _create_mock_completion(prompt_content, parse_structured)
+
+
+def _is_e2e_test_run(config: Any) -> bool:
+    """Check if this pytest run includes e2e tests.
+
+    Returns True if any of the test paths contain 'e2e_tests'.
+    """
+    args = config.args if hasattr(config, "args") else []
+    for arg in args:
+        if "e2e_tests" in str(arg):
+            return True
+
+    if hasattr(config, "workerinput"):
+        worker_args = config.workerinput.get("args", [])
+        for arg in worker_args:
+            if "e2e_tests" in str(arg):
+                return True
+
+    return False
+
+
+# Global patcher reference kept alive across the test session.
+_litellm_patcher = None
+
+
+def configure_llm_mock(config: Any) -> None:
+    """Call from ``pytest_configure`` to patch litellm for non-e2e tests."""
+    global _litellm_patcher  # noqa: PLW0603
+
+    if _is_e2e_test_run(config):
+        return
+
+    os.environ["MOCK_LLM_RESPONSE"] = "true"
+    _litellm_patcher = patch("litellm.completion", side_effect=_mock_completion)
+    _litellm_patcher.start()
+
+
+def cleanup_llm_mock(config: Any) -> None:  # noqa: ARG001
+    """Call from ``pytest_unconfigure`` to stop the patcher."""
+    global _litellm_patcher  # noqa: PLW0603
+
+    if _litellm_patcher:
+        _litellm_patcher.stop()
+        _litellm_patcher = None
+
+
+def litellm_is_patched() -> bool:
+    """Report whether ``litellm.completion`` is currently a mock.
+
+    Returns:
+        bool: True when a patcher has replaced ``litellm.completion``.
+    """
+    import litellm
+
+    return isinstance(litellm.completion, NonCallableMock | MagicMock)
+
+
+@contextmanager
+def unpatched_litellm() -> Iterator[None]:
+    """Suspend the session-level mock for the duration, then restore it.
+
+    :func:`configure_llm_mock` decides whether to patch from the invocation
+    *path* (:func:`_is_e2e_test_run` scans ``config.args`` for ``e2e_tests``),
+    so a live-provider test is mocked or not depending on how the command was
+    typed -- ``pytest tests/e2e_tests/`` leaves it unpatched while
+    ``pytest -m e2e`` does not. This makes the exemption a property of the
+    test instead: whoever knows a given test needs a real provider can lift
+    the patch for exactly that test, whatever the invocation.
+
+    ``MOCK_LLM_RESPONSE`` is cleared unconditionally -- including when there is
+    no session patcher to stop. Service code branches on that variable to skip
+    LLM work entirely, and :func:`patched_litellm` deliberately leaves it set
+    on exit, so an e2e-path run (where ``configure_llm_mock`` never patched)
+    can reach a live test with a stale flag: ``litellm.completion`` is real,
+    :func:`assert_litellm_unpatched` passes, and the services under test
+    quietly take their mock branches anyway.
+
+    Yields:
+        None: A context in which ``litellm.completion`` is the real function
+            and ``MOCK_LLM_RESPONSE`` is unset.
+    """
+    patcher = _litellm_patcher
+    previous_flag = os.environ.get("MOCK_LLM_RESPONSE")
+
+    if patcher is not None:
+        patcher.stop()
+    os.environ.pop("MOCK_LLM_RESPONSE", None)
+    try:
+        yield
+    finally:
+        if patcher is not None:
+            patcher.start()
+        if previous_flag is None:
+            os.environ.pop("MOCK_LLM_RESPONSE", None)
+        else:
+            os.environ["MOCK_LLM_RESPONSE"] = previous_flag
+
+
+def assert_litellm_unpatched() -> None:
+    """Fail a live-provider test that is about to assert against the mock.
+
+    Checks BOTH mock mechanisms, because either alone can be satisfied while
+    the test still grades canned text:
+
+    * the patcher -- ``litellm.completion`` replaced by a mock;
+    * ``MOCK_LLM_RESPONSE`` -- read directly by service code that returns a
+      canned payload *without ever calling litellm* (e.g.
+      ``profile/components/extractor.py`` returns ``_generate_mock_profiles``
+      outright). Asking only the patcher passes cleanly in that state, so this
+      backstop could not fail in exactly the mode it advertises.
+
+    The e2e conftest lifts the session patch for ``requires_credentials``
+    tests via :func:`unpatched_litellm`, which also pops the variable, so both
+    conditions hold for any invocation of those. This stays as a backstop for a
+    live test reached some other way -- outside ``tests/e2e_tests/``, or
+    without the marker the fixture keys on.
+
+    Raises:
+        AssertionError: When ``litellm.completion`` is patched, or when
+            ``MOCK_LLM_RESPONSE`` is set to "true".
+    """
+    if litellm_is_patched():
+        raise AssertionError(
+            "litellm.completion is patched, so this live-provider test would "
+            "assert against canned mock text. Live tests belong under "
+            "tests/e2e_tests/ and must carry the requires_credentials marker; "
+            "the e2e conftest lifts the session patch for those."
+        )
+    if env_bool("MOCK_LLM_RESPONSE", default=False):
+        raise AssertionError(
+            "MOCK_LLM_RESPONSE=true, so service code takes its canned branch "
+            "without calling litellm at all -- this live-provider test would "
+            "assert against mock payloads even though the patcher is off."
+        )
+
+
+@contextmanager
+def patched_litellm() -> Iterator[None]:
+    """Opt-in patch for one e2e test that wants deterministic LLM responses.
+
+    The session-level ``configure_llm_mock`` skips e2e runs entirely so
+    historical e2e tests can hit real APIs. This context manager
+    re-enables the same mock for the scope of one test (or one block) —
+    useful for new e2e tests that need a predictable LLM response and
+    don't want to pay for or wait on a real provider.
+
+    Returns:
+        Iterator[None]: A context that patches ``litellm.completion``
+            on entry and restores the original on exit.
+    """
+    os.environ["MOCK_LLM_RESPONSE"] = "true"
+    patcher = patch("litellm.completion", side_effect=_mock_completion)
+    patcher.start()
+    try:
+        yield
+    finally:
+        patcher.stop()
+        # Leave MOCK_LLM_RESPONSE as-is — tests that read it should not
+        # depend on its lifetime being tied to a single context block.
+
+
+def make_tool_call_response(tool_name: str, args: dict[str, Any]) -> MagicMock:
+    """Build a litellm ModelResponse-shaped mock with a single tool_call.
+
+    Used by unit tests that drive tool loops against the patched
+    ``litellm.completion``. Not routed automatically by prompt
+    heuristics — callers install it explicitly with ``side_effect``.
+
+    Args:
+        tool_name (str): The name the assistant is calling.
+        args (dict[str, Any]): JSON-serialisable arguments passed to the tool.
+
+    Returns:
+        MagicMock: A response object shaped like a litellm ModelResponse
+            whose first choice has ``finish_reason="tool_calls"`` and a
+            single tool call matching the given name and args.
+    """
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].finish_reason = "tool_calls"
+    resp.choices[0].message.content = None
+    tc = MagicMock()
+    tc.id = f"tc_{tool_name}"
+    tc.type = "function"
+    tc.function.name = tool_name
+    tc.function.arguments = json.dumps(args)
+    resp.choices[0].message.tool_calls = [tc]
+    return resp
+
+
+def make_structured_finish(payload: dict[str, Any] | str) -> MagicMock:
+    """Build a structured-response finish for the extraction agent.
+
+    The resumable extraction agent now delivers its result as a native
+    structured response — the schema-conformant JSON arrives as the assistant
+    message content (no tool call), and the tool loop parses it into the output
+    schema. Use this in place of the old ``make_tool_call_response(
+    FINISH_EXTRACTION_TOOL_NAME, payload)`` pattern.
+
+    Args:
+        payload: The extraction result as a dict (serialized to JSON) or an
+            already-serialized JSON string (e.g. ``model.model_dump_json()``).
+
+    Returns:
+        MagicMock: A response object whose message content is the JSON payload
+            and whose ``tool_calls`` is None.
+    """
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    return make_finish_response(content)
+
+
+def make_finish_response(text: str = "done") -> MagicMock:
+    """Build a normal (non-tool-call) assistant message.
+
+    Used to terminate a tool loop that was driven by repeated
+    ``make_tool_call_response`` mocks.
+
+    Args:
+        text (str): Content of the terminal message.
+
+    Returns:
+        MagicMock: A response object with ``finish_reason="stop"``,
+            the given text, and ``tool_calls=None``.
+    """
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].finish_reason = "stop"
+    resp.choices[0].message.content = text
+    resp.choices[0].message.tool_calls = None
+    return resp

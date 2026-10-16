@@ -1,0 +1,151 @@
+"""Backend-neutral AgentRunStore contract (the AgentRunStore bucket).
+
+Extracted from ``_agent_run.py`` (the AgentRunStore bucket): the agent-run
+lifecycle and provenance lookup methods. The residual ``AgentRunMixin``
+composite stays composed alongside this class and holds the remaining pending-tool-call /
+run-tool-dependency stubs plus the shared ``build_scope_hash`` /
+``human_feedback_scope`` / ``build_pending_tool_call_dedup_key`` staticmethods.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from ._models import AgentRunRecord, AgentRunStatus
+
+
+def is_overflow_protocol_run(run: AgentRunRecord) -> bool:
+    """A durable protocol marker assigns execution to the window coordinator."""
+    return "overflow" in run.generation_request_snapshot
+
+
+class AgentRunStoreABC:
+    """Backend-neutral agent-run lifecycle store contract."""
+
+    def create_agent_run(self, record: AgentRunRecord) -> AgentRunRecord:
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def get_agent_run(self, run_id: str) -> AgentRunRecord | None:
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def get_agent_run_finalization_receipt(
+        self,
+        *,
+        run_id: str,
+        entity_type: str,
+    ) -> list[str] | None:
+        """Return the committed learning ids, or ``None`` when no receipt exists.
+
+        A committed empty receipt returns ``[]`` and must remain distinguishable
+        from a missing receipt so finalization stays idempotent.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def save_agent_run_finalization_receipt(
+        self,
+        *,
+        run_id: str,
+        entity_type: str,
+        learning_ids: list[str],
+    ) -> bool:
+        """Persist an immutable run-to-learning binding and report insert ownership."""
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def get_latest_finalized_agent_run_for_request(
+        self,
+        *,
+        org_id: str,
+        extractor_kind: str,
+        user_id: str | None,
+        request_id: str,
+    ) -> AgentRunRecord | None:
+        """Return the newest finalized extraction run for one logical request."""
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def update_agent_run_status(
+        self,
+        run_id: str,
+        status: AgentRunStatus,
+        *,
+        committed_output: dict[str, Any] | None = None,
+        pending_tool_call_ids: list[str] | None = None,
+        max_steps_remaining: int | None = None,
+        next_resume_at: datetime | None = None,
+        last_error: str | None = None,
+        increment_finalization_attempts: bool = False,
+        expected_statuses: tuple[AgentRunStatus, ...] | None = None,
+        expected_claimed_by: str | None = None,
+        expected_claimed_at: datetime | None = None,
+    ) -> AgentRunRecord | None:
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def fail_running_agent_runs_for_request(
+        self,
+        *,
+        org_id: str,
+        extractor_kind: str,
+        user_id: str | None,
+        request_id: str,
+        last_error: str,
+    ) -> int:
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def claim_ready_agent_run(
+        self,
+        *,
+        org_id: str,
+        worker_id: str,
+        now: datetime | None = None,
+        claim_ttl_seconds: int = 600,
+    ) -> AgentRunRecord | None:
+        """Claim legacy work only; overflow-marked runs belong to window workers."""
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def claim_finalization_failed_agent_run(
+        self,
+        *,
+        org_id: str,
+        worker_id: str,
+        now: datetime | None = None,
+        claim_ttl_seconds: int = 600,
+    ) -> AgentRunRecord | None:
+        """Claim legacy finalization only, excluding any durable overflow marker."""
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")
+
+    def claim_agent_run_for_recovery(
+        self,
+        *,
+        run_id: str,
+        org_id: str,
+        worker_id: str,
+        expected_updated_at: datetime,
+        operation_id: str,
+        now: datetime | None = None,
+        claim_ttl_seconds: int = 600,
+    ) -> AgentRunRecord | None:
+        """Atomically claim exactly one reviewed finalization run, or nothing.
+
+        Unlike queue claims this never falls back to another run. The caller
+        must revalidate the preview under the user's lease before effects.
+        """
+        raise NotImplementedError("Selected recovery requires the recovery migration")
+
+    def get_agent_run_recovery_facts(self, run_id: str) -> dict[str, Any]:
+        """Read-only, scoped evidence; no content or locking receipt lookup."""
+        raise NotImplementedError("Run diagnostics require the recovery migration")
+
+    def list_resumable_work_org_ids(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[str]:
+        """Return distinct org_ids that have actionable resumable-extraction work.
+
+        Cross-org maintenance query (intentionally NOT scoped to ``self.org_id``):
+        the resume scheduler uses it to discover every org that has a run ready
+        to resume, a run awaiting finalization retry, or a pending tool call that
+        can be expired, so per-org workers can be driven for all of them.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support agent runs")

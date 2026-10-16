@@ -1,0 +1,592 @@
+"""Shared .env discovery, loading, and mutation utility.
+
+Searches for .env in multiple locations. On first run, auto-creates
+~/.reflexio/.env from the bundled .env.example template.
+"""
+
+from __future__ import annotations
+
+import importlib.resources
+import logging
+import os
+import re
+import secrets
+import sys
+from pathlib import Path
+
+_logger = logging.getLogger(__name__)
+
+from dotenv import dotenv_values, load_dotenv
+
+from .paths import reflexio_home
+
+_USER_ENV_DIR = reflexio_home()
+_USER_ENV_FILE = _USER_ENV_DIR / ".env"
+
+
+def user_env_file() -> Path:
+    """Return the user-level .env path, honoring ``REFLEXIO_ENV_FILE``.
+
+    When ``REFLEXIO_ENV_FILE`` is set (and non-blank) it overrides the default
+    ``~/.reflexio/.env``. This lets a second local backend keep its env separate
+    from the OSS reflexio default that also lives under ``~/.reflexio`` — e.g.
+    claude-smart points this at ``~/.claude-smart/.env`` so an OSS reflexio
+    ``.env`` (with its own ``REFLEXIO_STORAGE`` etc.) can't leak into it. The data
+    directory is independent (see ``LOCAL_STORAGE_PATH``), so both backends can
+    still share ``~/.reflexio/data``.
+    """
+    override = os.environ.get("REFLEXIO_ENV_FILE", "").strip()
+    return Path(override).expanduser() if override else _USER_ENV_FILE
+
+
+# Path to the .env file that load_reflexio_env last resolved — None until
+# load_reflexio_env runs for the first time. Exposed via get_loaded_env_path
+# so the startup banner can show the operator exactly which dotenv was
+# picked (./.env vs ~/.reflexio/.env vs auto-created).
+_loaded_env_path: Path | None = None
+
+
+def get_env_path() -> Path:
+    """Return the canonical path to the user-level .env file.
+
+    Honors ``REFLEXIO_ENV_FILE`` (see :func:`user_env_file`); defaults to
+    ``~/.reflexio/.env``.
+    """
+    return user_env_file()
+
+
+def block_implicit_dotenv_walkup() -> None:
+    """Neutralize path-less ``dotenv.load_dotenv()`` autoloads (the walk-up).
+
+    Third-party libraries — notably ``litellm`` at import time
+    (``litellm/__init__.py``) — call ``load_dotenv()`` with no arguments. With
+    no path, python-dotenv runs ``find_dotenv()``, which walks **up** the
+    directory tree and loads the first ``.env`` it finds. Run from the
+    ``open_source/reflexio`` submodule inside the enterprise monorepo, that
+    climbs to the enterprise-root ``.env`` (platform-configured) and leaks
+    ``BACKEND_PORT`` / ``DEPLOYMENT_MODE`` / ``REFLEXIO_STORAGE`` into the
+    process — silently overriding the OSS launcher's own ``806*`` defaults.
+
+    Reflexio loads env deliberately via :func:`load_reflexio_env`, scoped to
+    ``./.env`` + ``~/.reflexio/.env`` and never walking up, so a library's
+    implicit autoload is redundant. This installs a shim on
+    ``dotenv.load_dotenv`` that no-ops the path-less form while passing explicit
+    ``load_dotenv(dotenv_path=...)`` / ``stream=...`` calls through unchanged.
+    Reflexio's own loader binds ``load_dotenv`` at import and always passes an
+    explicit path, so it is unaffected regardless.
+
+    Must run before the first ``import litellm`` in the process — the CLI entry
+    point (:func:`reflexio.cli.__main__.main`) calls it first thing. Idempotent.
+    Only the CLI launcher installs this: the spawned server subprocesses bind
+    the parent-resolved ``--port`` and the OSS server never reads
+    ``DEPLOYMENT_MODE``, so the launcher process is the only place the leak
+    changes behavior.
+    """
+    import functools
+    from typing import IO
+
+    import dotenv
+
+    original = dotenv.load_dotenv
+    if getattr(original, "__reflexio_walkup_guarded__", False):
+        return
+
+    @functools.wraps(original)
+    def _guarded(
+        dotenv_path: str | os.PathLike[str] | None = None,
+        stream: IO[str] | None = None,
+        verbose: bool = False,
+        override: bool = False,
+        interpolate: bool = True,
+        encoding: str | None = "utf-8",
+    ) -> bool:
+        if dotenv_path is None and stream is None:
+            # Path-less call would walk up past reflexio's controlled search
+            # scope (./.env + ~/.reflexio/.env). Ignore it.
+            return False
+        return original(
+            dotenv_path,
+            stream,
+            verbose=verbose,
+            override=override,
+            interpolate=interpolate,
+            encoding=encoding,
+        )
+
+    _guarded.__reflexio_walkup_guarded__ = True  # type: ignore[attr-defined]
+    dotenv.load_dotenv = _guarded
+
+
+def get_loaded_env_path() -> Path | None:
+    """Return the .env path that the most recent ``load_reflexio_env`` call
+    resolved, or None if the loader hasn't run yet.
+
+    Used by the startup banner so operators can see at a glance which
+    dotenv file was actually consumed (``./.env`` wins over
+    ``~/.reflexio/.env`` when both exist).
+    """
+    return _loaded_env_path
+
+
+def set_env_var(env_path: Path, key: str, value: str) -> None:
+    """Write or update an environment variable in a .env file.
+
+    If the key already exists (active or commented-out), the line is replaced
+    in-place. Active (uncommented) lines are prioritized over commented ones.
+    Values are always wrapped in double quotes for safe parsing.
+
+    Args:
+        env_path (Path): Path to the .env file.
+        key (str): Environment variable name.
+        value (str): Environment variable value.
+    """
+    content = env_path.read_text() if env_path.exists() else ""
+    lines = content.splitlines()
+    pattern = re.compile(rf"^#?\s*{re.escape(key)}=")
+    active_idx: int | None = None
+    commented_idx: int | None = None
+    for i, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+        if line.lstrip().startswith("#"):
+            if commented_idx is None:
+                commented_idx = i
+        else:
+            active_idx = i
+            break
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    replacement = f'{key}="{escaped}"'
+    target = active_idx if active_idx is not None else commented_idx
+    if target is not None:
+        lines[target] = replacement
+    else:
+        lines.append(replacement)
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+
+def _env_search_paths() -> list[Path]:
+    """OSS .env search order, resolved at call time so ``REFLEXIO_ENV_FILE`` is honored."""
+    return [
+        Path(".env"),  # 1. Current directory (local dev / project-level)
+        user_env_file(),  # 2. User-level file (REFLEXIO_ENV_FILE override, else ~/.reflexio/.env)
+    ]
+
+
+def _load_dotenv_pruned(path: Path, *, override: bool = False) -> None:
+    """Load a .env file, treating blank assignments (``KEY=``) as unset.
+
+    python-dotenv exports a blank ``KEY=`` line as ``os.environ["KEY"] = ""``
+    rather than leaving the key unset. That empty string silently defeats every
+    ``os.getenv("KEY", default)`` fallback — the root cause of the HF_HOME
+    cache-in-repo-root bug, and of any ``int()``/``float()`` parse that crashes
+    on ``""``. This wrapper normalizes "set to blank" to "unset" so callers that
+    rely on a default behave correctly.
+
+    After loading, it drops any key the FILE assigned a blank/whitespace value,
+    but only when the resulting environment value is still blank — so a real
+    process-env value (task definition, shell ``export``) or an earlier-loaded
+    file value is never removed.
+
+    Args:
+        path: Path to the .env file to load.
+        override: Forwarded to ``load_dotenv``. When False (default) the existing
+            process environment wins over the file's values.
+    """
+    file_vals = dotenv_values(path)
+    load_dotenv(dotenv_path=path, override=override)
+    for key, value in file_vals.items():
+        if (
+            value is not None
+            and not value.strip()
+            and not os.environ.get(key, "").strip()
+        ):
+            os.environ.pop(key, None)
+
+
+def promote_legacy_env_aliases() -> None:
+    """Fill a blank/unset canonical env var from its legacy alias.
+
+    Must run BEFORE any ``.env`` file is loaded. Those files load with
+    ``override=False``, which only protects a canonical name that is ALREADY
+    set in the process environment — it does nothing when the environment
+    supplied the LEGACY name and a ``.env`` file supplies the CANONICAL one.
+    In that case the file's value silently wins, so a process handed a real
+    DSN under the legacy name can end up reading a developer's local DSN
+    while reporting success. That shipped: a prod deploy's post-deploy grant
+    check verified the operator's local Supabase for exactly this reason.
+
+    ``DATA_DB_URL`` is canonical; ``DATA_SUPABASE_DB_URL`` is the legacy name
+    (see ``.env.template``). Deployments whose secret store we do not control
+    — a self-host customer's, for instance — may legitimately supply only the
+    legacy one, so this must work whichever name arrives.
+
+    Deliberately conservative: promotion is skipped when the canonical name
+    already carries a value, and when ``POSTGRES_DB_URL`` is set or the
+    storage backend is ``postgres``. In those cases the legacy Supabase name
+    is not necessarily the intended DSN, and the existing storage-aware
+    resolver should decide instead of this loader pre-empting it.
+    """
+    if os.environ.get("DATA_DB_URL", "").strip():
+        return
+    legacy = os.environ.get("DATA_SUPABASE_DB_URL", "").strip()
+    if not legacy:
+        return
+    if os.environ.get("POSTGRES_DB_URL", "").strip():
+        return
+    if os.environ.get("REFLEXIO_STORAGE", "").strip().lower() == "postgres":
+        return
+    os.environ["DATA_DB_URL"] = legacy
+    _logger.debug("Promoted legacy DATA_SUPABASE_DB_URL to canonical DATA_DB_URL")
+
+
+def load_reflexio_env(
+    *,
+    package_data_module: str = "reflexio.data",
+    auto_generate_keys: list[str] | None = None,
+) -> Path | None:
+    """Load .env from the first location found, or auto-create on first run.
+
+    Search order:
+        1. ./.env (current directory)
+        2. ~/.reflexio/.env (user home)
+        3. Auto-create from bundled .env.example template
+
+    Args:
+        package_data_module: Module containing bundled .env.example
+            (for importlib.resources). The OS package passes "reflexio.data";
+            a downstream build may pass its own data module.
+        auto_generate_keys: Env var names to auto-generate as hex tokens
+            (e.g., ["JWT_SECRET_KEY"]).
+
+    Returns:
+        Path to the loaded .env file, or None if no .env was found/created.
+    """
+    global _loaded_env_path
+    promote_legacy_env_aliases()
+    for env_path in _env_search_paths():
+        if env_path.exists():
+            _load_dotenv_pruned(env_path)
+            resolved = env_path.resolve()
+            _logger.debug("Loaded env from: %s", resolved)
+            _loaded_env_path = resolved
+            # Auto-generate any missing secret keys into the existing .env
+            _backfill_missing_keys(env_path, auto_generate_keys or [])
+            return env_path
+
+    # No .env found — auto-create from bundled template
+    created = _create_default_env(package_data_module, auto_generate_keys or [])
+    if created is not None:
+        _loaded_env_path = created.resolve()
+    return created
+
+
+def resolve_mode(cli_mode: str | None = None) -> str | None:
+    """Resolve the active deployment mode for mode-aware env loading.
+
+    Selection precedence:
+        1. Explicit ``--mode`` flag (``cli_mode``)
+        2. ``DEPLOYMENT_MODE`` environment variable
+        3. None (caller falls back to the plain ``.env`` loader)
+
+    The resolved mode is spliced into ``.env.<mode>`` file paths, so it is
+    validated against a safe slug pattern: an empty/whitespace value resolves to
+    None (fall back to the plain loader), and anything containing path
+    characters (``/``, ``..``) or other non-slug characters raises ValueError
+    rather than redirecting reads/writes/chmods outside ``~/.reflexio/``.
+
+    Args:
+        cli_mode: Mode passed explicitly via a CLI flag, if any.
+
+    Returns:
+        The normalized (stripped, lowercased) mode string, or None when no
+        mode is selected.
+
+    Raises:
+        ValueError: If the selected mode is not a safe slug.
+    """
+    raw_mode = cli_mode if cli_mode is not None else os.environ.get("DEPLOYMENT_MODE")
+    if raw_mode is None:
+        return None
+    mode = raw_mode.strip().lower()
+    if not mode:
+        return None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", mode):
+        raise ValueError(f"Invalid deployment mode: {raw_mode!r}")
+    return mode
+
+
+def load_reflexio_env_for_mode(
+    *,
+    cli_mode: str | None = None,
+    package_data_module: str = "reflexio.data",
+    auto_generate_keys: list[str] | None = None,
+) -> Path | None:
+    """Load ``.env.<mode>`` presets plus optional home secrets, mode-aware.
+
+    Loads the committed ``.env.<mode>`` presets (from CWD or the user home dir)
+    together with the optional gitignored ``~/.reflexio/.env.<mode>`` secrets
+    file. Both are loaded with ``override=False`` so the process environment
+    (task-def / shell ``export``) always wins, and home secrets take precedence
+    over committed presets for any disjoint keys.
+
+    When no mode is resolved, this falls back to :func:`load_reflexio_env`.
+
+    Args:
+        cli_mode: Mode passed explicitly via a CLI flag, if any.
+        package_data_module: Module containing the bundled ``.env.<mode>``
+            template (for ``importlib.resources``).
+        auto_generate_keys: Env var names to auto-generate as hex tokens
+            (e.g., ``["JWT_SECRET_KEY"]``) when missing. Generated secrets are
+            written ONLY to the gitignored ``~/.reflexio/.env.<mode>`` home
+            file — never the committed ``./.env.<mode>`` presets. Load-only
+            callers (the uvicorn / migration entrypoints) pass ``None``.
+
+    Returns:
+        Path to the loaded mode env file, or None if nothing was found/created.
+    """
+    global _loaded_env_path
+    promote_legacy_env_aliases()
+    mode = resolve_mode(cli_mode)
+    if mode is None:
+        return load_reflexio_env(
+            package_data_module=package_data_module,
+            auto_generate_keys=auto_generate_keys,
+        )
+
+    # Optional gitignored home secrets, loaded first so committed presets and
+    # process env both still win where they define the same keys.
+    home_secrets = _USER_ENV_DIR / f".env.{mode}"
+    if home_secrets.exists():
+        _load_dotenv_pruned(home_secrets, override=False)
+
+    loaded: Path | None = None
+    for env_path in (Path(f".env.{mode}"), home_secrets):
+        if env_path.exists():
+            _load_dotenv_pruned(env_path, override=False)
+            _loaded_env_path = env_path.resolve()
+            _logger.debug("Loaded mode env from: %s (mode=%s)", _loaded_env_path, mode)
+            loaded = env_path
+            break
+
+    if loaded is None:
+        loaded = _create_default_env_for_mode(mode, package_data_module)
+
+    # Auto-generate any missing secret keys into the gitignored home file ONLY,
+    # never the committed ./.env.<mode> presets file.
+    if auto_generate_keys:
+        _USER_ENV_DIR.mkdir(parents=True, exist_ok=True)
+        _backfill_missing_keys(home_secrets, auto_generate_keys)
+
+    return loaded
+
+
+def _create_default_env_for_mode(mode: str, package_data_module: str) -> Path | None:
+    """Create ``~/.reflexio/.env.<mode>`` from the bundled mode template.
+
+    Args:
+        mode: The resolved deployment mode (e.g. ``"platform"``).
+        package_data_module: Module path for finding the ``.env.<mode>``
+            template.
+
+    Returns:
+        Path to the newly created mode env file, or None if no template found.
+    """
+    global _loaded_env_path
+    content = _find_mode_template(mode, package_data_module)
+    if content is None:
+        return None
+    _USER_ENV_DIR.mkdir(parents=True, exist_ok=True)
+    target = _USER_ENV_DIR / f".env.{mode}"
+    target.write_text(content)
+    target.chmod(0o600)
+    _load_dotenv_pruned(target, override=False)
+    _loaded_env_path = target.resolve()
+    return target
+
+
+def _find_mode_template(mode: str, package_data_module: str) -> str | None:
+    """Find ``.env.<mode>`` template content from CWD or package data.
+
+    Args:
+        mode: The resolved deployment mode (e.g. ``"platform"``).
+        package_data_module: Dotted module path for importlib.resources lookup.
+
+    Returns:
+        The template content as a string, or None if not found anywhere.
+    """
+    # 1. Current directory (local dev checkout)
+    local = Path(f".env.{mode}")
+    if local.exists():
+        return local.read_text()
+
+    # 2. Package data (installed package)
+    try:
+        ref = importlib.resources.files(package_data_module).joinpath(f".env.{mode}")
+        return ref.read_text(encoding="utf-8")
+    except (ModuleNotFoundError, FileNotFoundError):
+        pass
+
+    # 3. Editable install: .env.<mode> lives at project root, two levels up.
+    try:
+        import reflexio as _pkg
+
+        project_root = Path(_pkg.__file__).resolve().parent.parent
+        candidate = project_root / f".env.{mode}"
+        if candidate.is_file():
+            return candidate.read_text()
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    return None
+
+
+def ensure_user_env_for_setup(
+    *,
+    package_data_module: str = "reflexio.data",
+    auto_generate_keys: list[str] | None = None,
+) -> Path | None:
+    """Return ``~/.reflexio/.env``, creating it from the template if missing.
+
+    Distinct from :func:`load_reflexio_env`: that function honors a CWD-local
+    ``./.env`` (intentional for ``services start``, where a project-level
+    override should take precedence). For ``setup init`` we never want to
+    write to whatever ``.env`` happens to be in the user's CWD — they may be
+    running from a worktree or a project root with an unrelated ``.env``,
+    and the resulting writes pollute that file and break the documented
+    ``~/.reflexio/.env`` invariant.
+
+    Args:
+        package_data_module: Module containing the bundled ``.env.example``
+            template (for ``importlib.resources``). The OS package passes
+            ``reflexio.data``; a downstream build may pass its own data module.
+        auto_generate_keys: Env var names to auto-fill with random hex
+            tokens when creating from the template.
+
+    Returns:
+        Path to ``~/.reflexio/.env`` (existing or newly created), or
+        ``None`` if no template could be found.
+    """
+    global _loaded_env_path
+    if _USER_ENV_FILE.exists():
+        _load_dotenv_pruned(_USER_ENV_FILE)
+        resolved = _USER_ENV_FILE.resolve()
+        _logger.debug("Loaded user env from: %s", resolved)
+        _loaded_env_path = resolved
+        _backfill_missing_keys(_USER_ENV_FILE, auto_generate_keys or [])
+        return _USER_ENV_FILE
+    created = _create_default_env(package_data_module, auto_generate_keys or [])
+    if created is not None:
+        _loaded_env_path = created.resolve()
+    return created
+
+
+def _backfill_missing_keys(env_path: Path, keys: list[str]) -> None:
+    """Generate and write any missing secret keys into an existing .env file.
+
+    Called when ``load_reflexio_env`` finds a pre-existing .env (e.g. created
+    by ``setup init``) that may be missing keys that ``services start``
+    requires (like JWT_SECRET_KEY).
+
+    Args:
+        env_path: Path to the existing .env file.
+        keys: Env var names to check/generate.
+    """
+    generated: list[str] = []
+    for key in keys:
+        if os.environ.get(key):
+            continue
+        token = secrets.token_hex(32)
+        set_env_var(env_path, key, token)
+        os.environ[key] = token
+        generated.append(key)
+    if generated:
+        sys.stdout.write(f"  Auto-generated missing keys: {', '.join(generated)}\n")
+        sys.stdout.flush()
+
+
+def _find_env_example(package_data_module: str) -> str | None:
+    """Find .env.example content from CWD or package data.
+
+    Args:
+        package_data_module: Dotted module path for importlib.resources lookup.
+
+    Returns:
+        The template content as a string, or None if not found anywhere.
+    """
+    # 1. Current directory (local dev checkout)
+    local = Path(".env.example")
+    if local.exists():
+        return local.read_text()
+
+    # 2. Package data (installed package)
+    try:
+        ref = importlib.resources.files(package_data_module).joinpath(".env.example")
+        return ref.read_text(encoding="utf-8")
+    except (ModuleNotFoundError, FileNotFoundError):  # fmt: skip
+        pass
+
+    # 3. Editable install: .env.example lives at project root, two levels above reflexio/
+    try:
+        import reflexio as _pkg
+
+        project_root = Path(_pkg.__file__).resolve().parent.parent
+        candidate = project_root / ".env.example"
+        if candidate.is_file():
+            return candidate.read_text()
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    return None
+
+
+def _create_default_env(
+    package_data_module: str,
+    auto_generate_keys: list[str],
+) -> Path | None:
+    """Create ~/.reflexio/.env from .env.example with auto-generated secrets.
+
+    Args:
+        package_data_module: Module path for finding the .env.example template.
+        auto_generate_keys: Env var names to auto-fill with random hex tokens.
+
+    Returns:
+        Path to the newly created .env file, or None if template not found.
+    """
+    content = _find_env_example(package_data_module)
+    if content is None:
+        sys.stdout.write(
+            "Warning: no .env file found and no .env.example template available.\n"
+            "  Set required environment variables manually.\n"
+        )
+        sys.stdout.flush()
+        return None
+
+    target = user_env_file()  # honors REFLEXIO_ENV_FILE (e.g. ~/.claude-smart/.env)
+    target_dir = target.parent
+    created_dir = not target_dir.exists()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if created_dir:
+        sys.stdout.write(f"Created directory: {target_dir}\n")
+
+    # Auto-generate secret keys
+    for key in auto_generate_keys:
+        token = secrets.token_hex(32)
+        content = re.sub(
+            rf"^{re.escape(key)}=.*$",
+            f"{key}={token}",
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+
+    target.write_text(content)
+    target.chmod(0o600)
+    _load_dotenv_pruned(target)
+
+    sys.stdout.write(f"Created env file: {target}\n")
+    if auto_generate_keys:
+        sys.stdout.write(f"  Auto-generated: {', '.join(auto_generate_keys)}\n")
+    sys.stdout.write(f"  Edit {target} to add your API keys.\n\n")
+    sys.stdout.flush()
+    return target

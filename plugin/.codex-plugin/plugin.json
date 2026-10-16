@@ -1,0 +1,44 @@
+{
+  "name": "claude-smart",
+  "version": "0.3.11",
+  "description": "按场景管理和提炼可复用工作偏好",
+  "author": {
+    "name": "hyz"
+  },
+  "homepage": "https://github.com/lianshangyou/scene-memory#readme",
+  "repository": "https://github.com/lianshangyou/scene-memory",
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-code-plugin",
+    "codex",
+    "codex-plugin",
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "agent-memory",
+    "plugin",
+    "reflexio",
+    "self-improvement",
+    "self-improving-agents",
+    "skills",
+    "learning"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "工作偏好管理",
+    "shortDescription": "Local learning across coding sessions",
+    "longDescription": "本机场景偏好管理、编辑与检索。",
+    "developerName": "hyz",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/lianshangyou/scene-memory",
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

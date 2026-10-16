@@ -1,0 +1,572 @@
+"""Search/retrieval route handlers (extracted from api.py, Tier3 A2)."""
+
+import logging
+import time
+from functools import partial
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    pass
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    status,
+)
+
+from reflexio.models.api_schema.retriever_schema import (
+    RerankUserProfilesRequest,
+    RetrievalExperimentAssignment,
+    SearchAgentPlaybookRequest,
+    SearchAgentPlaybooksViewResponse,
+    SearchInteractionRequest,
+    SearchInteractionsViewResponse,
+    SearchProfilesViewResponse,
+    SearchUserPlaybookRequest,
+    SearchUserPlaybooksViewResponse,
+    SearchUserProfileRequest,
+    UnifiedSearchRequest,
+    UnifiedSearchViewResponse,
+)
+from reflexio.models.api_schema.ui.converters import (
+    to_agent_playbook_view,
+    to_interaction_view,
+    to_profile_view,
+    to_user_playbook_view,
+)
+from reflexio.server import search_runtime
+from reflexio.server.auth import (
+    default_billing_gate,
+    default_get_caller_type,
+    default_get_org_id,
+)
+from reflexio.server.cache import reflexio_cache
+from reflexio.server.extensions import get_service
+from reflexio.server.llm.rerank.common import CrossEncoderUnavailableError
+from reflexio.server.rate_limit import limiter
+from reflexio.server.routes._common import _run_limited_api
+from reflexio.server.routes._metering import _stamp_search_dependencies_done
+from reflexio.server.services.retrieval_experiment import (
+    active_retrieval_experiment_assignment,
+)
+from reflexio.server.services.search_exposure import (
+    SEARCH_EXPOSURE_RECEIPT_ISSUER,
+    SearchExposureBatch,
+    issue_search_exposure_receipts,
+    record_search_exposures,
+    validate_search_exposure_batch,
+)
+from reflexio.server.services.search_metering_worker import enqueue_search_metering
+from reflexio.server.services.search_observer import (
+    CompletedSearch,
+    observe_completed_search,
+)
+from reflexio.server.tracing import profile_step
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def _retrieval_experiment_assignment(
+    *, org_id: str, caller_type: str, user_id: str | None
+) -> RetrievalExperimentAssignment | None:
+    """Resolve agent traffic assignment while leaving dashboard inspection untouched."""
+    if caller_type == "dashboard":
+        return None
+    reflexio = reflexio_cache.get_reflexio(org_id=org_id)
+    config = reflexio.request_context.configurator.get_config()
+    if config.retrieval_experiment_config is None:
+        return None
+    if user_id is None or not user_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="user_id is required while a retrieval experiment is active",
+        )
+    return active_retrieval_experiment_assignment(
+        config=config,
+        org_id=org_id,
+        user_id=user_id,
+    )
+
+
+@router.post(
+    "/api/search_profiles",
+    response_model=SearchProfilesViewResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("120/minute")  # Rate limit for read operations
+def search_user_profiles(
+    request: Request,
+    payload: SearchUserProfileRequest,
+    org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
+) -> SearchProfilesViewResponse:
+    assignment = _retrieval_experiment_assignment(
+        org_id=org_id, caller_type=caller_type, user_id=payload.user_id
+    )
+    if assignment is not None and assignment.arm == "holdout":
+        resp = SearchProfilesViewResponse(
+            success=True,
+            user_profiles=[],
+            msg="Retrieval withheld by experiment assignment",
+            experiment=assignment,
+        )
+    else:
+        response = _run_limited_api(
+            org_id,
+            "search",
+            lambda: reflexio_cache.get_reflexio(org_id=org_id).search_user_profiles(
+                payload
+            ),
+        )
+        resp = SearchProfilesViewResponse(
+            success=response.success,
+            user_profiles=[to_profile_view(p) for p in response.user_profiles],
+            msg=response.msg,
+            experiment=assignment,
+        )
+    enqueue_search_metering(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.user_profiles),
+        record_search_request=True,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
+
+
+@router.post(
+    "/api/rerank_user_profiles",
+    response_model=SearchProfilesViewResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("120/minute")  # Rate limit for read operations
+def rerank_user_profiles(
+    request: Request,
+    payload: RerankUserProfilesRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> SearchProfilesViewResponse:
+    """Rerank a list of profile ids by query relevance using a cross-encoder.
+
+    Args:
+        request (Request): The HTTP request object (for rate limiting)
+        payload (RerankUserProfilesRequest): The rerank request
+        org_id (str): Organization ID
+
+    Returns:
+        SearchProfilesViewResponse: Reranked profiles, top_k entries.
+    """
+    try:
+        response = _run_limited_api(
+            org_id,
+            "search",
+            lambda: reflexio_cache.get_reflexio(org_id=org_id).rerank_user_profiles(
+                payload
+            ),
+        )
+    except CrossEncoderUnavailableError as exc:
+        logger.warning(
+            "event=profile_rerank_unavailable org_id=%s",
+            org_id,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Reranking is currently unavailable",
+        ) from exc
+    return SearchProfilesViewResponse(
+        success=response.success,
+        user_profiles=[to_profile_view(p) for p in response.user_profiles],
+        msg=response.msg,
+    )
+
+
+@router.post(
+    "/api/search_interactions",
+    response_model=SearchInteractionsViewResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("120/minute")  # Rate limit for read operations
+def search_interactions(
+    request: Request,
+    payload: SearchInteractionRequest,
+    org_id: str = Depends(default_get_org_id),
+) -> SearchInteractionsViewResponse:
+    response = _run_limited_api(
+        org_id,
+        "search",
+        lambda: reflexio_cache.get_reflexio(org_id=org_id).search_interactions(payload),
+    )
+    return SearchInteractionsViewResponse(
+        success=response.success,
+        interactions=[to_interaction_view(i) for i in response.interactions],
+        msg=response.msg,
+    )
+
+
+@router.post(
+    "/api/search_user_playbooks",
+    response_model=SearchUserPlaybooksViewResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("120/minute")  # Rate limit for read operations
+def search_user_playbooks_endpoint(
+    request: Request,
+    payload: SearchUserPlaybookRequest,
+    org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
+) -> SearchUserPlaybooksViewResponse:
+    """Search user playbooks with semantic search and advanced filtering.
+
+    Supports filtering by user_id (via request_id linkage), agent_version,
+    playbook_name, datetime range, and status.
+
+    Args:
+        request (Request): The HTTP request object (for rate limiting)
+        payload (SearchUserPlaybookRequest): The search request
+        org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
+
+    Returns:
+        SearchUserPlaybooksViewResponse: Response containing matching user playbooks
+    """
+    assignment = _retrieval_experiment_assignment(
+        org_id=org_id, caller_type=caller_type, user_id=payload.user_id
+    )
+    if assignment is not None and assignment.arm == "holdout":
+        resp = SearchUserPlaybooksViewResponse(
+            success=True,
+            user_playbooks=[],
+            msg="Retrieval withheld by experiment assignment",
+            experiment=assignment,
+        )
+    else:
+        storage: object | None = None
+
+        def run_search() -> Any:
+            nonlocal storage
+            reflexio = reflexio_cache.get_reflexio(org_id=org_id)
+            storage = reflexio.get_storage()
+            return reflexio.search_user_playbooks(payload)
+
+        response = _run_limited_api(org_id, "search", run_search)
+        resp = SearchUserPlaybooksViewResponse(
+            success=response.success,
+            user_playbooks=[
+                to_user_playbook_view(rf) for rf in response.user_playbooks
+            ],
+            msg=response.msg,
+            experiment=assignment,
+        )
+        if caller_type == "production_agent":
+            batch = SearchExposureBatch(
+                org_id=org_id,
+                request_id=payload.request_id,
+                session_id=payload.session_id,
+                interaction_id=None,
+                user_id=payload.user_id,
+                user_playbooks=tuple(response.user_playbooks),
+            )
+            validate_search_exposure_batch(batch)
+            if get_service(SEARCH_EXPOSURE_RECEIPT_ISSUER) is None:
+                # Enterprise retains synchronous recording until it installs
+                # receipt issuance and publication ingestion together.
+                if response.success and response.user_playbooks and storage is not None:
+                    with search_runtime.search_exposure_scope(org_id, storage):
+                        record_search_exposures(batch)
+            else:
+                receipts = issue_search_exposure_receipts(batch)
+                for playbook in resp.user_playbooks:
+                    playbook.exposure_receipt = receipts.get(playbook.user_playbook_id)
+    enqueue_search_metering(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.user_playbooks),
+        record_search_request=True,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
+
+
+@router.post(
+    "/api/search_agent_playbooks",
+    response_model=SearchAgentPlaybooksViewResponse,
+    response_model_exclude_none=True,
+)
+@limiter.limit("120/minute")  # Rate limit for read operations
+def search_agent_playbooks_endpoint(
+    request: Request,
+    payload: SearchAgentPlaybookRequest,
+    org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
+) -> SearchAgentPlaybooksViewResponse:
+    """Search agent playbooks with semantic search and advanced filtering.
+
+    Supports filtering by agent_version, playbook_name, datetime range,
+    status_filter, and playbook_status_filter.
+
+    Args:
+        request (Request): The HTTP request object (for rate limiting)
+        payload (SearchAgentPlaybookRequest): The search request
+        org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
+
+    Returns:
+        SearchAgentPlaybooksViewResponse: Response containing matching agent playbooks
+    """
+    assignment = _retrieval_experiment_assignment(
+        org_id=org_id, caller_type=caller_type, user_id=payload.user_id
+    )
+    if assignment is not None and assignment.arm == "holdout":
+        resp = SearchAgentPlaybooksViewResponse(
+            success=True,
+            agent_playbooks=[],
+            msg="Retrieval withheld by experiment assignment",
+            experiment=assignment,
+        )
+    else:
+        response = _run_limited_api(
+            org_id,
+            "search",
+            lambda: reflexio_cache.get_reflexio(org_id=org_id).search_agent_playbooks(
+                payload
+            ),
+        )
+        resp = SearchAgentPlaybooksViewResponse(
+            success=response.success,
+            agent_playbooks=[
+                to_agent_playbook_view(fb) for fb in response.agent_playbooks
+            ],
+            msg=response.msg,
+            experiment=assignment,
+        )
+    enqueue_search_metering(
+        org_id=org_id,
+        caller_type=caller_type,
+        surfaced_count=len(resp.agent_playbooks),
+        record_search_request=True,
+        request_id=getattr(payload, "request_id", None),
+        session_id=getattr(payload, "session_id", None),
+    )
+    return resp
+
+
+@router.post(
+    "/api/search",
+    response_model=UnifiedSearchViewResponse,
+    response_model_exclude_none=True,
+    responses={
+        503: {"description": "Search capacity exhausted or storage unavailable"},
+        504: {
+            "description": "The shared search request deadline expired",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["detail", "reason", "correlation_id"],
+                        "properties": {
+                            "detail": {"type": "string"},
+                            "reason": {
+                                "type": "string",
+                                "enum": ["search_deadline", "backstop_timeout"],
+                            },
+                            "correlation_id": {"type": "string"},
+                        },
+                    }
+                }
+            },
+        },
+    },
+)
+@limiter.limit("120/minute")
+def unified_search_endpoint(
+    request: Request,
+    payload: UnifiedSearchRequest,
+    org_id: str = Depends(default_get_org_id),
+    caller_type: str = Depends(default_get_caller_type),
+    _gate: None = Depends(default_billing_gate("application")),  # noqa: B008
+    _deps_done: None = Depends(_stamp_search_dependencies_done),
+) -> UnifiedSearchViewResponse:
+    """Search across all entity types (profiles, agent playbooks, user playbooks).
+
+    Runs query rewriting followed by embedding generation, then retrieves the
+    requested entity types. Query rewriting is gated behind the
+    enable_reformulation request param.
+
+    Args:
+        request (Request): The HTTP request object (for rate limiting)
+        payload (UnifiedSearchRequest): The unified search request
+        org_id (str): Organization ID
+        caller_type (str): Billing caller classification (injected via dependency).
+
+    Returns:
+        UnifiedSearchViewResponse: Combined search results
+    """
+    scope = search_runtime.current()
+    if scope is not None:
+        with scope.lock:
+            scope.requested_search_mode = payload.search_mode.value
+    assignment = _retrieval_experiment_assignment(
+        org_id=org_id, caller_type=caller_type, user_id=payload.user_id
+    )
+    if assignment is not None and assignment.arm == "holdout":
+        search_runtime.set_outcome(True)
+        resp = UnifiedSearchViewResponse(
+            success=True,
+            profiles=[],
+            agent_playbooks=[],
+            user_playbooks=[],
+            msg="Retrieval withheld by experiment assignment",
+            experiment=assignment,
+        )
+        search_runtime.checkpoint()
+        search_runtime.on_response_accepted(
+            "metering",
+            partial(
+                enqueue_search_metering,
+                org_id=org_id,
+                caller_type=caller_type,
+                surfaced_count=0,
+                record_search_request=True,
+                request_id=payload.request_id,
+                session_id=payload.session_id,
+            ),
+            order=20,
+        )
+        return resp
+
+    deps_done = getattr(request.state, "search_deps_done_monotonic", None)
+    deps_to_body_ms = (
+        int((time.monotonic() - deps_done) * 1000) if deps_done is not None else None
+    )
+    with profile_step(
+        "search.endpoint",
+        enabled=bool(payload.enable_reformulation),
+        has_conversation_history=bool(payload.conversation_history),
+        search_mode=payload.search_mode,
+    ) as endpoint_span:
+        endpoint_span.set_data("deps_to_body_ms", deps_to_body_ms)
+        endpoint_span.set_data(
+            "tp_borrowed", getattr(request.state, "tp_borrowed", None)
+        )
+        endpoint_span.set_data("tp_total", getattr(request.state, "tp_total", None))
+        endpoint_span.set_data("tp_waiting", getattr(request.state, "tp_waiting", None))
+
+        def run_search() -> Any:
+            with profile_step("search.reflexio_cache"):
+                reflexio = reflexio_cache.get_reflexio(org_id=org_id)
+            search_runtime.remember_search_storage(org_id, reflexio.get_storage())
+            return reflexio.unified_search(payload, org_id=org_id)
+
+        response = _run_limited_api(org_id, "search", run_search)
+        with profile_step("search.response_view"):
+            resp = UnifiedSearchViewResponse(
+                success=response.success,
+                profiles=[to_profile_view(p) for p in response.profiles],
+                agent_playbooks=[
+                    to_agent_playbook_view(fb) for fb in response.agent_playbooks
+                ],
+                user_playbooks=[
+                    to_user_playbook_view(rf) for rf in response.user_playbooks
+                ],
+                reformulated_query=response.reformulated_query,
+                msg=response.msg,
+                agent_trace=response.agent_trace,
+                rehydrated_text=response.rehydrated_text,
+                # Copied through, because a PARTIAL failure's whole contract is
+                # that the caller is told. The service has computed these since
+                # the degrade-to-FTS path shipped and this view dropped both,
+                # so an empty profile list read as a fact rather than as an arm
+                # that never answered.
+                degraded=response.degraded,
+                search_mode_effective=response.search_mode_effective,
+                experiment=assignment,
+            )
+        search_runtime.checkpoint()
+        search_runtime.set_outcome(resp.success)
+        if caller_type == "production_agent":
+            exposure_batch = SearchExposureBatch(
+                org_id=org_id,
+                request_id=payload.request_id,
+                session_id=payload.session_id,
+                interaction_id=payload.interaction_id,
+                user_id=payload.user_id,
+                user_playbooks=tuple(response.user_playbooks),
+            )
+            validate_search_exposure_batch(exposure_batch)
+            if get_service(SEARCH_EXPOSURE_RECEIPT_ISSUER) is None:
+                # Served-state writes keep the existing acceptance boundary;
+                # recorder-less OSS remains a supported no-op configuration.
+                if response.success:
+
+                    def record_exposures() -> None:
+                        with profile_step("search.exposure"):
+                            record_search_exposures(exposure_batch)
+
+                    search_runtime.on_response_accepted(
+                        "exposure", record_exposures, order=0
+                    )
+            else:
+                receipts = issue_search_exposure_receipts(exposure_batch)
+                for playbook in resp.user_playbooks:
+                    playbook.exposure_receipt = receipts.get(playbook.user_playbook_id)
+        search_runtime.checkpoint()
+        meter = partial(
+            enqueue_search_metering,
+            org_id=org_id,
+            caller_type=caller_type,
+            surfaced_count=len(resp.profiles)
+            + len(resp.agent_playbooks)
+            + len(resp.user_playbooks),
+            record_search_request=True,
+            request_id=getattr(payload, "request_id", None),
+            session_id=getattr(payload, "session_id", None),
+        )
+        if resp.success:
+            search_runtime.on_response_accepted("metering", meter, order=20)
+        else:
+            # Failed searches still count as requests, with no applied results.
+            meter()
+    search_runtime.checkpoint()
+    if resp.success:
+        search_runtime.on_response_accepted(
+            "completed_search",
+            partial(
+                observe_completed_search,
+                CompletedSearch(
+                    org_id=org_id,
+                    caller_type=caller_type,
+                    user_id=payload.user_id,
+                    session_id=payload.session_id,
+                    request_id=payload.request_id,
+                    profile_ids=tuple(p.profile_id for p in resp.profiles),
+                    user_playbook_ids=tuple(
+                        str(p.user_playbook_id) for p in resp.user_playbooks
+                    ),
+                ),
+            ),
+            order=30,
+        )
+    if not resp.success:
+        # A TOTAL storage failure used to answer 200 with empty lists and
+        # ``success=False`` only in the body, so a caller checking the status
+        # code -- or just reading the result lists -- saw a backend outage as
+        # "this user has no profile and no playbooks" and could not retry
+        # (the pooled-connection incident). ``success=False`` has exactly one
+        # producer, the total-failure branch in ``unified_search_service``, so
+        # this cannot fire on an ordinary empty result.
+        #
+        # A PARTIAL failure is deliberately NOT a 503: it returns 200 with
+        # ``degraded=True``, matching the existing degrade-to-FTS contract.
+        #
+        # Failed requests retain their existing zero-result request metering.
+        # Successful served-state callbacks are discarded for this 503.
+        raise HTTPException(status_code=503, detail=resp.msg or "Search failed")
+    return resp

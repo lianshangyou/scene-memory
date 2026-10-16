@@ -1,0 +1,607 @@
+"""Auto-detect available LLM providers and resolve default models by API key.
+
+Resolution order (highest priority first):
+    1. LLMConfig override (org-level configuration)
+    2. For embeddings, Reflexio's local default model
+    3. For other roles, llm_model_setting.json site var and provider autodetection
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from reflexio.models.config_schema import APIKeyConfig
+
+# Env var opting into the Claude Code CLI provider (registered in
+# reflexio.server.llm.providers.claude_code_provider). When set to "1"
+# *and* the active host CLI is available, the provider is auto-detected
+# with highest priority — reflexio will route extraction/evaluation
+# calls through the local CLI instead of requiring an API key.
+_CLAUDE_CODE_ENABLE_ENV = "CLAUDE_SMART_USE_LOCAL_CLI"
+_CLAUDE_CODE_PROVIDER = "claude-code"
+
+# Companion provider key for the local ONNX embedder (registered in
+# reflexio.server.llm.providers.local_embedding_provider). Surfaces in
+# ``providers`` only when ``CLAUDE_SMART_USE_LOCAL_EMBEDDING=1`` is set
+# (claude-smart's explicit opt-in); otherwise the embedding role still
+# silently falls back to "local" when ONNX dependencies are importable but no
+# cloud embedder is configured — see Path 3 in ``_auto_detect_model``.
+_LOCAL_EMBEDDING_PROVIDER = "local"
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Provider detection
+# ---------------------------------------------------------------------------
+
+_ENV_TO_PROVIDER: dict[str, str] = {
+    "OPENAI_API_KEY": "openai",
+    "ANTHROPIC_API_KEY": "anthropic",
+    "GEMINI_API_KEY": "gemini",
+    "DEEPSEEK_API_KEY": "deepseek",
+    "OPENROUTER_API_KEY": "openrouter",
+    "MINIMAX_API_KEY": "minimax",
+    "DASHSCOPE_API_KEY": "dashscope",
+    "XAI_API_KEY": "xai",
+    "MOONSHOT_API_KEY": "moonshot",
+    "ZAI_API_KEY": "zai",
+}
+
+# When multiple keys are set, prefer providers in this order. The
+# claude-code CLI provider sits at the top — when it's available, users
+# are explicitly opting into local-auth extraction and should not be
+# surprised by an OpenAI/Anthropic API bill from a leftover env var.
+_PROVIDER_PRIORITY: list[str] = [
+    _CLAUDE_CODE_PROVIDER,
+    _LOCAL_EMBEDDING_PROVIDER,
+    "anthropic",
+    "gemini",
+    "openrouter",
+    "deepseek",
+    "minimax",
+    "dashscope",
+    "xai",
+    "moonshot",
+    "zai",
+    "openai",
+]
+
+# Maps APIKeyConfig field names to provider keys (field name == provider key
+# for all current providers, but kept explicit for clarity).
+_API_KEY_CONFIG_FIELDS: dict[str, str] = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "gemini": "gemini",
+    "deepseek": "deepseek",
+    "openrouter": "openrouter",
+    "minimax": "minimax",
+    "dashscope": "dashscope",
+    "xai": "xai",
+    "moonshot": "moonshot",
+    "zai": "zai",
+}
+
+
+def provider_env_vars() -> dict[str, str]:
+    """Return the env-var-to-provider mapping used for credential detection.
+
+    A read-only view for callers that need to ask about a *specific* credential
+    rather than "what is available" — notably the test suites' live-provider
+    skip gates, which must distinguish a real key from the placeholder that
+    ``ensure_provider_credential`` pins. Providers reached through a local CLI
+    rather than an API key (``claude-code``) have no entry here.
+
+    Returns:
+        dict[str, str]: Copy of the env var name to provider key mapping.
+    """
+    return dict(_ENV_TO_PROVIDER)
+
+
+def detect_available_providers(
+    api_key_config: APIKeyConfig | None = None,
+) -> list[str]:
+    """Detect available LLM providers from APIKeyConfig and/or environment variables.
+
+    Args:
+        api_key_config: Optional org-level API key configuration. Fields set here
+            take precedence over environment variables.
+
+    Returns:
+        list[str]: Available provider keys in priority order.
+    """
+    available: set[str] = set()
+
+    # Check APIKeyConfig fields
+    if api_key_config:
+        for field, provider in _API_KEY_CONFIG_FIELDS.items():
+            if getattr(api_key_config, field, None) is not None:
+                available.add(provider)
+
+    # Check environment variables
+    for env_var, provider in _ENV_TO_PROVIDER.items():
+        if os.environ.get(env_var):
+            available.add(provider)
+
+    # Claude Code CLI and the local ONNX embedder are opt-in via their
+    # own env vars + runtime requirements (`claude` on PATH for the CLI,
+    # ONNX dependencies installed for the embedder). Their availability helpers
+    # own the detection logic so there's one source of truth.
+    from reflexio.server.llm.providers.claude_code_provider import (
+        is_claude_code_available,
+    )
+    from reflexio.server.llm.providers.local_embedding_provider import (
+        is_local_embedder_available,
+    )
+
+    if is_claude_code_available():
+        available.add(_CLAUDE_CODE_PROVIDER)
+    if is_local_embedder_available():
+        available.add(_LOCAL_EMBEDDING_PROVIDER)
+
+    return [p for p in _PROVIDER_PRIORITY if p in available]
+
+
+# ---------------------------------------------------------------------------
+# Per-provider default models
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderDefaults:
+    """Default model names for a given provider.
+
+    Any field may be ``None`` for a role the provider does not support.
+    For example, the ``local`` ONNX embedder has no generation model;
+    the ``claude-code`` CLI has no embedding endpoint. ``_auto_detect_model``
+    falls through to the next provider in priority order when the
+    requested role is missing.
+
+    Args:
+        generation: Model for content generation, or None.
+        evaluation: Model for evaluation/scoring, or None.
+        should_run: Model for lightweight "should run extraction" checks, or None.
+        pre_retrieval: Model for pre-retrieval query reformulation, or None.
+        embedding: Model for embedding generation, or None.
+        extraction_agent: Sonnet-tier model for the resumable extraction loop, or None.
+    """
+
+    generation: str | None
+    evaluation: str | None
+    should_run: str | None
+    pre_retrieval: str | None
+    embedding: str | None
+    extraction_agent: str | None = None
+
+
+_PROVIDER_DEFAULTS: dict[str, ProviderDefaults] = {
+    # claude-code routes through the local Claude Code CLI via LiteLLM's
+    # custom provider mechanism (see providers/claude_code_provider.py).
+    # The model-name suffix after "claude-code/" is opaque — the CLI
+    # picks whichever model the user has auth for.
+    _CLAUDE_CODE_PROVIDER: ProviderDefaults(
+        generation="claude-code/default",
+        evaluation="claude-code/default",
+        should_run="claude-code/default",
+        pre_retrieval="claude-code/default",
+        embedding=None,
+        extraction_agent="claude-code/default",
+    ),
+    # local is an embedding-only provider that routes through an
+    # in-process ONNX model (all-MiniLM-L6-v2). Generation
+    # roles stay None — use claude-code for those.
+    _LOCAL_EMBEDDING_PROVIDER: ProviderDefaults(
+        generation=None,
+        evaluation=None,
+        should_run=None,
+        pre_retrieval=None,
+        embedding="local/minilm-l6-v2",
+    ),
+    "openai": ProviderDefaults(
+        generation="gpt-5.5",
+        evaluation="gpt-5.4-mini",
+        should_run="gpt-5-nano",
+        pre_retrieval="gpt-5-nano",
+        embedding="text-embedding-3-small",
+        extraction_agent="gpt-5.5",
+    ),
+    "anthropic": ProviderDefaults(
+        generation="claude-sonnet-5",
+        evaluation="claude-sonnet-5",
+        should_run="claude-haiku-4-5-20251001",
+        pre_retrieval="claude-haiku-4-5-20251001",
+        embedding=None,
+        extraction_agent="claude-sonnet-5",
+    ),
+    "gemini": ProviderDefaults(
+        generation="gemini/gemini-3-flash-preview",
+        evaluation="gemini/gemini-3-flash-preview",
+        should_run="gemini/gemini-3-flash-preview",
+        pre_retrieval="gemini/gemini-3-flash-preview",
+        embedding="gemini/gemini-embedding-001",
+    ),
+    "deepseek": ProviderDefaults(
+        generation="deepseek/deepseek-chat",
+        evaluation="deepseek/deepseek-chat",
+        should_run="deepseek/deepseek-chat",
+        pre_retrieval="deepseek/deepseek-chat",
+        embedding=None,
+    ),
+    "openrouter": ProviderDefaults(
+        generation="openrouter/google/gemini-3-flash-preview",
+        evaluation="openrouter/google/gemini-3-flash-preview",
+        should_run="openrouter/google/gemini-3-flash-preview",
+        pre_retrieval="openrouter/google/gemini-3-flash-preview",
+        embedding=None,
+    ),
+    "minimax": ProviderDefaults(
+        generation="minimax/MiniMax-M3",
+        evaluation="minimax/MiniMax-M3",
+        should_run="minimax/MiniMax-M3",
+        pre_retrieval="minimax/MiniMax-M3",
+        embedding=None,
+        # Same M3 model handles resumable extraction. Surfaced by an
+        # e2e run on a MiniMax-only VPS where publish printed
+        # "No provider in ['minimax'] supports role=extraction_agent"
+        # warnings and silently skipped profile creation. Without this,
+        # MiniMax-only users can publish but get zero profiles.
+        extraction_agent="minimax/MiniMax-M3",
+    ),
+    "dashscope": ProviderDefaults(
+        generation="dashscope/qwen-plus",
+        evaluation="dashscope/qwen-plus",
+        should_run="dashscope/qwen-turbo",
+        pre_retrieval="dashscope/qwen-turbo",
+        embedding=None,
+    ),
+    "xai": ProviderDefaults(
+        generation="xai/grok-3-mini",
+        evaluation="xai/grok-3-mini",
+        should_run="xai/grok-3-mini",
+        pre_retrieval="xai/grok-3-mini",
+        embedding=None,
+    ),
+    "moonshot": ProviderDefaults(
+        generation="moonshot/moonshot-v1-8k",
+        evaluation="moonshot/moonshot-v1-8k",
+        should_run="moonshot/moonshot-v1-8k",
+        pre_retrieval="moonshot/moonshot-v1-8k",
+        embedding=None,
+    ),
+    "zai": ProviderDefaults(
+        generation="zai/glm-5.2",
+        evaluation="zai/glm-5.2",
+        should_run="zai/glm-5.2",
+        pre_retrieval="zai/glm-5.2",
+        embedding=None,
+    ),
+}
+
+
+# Output-token cap applied when neither the call site nor the client config
+# sets max_tokens. MiniMax-M3 misbehaves with unbounded output: omitting
+# max_tokens (especially combined with a strict json_schema response_format)
+# deterministically stalls generation into litellm's 120s timeout (reproduced
+# 2026-07; observed in prod as consolidator/document-expansion timeouts).
+# Sizing (measured in prod, 2026-07-14): M3's reasoning tokens count against
+# this budget, so too small a cap starves the visible output — at 4096 the
+# model regularly spent the whole budget thinking and returned empty/truncated
+# content (structured-output parse failures ran ~10-20x the 8192-era rate,
+# breaking extraction). 8192 was the healthiest measured setting. The 120s
+# provider stalls occur at every cap value (provider-side; mitigate with
+# fallback models, not here). Providers absent from this map stay unbounded.
+#
+# `zai` shares the property that forced MiniMax's entry, and only that one:
+# both sit on ``_PROMPT_SCHEMA_PROVIDER_ALLOWLIST``
+# (_litellm_structured_output.py), so the whole JSON schema travels inside the
+# prompt and the model has to emit a COMPLETE structured body from scratch --
+# there is no provider-side grammar to stop it short of one. A cap that fits
+# the reasoning but not the body yields a truncated document that fails to
+# parse as JSON at all, rather than a document that parses and then fails
+# field validation.
+#
+# The 8192 here is NOT a measured ZAI value, and should not be read as one.
+# MiniMax's 8192 came from a prod A/B on MiniMax-M3 (2026-07-14, the note
+# above): 4096 ran structured-output parse failures ~10-20x the 8192-era rate.
+# No equivalent A/B has been run against glm-5.2, and M3's reasoning-token
+# accounting is not evidence about a different vendor's model. What IS
+# measured for ZAI is a single direction: a live `zai/glm-5.2` structured call
+# capped at 4096 truncated at exactly the cap on both the first attempt and its
+# corrective re-issue, producing a body that raised JSONDecodeError with zero
+# extractable content (`validation_errors: []` throughout -- it never reached
+# field validation). That establishes only that 4096 is too small. 8192 is
+# therefore the nearest reasonable floor -- the one other value in this map --
+# and is expected to be revised once ZAI has its own measurement.
+_PROVIDER_DEFAULT_MAX_TOKENS: dict[str, int] = {"minimax": 8192, "zai": 8192}
+
+
+def default_max_tokens_for_model(model: str) -> int | None:
+    """Return the provider-level default output-token cap for ``model``.
+
+    Args:
+        model (str): Full model name, e.g. ``"minimax/MiniMax-M3"``.
+
+    Returns:
+        int | None: Cap to apply when the caller set none, or None (no cap).
+    """
+    provider = model.split("/", 1)[0] if "/" in model else ""
+    return _PROVIDER_DEFAULT_MAX_TOKENS.get(provider)
+
+
+EMBEDDING_CAPABLE_PROVIDERS: frozenset[str] = frozenset(
+    p for p, d in _PROVIDER_DEFAULTS.items() if d.embedding is not None
+)
+
+
+GENERATION_CAPABLE_PROVIDERS: frozenset[str] = frozenset(
+    p for p, d in _PROVIDER_DEFAULTS.items() if d.generation is not None
+)
+
+
+def _local_cli_provider_hint() -> str:
+    return (
+        f"or set {_CLAUDE_CODE_ENABLE_ENV}=1 with the active host CLI "
+        "(claude for Claude Code, codex for Codex) available."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model role enum and resolution
+# ---------------------------------------------------------------------------
+
+
+class ModelRole(StrEnum):
+    """Roles that require an LLM model name."""
+
+    GENERATION = "generation"
+    EVALUATION = "evaluation"
+    SHOULD_RUN = "should_run"
+    PRE_RETRIEVAL = "pre_retrieval"
+    EMBEDDING = "embedding"
+    # Sonnet-tier agent that drives the resumable extraction tool loop.
+    EXTRACTION_AGENT = "extraction_agent"
+
+
+def _auto_detect_model(
+    role: ModelRole,
+    providers: list[str],
+) -> str:
+    """Pick the default model for *role* from the first available provider.
+
+    For the EMBEDDING role, if the primary provider has no embedding support,
+    search the remaining providers for one that does.
+
+    Args:
+        role: The model role to resolve.
+        providers: Available providers in priority order.
+
+    Returns:
+        str: The resolved model name.
+
+    Raises:
+        RuntimeError: If no suitable provider is found.
+    """
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider available. Set at least one of: "
+            + ", ".join(sorted(_ENV_TO_PROVIDER))
+            + f" in your .env file, {_local_cli_provider_hint()}"
+        )
+
+    if role == ModelRole.EMBEDDING:
+        # Path 1+2: explicit claude-smart opt-in or a cloud embedder. The
+        # priority list places `local` at position 2, so when the env var is
+        # set ``providers`` already contains "local" and this loop returns it
+        # before any cloud provider. When the env var is unset, only cloud
+        # providers can hit here (local is filtered out by
+        # ``is_local_embedder_available``).
+        for provider in providers:
+            defaults = _PROVIDER_DEFAULTS[provider]
+            if defaults.embedding:
+                return defaults.embedding
+        # Path 3: no embedding-capable provider in `providers`, but ONNX dependencies
+        # are importable — silently fall back to the local ONNX embedder so
+        # users with only a non-embedding LLM key (Anthropic, MiniMax, etc.)
+        # are not blocked at startup.
+        from reflexio.server.llm.providers.local_embedding_provider import (
+            are_local_embedding_dependencies_available,
+        )
+
+        if are_local_embedding_dependencies_available():
+            return _PROVIDER_DEFAULTS[_LOCAL_EMBEDDING_PROVIDER].embedding  # type: ignore[return-value]
+        raise RuntimeError(
+            "No embedding-capable provider configured and ONNX dependencies are not "
+            "importable. Set OPENAI_API_KEY or GEMINI_API_KEY, or "
+            "`pip install onnxruntime tokenizers numpy`."
+        )
+
+    # Non-embedding roles: fall through to the first provider whose slot
+    # for this role is non-None. Lets embedding-only providers (e.g.
+    # "local") sit in the priority list without breaking generation.
+    for provider in providers:
+        defaults = _PROVIDER_DEFAULTS[provider]
+        model_name = getattr(defaults, role.value)
+        if model_name:
+            return model_name
+    raise RuntimeError(f"No provider in {providers} supports role={role.value}.")
+
+
+def resolve_model_name(
+    role: ModelRole,
+    *,
+    site_var_value: str | None = None,
+    config_override: str | None = None,
+    api_key_config: APIKeyConfig | None = None,
+) -> str:
+    """Resolve a model name using the role-specific default chain.
+
+    Resolution order (highest priority first):
+        1. config_override (from LLMConfig, org-level)
+        2. For EMBEDDING, the OSS local MiniLM model
+        3. For other roles, site_var_value then auto-detect from available API keys
+
+    Args:
+        role: The model role to resolve.
+        site_var_value: Value from llm_model_setting.json. Ignored for embeddings.
+        config_override: Value from org-level LLMConfig.
+        api_key_config: Optional org-level API key configuration for provider detection.
+
+    Returns:
+        str: The resolved model name.
+
+    Raises:
+        RuntimeError: If no API keys are available and no override is set.
+    """
+    if config_override:
+        return config_override
+    if role == ModelRole.EMBEDDING:
+        return (
+            _PROVIDER_DEFAULTS[_LOCAL_EMBEDDING_PROVIDER].embedding
+            or "local/minilm-l6-v2"
+        )
+    if site_var_value:
+        return site_var_value
+    providers = detect_available_providers(api_key_config)
+    return _auto_detect_model(role, providers)
+
+
+def _warn_if_fallback_cannot_run(fallbacks: list[str]) -> None:
+    """Warn ONCE, at boot, when a stalled primary would leave no time for a fallback.
+
+    The ladder walk enforces one wall-clock budget across all rungs
+    (``_LADDER_WALL_CLOCK_BUDGET_SECONDS``), so this is a configuration fact, not
+    a per-call one -- it used to be re-warned on every structured call. Checked
+    against the process default generation timeout; a tenant's
+    ``generation_timeout_seconds`` override is not visible here.
+
+    Args:
+        fallbacks (list[str]): The configured fallback models.
+    """
+    if not fallbacks:
+        return
+    # Lazy: reflexio.lib imports the server package.
+    from reflexio.lib._base import GENERATION_TIMEOUT_SECONDS
+    from reflexio.server.llm._litellm_text_generation import (
+        _LADDER_MIN_TURN_SECONDS,
+        _LADDER_WALL_CLOCK_BUDGET_SECONDS,
+        _parse_grace_seconds,
+    )
+
+    # A stalled primary is killed at its timeout PLUS the hard-timeout grace, so
+    # the grace is part of what it consumes.
+    grace = _parse_grace_seconds(
+        os.environ.get("REFLEXIO_LLM_HARD_TIMEOUT_GRACE_SECONDS", "5") or "5"
+    )
+    if (
+        GENERATION_TIMEOUT_SECONDS + grace + _LADDER_MIN_TURN_SECONDS
+        > _LADDER_WALL_CLOCK_BUDGET_SECONDS
+    ):
+        logger.warning(
+            "event=llm_fallback_unreachable generation_timeout_seconds=%d "
+            "budget_seconds=%.0f fallbacks=%s -- a primary that runs to its "
+            "timeout leaves the fallback no time; lower "
+            "REFLEXIO_GENERATION_TIMEOUT_SECONDS",
+            GENERATION_TIMEOUT_SECONDS,
+            _LADDER_WALL_CLOCK_BUDGET_SECONDS,
+            fallbacks,
+        )
+
+
+def validate_llm_availability(
+    api_key_config: APIKeyConfig | None = None,
+) -> None:
+    """Validate that at least one LLM provider and one embedding provider are available.
+
+    Should be called once during startup. Logs available providers at INFO level.
+
+    Args:
+        api_key_config: Optional org-level API key configuration.
+
+    Raises:
+        RuntimeError: If no API keys are found, or if no embedding-capable provider is available.
+    """
+    providers = detect_available_providers(api_key_config)
+    if not providers:
+        raise RuntimeError(
+            "No LLM provider available. Set at least one of: "
+            + ", ".join(sorted(_ENV_TO_PROVIDER))
+            + f" in your .env file, {_local_cli_provider_hint()}"
+        )
+
+    logger.info("Auto-detected LLM providers (priority order): %s", providers)
+    generation_provider = next(
+        (p for p in providers if _PROVIDER_DEFAULTS[p].generation), None
+    )
+    if generation_provider is None:
+        # Configurations that surface only embedding-capable providers
+        # (e.g. ``providers == ["local"]`` from ONNX dependencies being available
+        # but no LLM key set) leave every generation-role lookup
+        # unresolvable. Failing here means the next reflexio call would
+        # raise "No provider supports role=generation" deep inside the
+        # extraction pipeline; we'd rather raise at startup with the
+        # same actionable message users hit when no providers are
+        # detected at all.
+        raise RuntimeError(
+            "No generation-capable LLM provider available. Set at least "
+            "one of: "
+            + ", ".join(sorted(_ENV_TO_PROVIDER))
+            + f" in your .env file, {_local_cli_provider_hint()}"
+        )
+    logger.info("Primary provider for generation: %s", generation_provider)
+
+    # The launcher always provides a separate colocated inference service when
+    # no remote endpoint is configured. API workers never import or construct
+    # the local model.
+    embedding_provider = next(
+        (p for p in providers if _PROVIDER_DEFAULTS[p].embedding), None
+    )
+    if embedding_provider:
+        logger.info(
+            "Cloud embedding provider available: %s (used when the saved "
+            "embedding model selects this provider)",
+            embedding_provider,
+        )
+    else:
+        from reflexio.server.llm.providers.embedding_service_provider import (
+            remote_inference_service_configured,
+        )
+
+        location = "remote" if remote_inference_service_configured() else "colocated"
+        logger.info(
+            "Using the configured %s inference service for embeddings", location
+        )
+
+    fallback_raw = os.environ.get("REFLEXIO_LLM_FALLBACK_MODELS", "")
+    fallbacks = [m.strip() for m in fallback_raw.split(",") if m.strip()]
+    for model in fallbacks:
+        if model.startswith("local/"):
+            continue
+        provider = model.split("/", 1)[0].lower() if "/" in model else ""
+        if not provider:
+            continue
+        if provider not in _ENV_TO_PROVIDER.values():
+            # A provider reflexio doesn't key-validate at boot (bedrock,
+            # vertex_ai, azure, groq, ollama, together_ai, ...) authenticates
+            # via non-``<PROVIDER>_API_KEY`` means (IAM role, service
+            # account, etc.). Refusing to boot here would be a backward-
+            # compat break — these fallbacks booted fine before per-rung
+            # boot validation existed and only failed at request time.
+            logger.warning(
+                "Configured fallback model %r names provider %r, which "
+                "reflexio cannot validate credentials for at boot; any "
+                "misconfiguration will surface at request time instead.",
+                model,
+                provider,
+            )
+            continue
+        if provider not in providers:
+            raise RuntimeError(
+                f"Configured fallback model {model!r} needs provider {provider!r}, "
+                f"but no key for it is available. Set the provider's API key or "
+                f"remove it from REFLEXIO_LLM_FALLBACK_MODELS."
+            )
+    _warn_if_fallback_cannot_run(fallbacks)

@@ -1,0 +1,1993 @@
+# ruff: noqa: S608 -- SQL identifiers are resolved from a fixed backend table registry.
+"""Durable, arrival-ordered extraction state shared by SQL storage backends.
+
+The backend supplies only a transaction-bound SQL adapter. Scheduling, window
+selection and fencing live here so SQLite and PostgreSQL obey the same rules.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, fields
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol
+
+from reflexio.models.api_schema.domain import Interaction
+from reflexio.server.work_scope import current_project_id
+
+Kind = Literal["profile", "playbook"]
+KINDS: tuple[Kind, ...] = ("profile", "playbook")
+
+
+def _validate_frozen_profile_checkpoint(
+    previous_checkpoint: dict[str, Any], checkpoint: dict[str, Any]
+) -> None:
+    """Host decisions are append-only, like the physical attempt receipts."""
+    for field in (
+        "profile_package_candidates",
+        "profile_dedup_inputs",
+        "profile_dedup_decision",
+        "profile_package_plan",
+        "profile_package_plan_digest",
+    ):
+        if (
+            field in previous_checkpoint
+            and checkpoint.get(field) != previous_checkpoint[field]
+        ):
+            raise OverflowCheckpointConflictError(
+                "Frozen profile decision is immutable"
+            )
+    if any(
+        checkpoint.get("historical_profiles", {}).get(key) != value
+        for key, value in previous_checkpoint.get("historical_profiles", {}).items()
+    ):
+        raise OverflowCheckpointConflictError("Historical profile witness is immutable")
+
+
+class StreamSQL(Protocol):
+    """Parameterised queries; identifiers are resolved by the backend."""
+
+    def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]: ...
+    def table(self, name: str) -> str: ...
+    def now(self) -> float: ...
+    def lock(self, *, skip_locked: bool = False) -> str: ...
+    def eligible(self, kind: Kind) -> str: ...
+    def project_filter(self) -> str: ...
+    def input_lock(self) -> str: ...
+    def admission_value(self, field: str) -> str: ...
+    def source_witness_bytes(self, row: dict[str, Any]) -> bytes: ...
+
+
+def decoded(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def source_request_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Recover request converter input from a locked request/interaction join."""
+    return {
+        "request_id": row["request_id"],
+        "user_id": row["user_id"],
+        **{
+            field: row[f"request_{field}"]
+            for field in (
+                "created_at",
+                "source",
+                "agent_version",
+                "session_id",
+                "evaluation_only",
+                "retrieval_experiment_id",
+                "retrieval_experiment_arm",
+            )
+        },
+    }
+
+
+@dataclass(frozen=True)
+class CoverageSnapshot:
+    """Inputs to reporting; remote backends can load them in one statement."""
+
+    admission: dict[str, Any] | None
+    surviving: int | None
+    cursors: list[dict[str, Any]]
+    now: float | None
+    lease_until: float | None
+
+
+@dataclass(frozen=True)
+class Window:
+    window_id: str
+    user_id: str
+    kind: Kind
+    project_id: str
+    predecessor: int
+    end_seq: int
+    manifest: list[dict[str, Any]]
+    policy: dict[str, Any]
+    force: bool
+    skip_aggregation: bool
+    outcome: dict[str, Any] | None = None
+    invalidated: bool = False
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> Window:
+        return cls(
+            window_id=row["window_id"],
+            user_id=row["user_id"],
+            kind=row["kind"],
+            project_id=row["project_id"],
+            predecessor=int(row["predecessor"]),
+            end_seq=int(row["end_seq"]),
+            manifest=decoded(row["manifest"]),
+            policy=decoded(row["policy"]),
+            force=bool(row["force"]),
+            skip_aggregation=bool(row["skip_aggregation"]),
+            outcome=decoded(row.get("outcome")),
+            invalidated=bool(row.get("invalidated", False)),
+        )
+
+
+class WindowInputsDeletedError(RuntimeError):
+    """A saved window has been invalidated by explicit deletion."""
+
+
+class LeaseLostError(RuntimeError):
+    """The complete transaction must roll back when a claim is superseded."""
+
+
+class OverflowCheckpointConflictError(RuntimeError):
+    """A stale worker may not replace a newer extraction checkpoint."""
+
+
+class OverflowAttemptBudgetExceededError(RuntimeError):
+    """The logical extraction has consumed all durable provider attempts."""
+
+
+def _valid_overflow_provenance(provenance: Any) -> bool:
+    from reflexio.server.llm._litellm_types import ModelProvenance
+
+    return (
+        isinstance(provenance, dict)
+        and set(provenance).issubset(field.name for field in fields(ModelProvenance))
+        and all(
+            value is None or isinstance(value, str) for value in provenance.values()
+        )
+    )
+
+
+def validate_extraction_overflow_manifest(manifest: Any) -> dict[str, Any]:
+    """Reject damaged saved quota before mutation or provider admission."""
+    from reflexio.server.llm.token_accounting import RunTokenTotals
+
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("version")) is not int
+        or manifest["version"] not in (1, 2)
+        or not isinstance(manifest.get("source_digest"), str)
+        or type(manifest.get("attempt_limit")) is not int
+        or manifest["attempt_limit"] != 128
+        or type(manifest.get("revision")) is not int
+        or not isinstance(manifest.get("attempts"), list)
+    ):
+        raise OverflowCheckpointConflictError("Invalid extraction overflow marker")
+    checkpoint = manifest.get("checkpoint")
+    if (
+        not isinstance(checkpoint, dict)
+        or not isinstance(checkpoint.get("stage"), str)
+        or not checkpoint["stage"]
+        or not isinstance(checkpoint.get("completed_steps"), dict)
+        or len(checkpoint["completed_steps"]) > 128
+    ):
+        raise OverflowCheckpointConflictError("Invalid extraction checkpoint")
+    for key, receipt in checkpoint["completed_steps"].items():
+        if (
+            manifest["version"] == 2
+            and isinstance(receipt, dict)
+            and receipt.get("kind") == "source_selection"
+        ):
+            continue
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(receipt, dict)
+            or "output" not in receipt
+            or "model_provenance" not in receipt
+            or not _valid_overflow_provenance(receipt["model_provenance"])
+        ):
+            raise OverflowCheckpointConflictError("Invalid extraction step receipt")
+    attempts = manifest["attempts"]
+    if len(attempts) > 128:
+        raise OverflowCheckpointConflictError("Invalid extraction attempt journal")
+    usage_fields = {field.name for field in fields(RunTokenTotals)}
+    identities: set[str] = set()
+    for attempt in attempts:
+        if (
+            not isinstance(attempt, dict)
+            or not isinstance(attempt.get("id"), str)
+            or not attempt["id"]
+            or attempt["id"] in identities
+            or "usage" not in attempt
+            or "model_provenance" not in attempt
+        ):
+            raise OverflowCheckpointConflictError("Invalid extraction attempt journal")
+        identities.add(attempt["id"])
+        usage = attempt["usage"]
+        if usage is not None and (
+            not isinstance(usage, dict)
+            or set(usage) != usage_fields
+            or any(type(value) is not int or value < 0 for value in usage.values())
+        ):
+            raise OverflowCheckpointConflictError("Invalid extraction attempt usage")
+        provenance = attempt["model_provenance"]
+        if provenance is not None and not _valid_overflow_provenance(provenance):
+            raise OverflowCheckpointConflictError("Invalid extraction model provenance")
+    if manifest["version"] == 2:
+        from reflexio.server.services.extraction.overflow_protocol import (
+            validate_package_manifest,
+        )
+
+        try:
+            validate_package_manifest(manifest)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise OverflowCheckpointConflictError(
+                "Invalid source-package journal"
+            ) from exc
+    return manifest
+
+
+class ExtractionStreamStore:
+    """Methods join the storage commit_scope; never perform model/network work."""
+
+    org_id: str
+    commit_scope: Any
+
+    def _stream_sql(
+        self,
+        *,
+        discovery: bool = False,
+        read_only: bool = False,
+        coordination: bool = False,
+    ) -> AbstractContextManager[StreamSQL]:
+        raise NotImplementedError
+
+    def admit_extraction(
+        self,
+        user_id: str,
+        request_id: str,
+        interaction_ids: list[int],
+        admission: dict[str, Any],
+    ) -> None:
+        """Called in the SAME commit_scope as request/interaction inserts.
+
+        lock_extraction_stream MUST be called before those inserts. Holding the
+        row lock until commit makes sequence order equal accepted commit order.
+        """
+        with self._stream_sql() as db:
+            work = db.table("learning_work")
+            rows = db.query(
+                f"UPDATE {work} SET highwater=highwater+?, revision=revision+1, "
+                "due_at=0,pending_since=CASE WHEN pending_since=0 THEN ? ELSE pending_since END WHERE org_id=? AND user_id=? RETURNING highwater",
+                (len(interaction_ids), db.now(), self.org_id, user_id),
+            )
+            end = int(rows[0]["highwater"])
+            start = end - len(interaction_ids) + 1
+            admission = {
+                **admission,
+                "min_seq": start,
+                "max_seq": end,
+                "admitted_at": db.now(),
+            }
+            db.query(
+                f"UPDATE {db.table('requests')} SET learning_admission=? "
+                "WHERE request_id=? AND user_id=?",
+                (json.dumps(admission), request_id, user_id),
+            )
+            # Bounded set updates avoid one database round trip per interaction.
+            for offset in range(0, len(interaction_ids), 200):
+                ids = interaction_ids[offset : offset + 200]
+                cases = " ".join("WHEN ? THEN ?" for _ in ids)
+                placeholders = ",".join("?" for _ in ids)
+                values = tuple(
+                    value
+                    for seq, i in enumerate(ids, start + offset)
+                    for value in (i, seq)
+                )
+                db.query(
+                    f"UPDATE {db.table('interactions')} SET ingestion_seq=CASE interaction_id {cases} END "
+                    f"WHERE user_id=? AND interaction_id IN ({placeholders})",
+                    (*values, user_id, *ids),
+                )
+
+    def lock_publish_stream(
+        self,
+        user_id: str,
+        interactions: list[Interaction],  # noqa: ARG002
+    ) -> None:
+        """Lock publication; enterprise adds the complete exposure subject set."""
+        self.lock_extraction_stream(user_id)
+
+    def lock_extraction_stream(self, user_id: str) -> None:
+        with self._stream_sql() as db:
+            work = db.table("learning_work")
+            db.query(
+                f"INSERT INTO {work} (org_id,user_id) VALUES (?,?) "
+                "ON CONFLICT (org_id,user_id) DO NOTHING",
+                (self.org_id, user_id),
+            )
+            db.query(
+                f"SELECT highwater FROM {work} WHERE org_id=? AND user_id=?{db.lock()}",
+                (self.org_id, user_id),
+            )
+            db.query(
+                f"INSERT INTO {db.table('extraction_cursors')} (user_id,kind,project_id) "
+                "VALUES (?,?,?),(?,?,?) ON CONFLICT (user_id,kind,project_id) DO NOTHING",
+                tuple(
+                    value
+                    for kind in KINDS
+                    for value in (user_id, kind, current_project_id() or "")
+                ),
+            )
+
+    def claim_extraction(
+        self, owner: str, lease_seconds: int
+    ) -> tuple[str, str] | None:
+        """Claim ONE user only after the caller has reserved execution capacity."""
+        with self._stream_sql(coordination=True) as db:
+            now = db.now()
+            work = db.table("learning_work")
+            rows = db.query(
+                f"SELECT user_id FROM {work} WHERE org_id=? AND due_at<=? "
+                "AND lease_until<=? ORDER BY last_turn,user_id LIMIT 1"
+                + db.lock(skip_locked=True),
+                (self.org_id, now, now),
+            )
+            if not rows:
+                return None
+            user_id, token = rows[0]["user_id"], uuid.uuid4().hex
+            db.query(
+                f"UPDATE {work} SET lease_token=?,lease_owner=?,lease_until=?,last_turn=? "
+                "WHERE org_id=? AND user_id=?",
+                (token, owner, now + lease_seconds, now, self.org_id, user_id),
+            )
+            return user_id, token
+
+    def renew_extraction(self, user_id: str, token: str, seconds: int) -> bool:
+        with self._stream_sql(coordination=True) as db:
+            now = db.now()
+            return bool(
+                db.query(
+                    f"UPDATE {db.table('learning_work')} SET lease_until=? "
+                    "WHERE org_id=? AND user_id=? AND lease_token=? AND lease_until>? RETURNING user_id",
+                    (now + seconds, self.org_id, user_id, token, now),
+                )
+            )
+
+    def _fence(self, db: StreamSQL, user_id: str, token: str) -> None:
+        if not db.query(
+            f"SELECT user_id FROM {db.table('learning_work')} "
+            "WHERE org_id=? AND user_id=? AND lease_token=? AND lease_until>?"
+            + db.lock(),
+            (self.org_id, user_id, token, db.now()),
+        ):
+            raise LeaseLostError("Extraction lease was superseded")
+
+    def _inputs(
+        self,
+        db: StreamSQL,
+        user_id: str,
+        kind: Kind,
+        after: int,
+        limit: int,
+        *,
+        project_id: str = "",
+        context: bool = False,
+    ) -> list[dict[str, Any]]:
+        comparator, order = ("<=", "DESC") if context else (">", "ASC")
+        rows = db.query(
+            f"SELECT i.interaction_id,i.ingestion_seq,i.request_id,r.session_id,r.learning_admission "
+            f"FROM {db.table('interactions')} i JOIN {db.table('requests')} r "
+            "ON r.request_id=i.request_id AND r.user_id=i.user_id "
+            f"WHERE i.user_id=? AND {db.project_filter()} AND i.ingestion_seq {comparator} ? AND {db.eligible(kind)} "
+            f"ORDER BY i.ingestion_seq {order} LIMIT ?",
+            (user_id, project_id, after, limit),
+        )
+        return list(reversed(rows)) if context else rows
+
+    def finalize_session(self, user_id: str, session_id: str) -> bool:
+        """Persist a completion boundary and wake work in one transaction.
+
+        No new stream is created for an unknown session. The marker is a hint,
+        not a closed state; subsequent publication remains valid.
+        """
+        with self.commit_scope(), self._stream_sql() as db:
+            if not db.query(
+                f"SELECT highwater FROM {db.table('learning_work')} "
+                "WHERE org_id=? AND user_id=?" + db.lock(),
+                (self.org_id, user_id),
+            ):
+                return False
+            end = db.admission_value("max_seq")
+            rows = db.query(
+                f"SELECT r.request_id,r.learning_admission FROM {db.table('requests')} r "
+                f"WHERE r.user_id=? AND {db.project_filter()} AND r.session_id=? "
+                f"AND {end} IS NOT NULL ORDER BY {end} DESC LIMIT 1",
+                (user_id, current_project_id() or "", session_id),
+            )
+            if not rows:
+                return False
+            # Reuse enterprise subject-erasure admission guards in this same
+            # transaction, after the shared work lock and scoped existence check.
+            self.lock_extraction_stream(user_id)
+            row = rows[0]
+            admission = decoded(row["learning_admission"])
+            admission["session_finished"] = True
+            db.query(
+                f"UPDATE {db.table('requests')} SET learning_admission=? "
+                "WHERE user_id=? AND request_id=?",
+                (json.dumps(admission), user_id, row["request_id"]),
+            )
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,revision=revision+1 "
+                "WHERE org_id=? AND user_id=?",
+                (self.org_id, user_id),
+            )
+            return True
+
+    def _completion_boundary(
+        self, db: StreamSQL, user_id: str, kind: Kind, after: int, project_id: str
+    ) -> int | None:
+        # Marker eligibility is independent of input eligibility. A consumed or
+        # erased prefix must not leave an empty barrier blocking later inputs.
+        end = db.admission_value("max_seq")
+        eligible = db.eligible(kind).replace("r.", "er.")
+        project = db.project_filter().replace("r.", "er.")
+        rows = db.query(
+            f"SELECT {end} AS boundary FROM {db.table('requests')} r "
+            f"WHERE r.user_id=? AND {db.project_filter()} "
+            f"AND {db.admission_value('session_finished')}=1 AND {end}>? "
+            f"AND EXISTS (SELECT 1 FROM {db.table('interactions')} live "
+            f"JOIN {db.table('requests')} er ON er.user_id=live.user_id AND er.request_id=live.request_id "
+            f"WHERE er.user_id=r.user_id AND er.session_id=r.session_id AND {project} "
+            f"AND {eligible} AND live.ingestion_seq>? AND live.ingestion_seq<={end}) "
+            f"ORDER BY {end} LIMIT 1",
+            (user_id, project_id, after, project_id, after),
+        )
+        return int(rows[0]["boundary"]) if rows else None
+
+    def _idle_boundary(
+        self,
+        db: StreamSQL,
+        user_id: str,
+        project_id: str,
+        pending: list[dict[str, Any]],
+        deadlines: list[float] | None,
+    ) -> int | None:
+        boundary = None
+        end = db.admission_value("max_seq")
+        now: float | None = None
+        for session_id in {row["session_id"] for row in pending}:
+            rows = db.query(
+                f"SELECT {end} AS end_seq,{db.admission_value('admitted_at')} AS admitted_at,"
+                f"{db.admission_value('idle_timeout_seconds')} AS idle_timeout_seconds FROM {db.table('requests')} r "
+                f"WHERE r.user_id=? AND {db.project_filter()} AND r.session_id=? "
+                f"AND {end} IS NOT NULL ORDER BY {end} DESC LIMIT 1",
+                (user_id, project_id, session_id),
+            )
+            if not rows:
+                continue
+            activity = rows[0]
+            timeout = activity["idle_timeout_seconds"]
+            admitted_at = activity["admitted_at"]
+            # Legacy data has no trustworthy admission clock. Explicit finish
+            # still works, but no idle backfill is inferred on upgrade.
+            if not timeout or admitted_at is None:
+                continue
+            due = float(admitted_at) + int(timeout)
+            if now is None:
+                now = db.now()
+            if due <= now:
+                value = int(activity["end_seq"])
+                boundary = value if boundary is None else min(boundary, value)
+            elif deadlines is not None:
+                deadlines.append(due)
+        return boundary
+
+    def _select(
+        self,
+        db: StreamSQL,
+        user_id: str,
+        kind: Kind,
+        cursor: dict[str, Any],
+        *,
+        deadlines: list[float] | None = None,
+    ) -> tuple[Window | None, int]:
+        after = int(cursor["completed_seq"])
+        project_id = cursor["project_id"]
+        first = self._inputs(db, user_id, kind, after, 1, project_id=project_id)
+        if not first:
+            return None, 0
+        admission = decoded(first[0]["learning_admission"])
+        policy = admission[kind]
+        width, stride = int(policy["window_size"]), int(policy["stride_size"])
+        if not 1 <= stride <= width:
+            raise ValueError("Extraction requires 1 <= stride_size <= window_size")
+        context = self._inputs(
+            db, user_id, kind, after, width, project_id=project_id, context=True
+        )
+        needed = max(stride, width - len(context)) if cursor["started"] else width
+        new = self._inputs(db, user_id, kind, after, width, project_id=project_id)
+        # A force barrier covers all preceding work, including full windows.
+        end_expr = db.admission_value("max_seq")
+        force_expr = db.admission_value("force")
+        barrier = db.query(
+            f"SELECT MIN({end_expr}) AS barrier FROM {db.table('requests')} r "
+            f"WHERE r.user_id=? AND {db.project_filter()} AND {force_expr}=1 "
+            f"AND {db.eligible(kind)} AND {end_expr}>? "
+            f"AND EXISTS(SELECT 1 FROM {db.table('interactions')} live "
+            "WHERE live.user_id=r.user_id AND live.request_id=r.request_id AND live.ingestion_seq>?)",
+            (user_id, project_id, after, after),
+        )[0]["barrier"]
+        forced = barrier is not None
+        if not forced:
+            barrier = self._completion_boundary(db, user_id, kind, after, project_id)
+            if barrier is None and len(new) < needed:
+                barrier = self._idle_boundary(db, user_id, project_id, new, deadlines)
+        if barrier is not None:
+            new = [row for row in new if int(row["ingestion_seq"]) <= barrier]
+        if len(new) < needed and barrier is None:
+            return None, needed - len(new)
+        new = new[:needed]
+        if not new:
+            return None, 0
+        manifest = [
+            {
+                "interaction_id": int(row["interaction_id"]),
+                "seq": int(row["ingestion_seq"]),
+                "request_id": row["request_id"],
+            }
+            for row in (context + new)[-width:]
+        ]
+        window = Window(
+            window_id=uuid.uuid4().hex,
+            user_id=user_id,
+            kind=kind,
+            project_id=project_id,
+            predecessor=after,
+            end_seq=int(new[-1]["ingestion_seq"]),
+            manifest=manifest,
+            policy=policy,
+            force=forced,
+            skip_aggregation=any(
+                decoded(row["learning_admission"]).get("skip_aggregation", False)
+                for row in new
+            ),
+        )
+        return window, 0
+
+    def prepare_extraction(self, user_id: str, token: str) -> Window | None:
+        with self._stream_sql(discovery=True) as db:
+            self._fence(db, user_id, token)
+            now = db.now()
+            cursors = db.query(
+                f"SELECT * FROM {db.table('extraction_cursors')} WHERE user_id=? "
+                "ORDER BY last_turn,kind",
+                (user_id,),
+            )
+            effects_due = db.query(
+                f"SELECT MIN(effects_retry_at) AS due FROM {db.table('extraction_windows')} "
+                "WHERE user_id=? AND completed=1 AND effects_done=0",
+                (user_id,),
+            )[0]["due"]
+            next_due = float(effects_due) if effects_due is not None else float("inf")
+            for cursor in cursors:
+                if cursor["retry_at"] > now:
+                    next_due = min(next_due, cursor["retry_at"])
+                    continue
+                if cursor["window_id"]:
+                    rows = db.query(
+                        f"SELECT * FROM {db.table('extraction_windows')} WHERE window_id=?",
+                        (cursor["window_id"],),
+                    )
+                    return Window.from_row(rows[0])
+                deadlines: list[float] = []
+                window, _ = self._select(
+                    db, user_id, cursor["kind"], cursor, deadlines=deadlines
+                )
+                if deadlines:
+                    next_due = min(next_due, *deadlines)
+                if window is None:
+                    continue
+                db.query(
+                    f"INSERT INTO {db.table('extraction_windows')} "
+                    "(window_id,user_id,kind,predecessor,end_seq,manifest,policy,force,skip_aggregation,project_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        window.window_id,
+                        user_id,
+                        window.kind,
+                        window.predecessor,
+                        window.end_seq,
+                        json.dumps(window.manifest),
+                        json.dumps(window.policy),
+                        int(window.force),
+                        int(window.skip_aggregation),
+                        window.project_id,
+                    ),
+                )
+                db.query(
+                    f"UPDATE {db.table('extraction_cursors')} SET window_id=? WHERE user_id=? AND kind=? AND project_id=?",
+                    (window.window_id, user_id, window.kind, window.project_id),
+                )
+                return window
+            # Same row lock as ingestion: publication either precedes this
+            # inspection or follows this update and sets due_at=0 again.
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=?,pending_since=CASE WHEN ?=1 THEN 0 ELSE pending_since END,lease_until=0,lease_token=NULL "
+                "WHERE org_id=? AND user_id=?",
+                (next_due, int(next_due == float("inf")), self.org_id, user_id),
+            )
+            return None
+
+    def save_extraction_outcome(
+        self, window: Window, token: str, outcome: dict[str, Any]
+    ) -> None:
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            rows = db.query(
+                f"UPDATE {db.table('extraction_windows')} SET outcome=? WHERE window_id=? AND outcome IS NULL AND invalidated=0 RETURNING window_id",
+                (json.dumps(outcome), window.window_id),
+            )
+            if not rows:
+                raise WindowInputsDeletedError("Computed window is no longer valid")
+
+    def complete_extraction(
+        self, window: Window, token: str, effects: dict[str, Any]
+    ) -> None:
+        """Call after output writes INSIDE their commit_scope; failures roll back all."""
+        effects = {
+            **effects,
+            "request_ids": list(
+                dict.fromkeys(
+                    m["request_id"]
+                    for m in window.manifest
+                    if m["seq"] > window.predecessor
+                )
+            ),
+        }
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            rows = db.query(
+                f"UPDATE {db.table('extraction_cursors')} SET completed_seq=?,started=1,window_id=NULL,"
+                "attempts=0,retry_at=0,last_error=NULL,last_turn=? "
+                "WHERE user_id=? AND kind=? AND completed_seq=? AND window_id=? AND project_id=? RETURNING user_id",
+                (
+                    window.end_seq,
+                    db.now(),
+                    window.user_id,
+                    window.kind,
+                    window.predecessor,
+                    window.window_id,
+                    window.project_id,
+                ),
+            )
+            if not rows:
+                raise LeaseLostError("Extraction cursor was superseded")
+            db.query(
+                f"UPDATE {db.table('extraction_windows')} SET completed=1,effects=? WHERE window_id=?",
+                (json.dumps(effects), window.window_id),
+            )
+            # A completed window is progress, so restart a still-pending user's
+            # backlog clock -- unless a sibling cursor is failing (this cursor's
+            # attempts were reset above), which must keep aging and alarm.
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,lease_until=0,lease_token=NULL,"
+                "pending_since=CASE WHEN pending_since>0 AND NOT EXISTS ("
+                f"SELECT 1 FROM {db.table('extraction_cursors')} WHERE user_id=? AND attempts>0"
+                ") THEN ? ELSE pending_since END "
+                "WHERE org_id=? AND user_id=?",
+                (window.user_id, db.now(), self.org_id, window.user_id),
+            )
+
+    def retry_extraction(self, window: Window, token: str, error: str) -> None:
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            row = db.query(
+                f"SELECT attempts FROM {db.table('extraction_cursors')} WHERE user_id=? AND kind=? AND project_id=?",
+                (window.user_id, window.kind, window.project_id),
+            )[0]
+            attempts = int(row["attempts"]) + 1
+            due = db.now() + min(300, 2 ** min(attempts - 1, 9))
+            db.query(
+                f"UPDATE {db.table('extraction_cursors')} SET attempts=?,retry_at=?,last_error=?,last_turn=? "
+                "WHERE user_id=? AND kind=? AND project_id=?",
+                (
+                    attempts,
+                    due,
+                    error,
+                    db.now(),
+                    window.user_id,
+                    window.kind,
+                    window.project_id,
+                ),
+            )
+            # Let the sibling cursor run before the failed cursor's next retry.
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,lease_until=0,lease_token=NULL "
+                "WHERE org_id=? AND user_id=?",
+                (self.org_id, window.user_id),
+            )
+
+    def fail_extraction_input_budget(
+        self, window: Window, token: str, reason: str
+    ) -> None:
+        """Retry correctable configuration; hold capacity failures without replay."""
+        if reason not in {"input_budget_exceeded", "input_budget_configuration_error"}:
+            raise ValueError("Unknown extraction input failure reason")
+        if window.project_id != (current_project_id() or ""):
+            raise LeaseLostError("Extraction project scope changed")
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            retry_at = float("inf")
+            if reason == "input_budget_configuration_error":
+                rows = db.query(
+                    f"SELECT attempts FROM {db.table('extraction_cursors')} "
+                    "WHERE user_id=? AND kind=? AND project_id=? AND window_id=? LIMIT 1",
+                    (window.user_id, window.kind, window.project_id, window.window_id),
+                )
+                if not rows:
+                    raise LeaseLostError(
+                        "Extraction configuration retry lost its active cursor"
+                    )
+                attempts = int(rows[0]["attempts"]) + 1
+                retry_at = db.now() + min(300, 2 ** min(attempts - 1, 9))
+            updated = db.query(
+                f"UPDATE {db.table('extraction_cursors')} SET attempts=attempts+1,retry_at=?,last_error=?,last_turn=? "
+                "WHERE user_id=? AND kind=? AND project_id=? AND window_id=? AND EXISTS ("
+                f"SELECT 1 FROM {db.table('extraction_windows')} w WHERE w.window_id=? AND w.completed=0 AND w.invalidated=0) "
+                "RETURNING window_id",
+                (
+                    retry_at,
+                    reason,
+                    db.now(),
+                    window.user_id,
+                    window.kind,
+                    window.project_id,
+                    window.window_id,
+                    window.window_id,
+                ),
+            )
+            if not updated:
+                raise LeaseLostError("Extraction input failure lost its active window")
+            # Keep saved outputs and quota. Configuration retries cannot reset
+            # frozen source/policy contracts; an unchanged mismatch stays failed.
+            db.query(
+                f"UPDATE {db.table('_agent_runs')} SET status='failed',last_error=?,updated_at=? "
+                "WHERE id=? AND org_id=? AND user_id=? AND status IN ('running','agent_completed','failed')",
+                (
+                    reason,
+                    datetime.fromtimestamp(db.now(), UTC).isoformat(),
+                    f"window:{window.window_id}",
+                    self.org_id,
+                    window.user_id,
+                ),
+            )
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,lease_until=0,lease_token=NULL "
+                "WHERE org_id=? AND user_id=?",
+                (self.org_id, window.user_id),
+            )
+
+    def suspend_extraction(self, window: Window, token: str) -> None:
+        """Yield saved work without advancing coverage or counting a failure."""
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            if window.project_id != (current_project_id() or ""):
+                raise OverflowCheckpointConflictError(
+                    "Extraction project scope changed"
+                )
+            rows = db.query(
+                f"UPDATE {db.table('extraction_cursors')} SET retry_at=?,last_turn=? "
+                "WHERE user_id=? AND kind=? AND project_id=? AND window_id=? RETURNING user_id",
+                (
+                    db.now() + 5,
+                    db.now(),
+                    window.user_id,
+                    window.kind,
+                    window.project_id,
+                    window.window_id,
+                ),
+            )
+            if not rows:
+                raise OverflowCheckpointConflictError(
+                    "Extraction window is no longer active"
+                )
+            # Sibling cursors may proceed while this one yields. Releasing the
+            # lease also prevents a late timed-out thread reserving another call.
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,lease_until=0,lease_token=NULL "
+                "WHERE org_id=? AND user_id=? AND lease_token=?",
+                (self.org_id, window.user_id, token),
+            )
+
+    def _request_admission(
+        self, db: StreamSQL, user_id: str, request_id: str
+    ) -> dict[str, Any] | None:
+        rows = db.query(
+            f"SELECT learning_admission FROM {db.table('requests')} WHERE user_id=? AND request_id=?",
+            (user_id, request_id),
+        )
+        return decoded(rows[0]["learning_admission"]) if rows else None
+
+    def extraction_report(
+        self, user_id: str, request_id: str
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """Read status and counts using one connection and admission lookup.
+
+        Reporting remains post-commit and best-effort. This shares work, not a
+        repeatable-read snapshot: extraction can advance between statements.
+        """
+        with self._stream_sql(read_only=True) as db:
+            snapshot = self._coverage_snapshot(db, user_id, request_id)
+            return (
+                self._extraction_status(db, user_id, snapshot),
+                self._extraction_counts(db, user_id, request_id, snapshot.admission),
+            )
+
+    def extraction_status(self, user_id: str, request_id: str) -> dict[str, Any]:
+        with self._stream_sql(read_only=True) as db:
+            return self._extraction_status(
+                db,
+                user_id,
+                self._coverage_snapshot(db, user_id, request_id),
+            )
+
+    def _coverage_snapshot(
+        self, db: StreamSQL, user_id: str, request_id: str
+    ) -> CoverageSnapshot:
+        admission = self._request_admission(db, user_id, request_id)
+        if admission is None:
+            return CoverageSnapshot(None, None, [], None, None)
+        surviving = db.query(
+            f"SELECT MAX(ingestion_seq) AS end_seq FROM {db.table('interactions')} WHERE user_id=? AND request_id=?",
+            (user_id, request_id),
+        )[0]["end_seq"]
+        if surviving is None:
+            return CoverageSnapshot(admission, None, [], None, None)
+        cursors = db.query(
+            f"SELECT kind,completed_seq,retry_at,window_id,project_id,started,last_error FROM {db.table('extraction_cursors')} WHERE user_id=? AND project_id=?",
+            (user_id, current_project_id() or ""),
+        )
+        # Portable backends retain lazy clock/lease reads. Remote overrides can
+        # supply both values with their consolidated snapshot statement.
+        return CoverageSnapshot(admission, surviving, cursors, None, None)
+
+    def _coverage_ready(
+        self, db: StreamSQL, user_id: str, cursor: dict[str, Any]
+    ) -> bool:
+        return self._select(db, user_id, cursor["kind"], cursor)[0] is not None
+
+    def _extraction_status(
+        self, db: StreamSQL, user_id: str, snapshot: CoverageSnapshot
+    ) -> dict[str, Any]:
+        admission, surviving = snapshot.admission, snapshot.surviving
+        if admission is None:
+            return {"status": "not_tracked", "reason": "before_cutover"}
+        if surviving is None:
+            return {
+                "status": "done",
+                "reason": "inputs_erased"
+                if admission["max_seq"] >= admission["min_seq"]
+                else "not_applicable",
+            }
+        by_kind = {c["kind"]: c for c in snapshot.cursors}
+        required = [kind for kind in KINDS if admission.get(kind, {}).get("eligible")]
+        missing = [kind for kind in required if kind not in by_kind]
+        if missing:
+            return {"status": "pending", "reason": "cursor_unavailable"}
+        pending = [
+            by_kind[kind]
+            for kind in required
+            if int(by_kind[kind]["completed_seq"]) < int(surviving)
+        ]
+        if not pending:
+            return {
+                "status": "done",
+                "reason": "covered" if required else "not_applicable",
+            }
+        for cursor in pending:
+            if cursor.get("last_error") in {
+                "input_budget_exceeded",
+                "input_budget_configuration_error",
+            }:
+                return {"status": "failed", "reason": cursor["last_error"]}
+        now = snapshot.now if snapshot.now is not None else db.now()
+        if any(c["retry_at"] > now for c in pending):
+            return {"status": "pending", "reason": "retrying"}
+        lease_until = snapshot.lease_until
+        if lease_until is None:
+            work = db.query(
+                f"SELECT lease_until FROM {db.table('learning_work')} WHERE org_id=? AND user_id=?",
+                (self.org_id, user_id),
+            )
+            lease_until = work[0]["lease_until"] if work else 0
+        if any(c["window_id"] for c in pending) and lease_until > now:
+            return {"status": "processing", "reason": "extracting"}
+        if any(c["window_id"] or self._coverage_ready(db, user_id, c) for c in pending):
+            return {"status": "pending", "reason": "queued"}
+        return {"status": "pending", "reason": "waiting_for_window"}
+
+    def list_extraction_orgs(self) -> list[str]:
+        with self._stream_sql(read_only=True, coordination=True) as db:
+            now = db.now()
+            return [
+                row["org_id"]
+                for row in db.query(
+                    f"SELECT DISTINCT org_id FROM {db.table('learning_work')} WHERE due_at<=? AND lease_until<=? ORDER BY org_id",
+                    (now, now),
+                )
+            ]
+
+    def oldest_extraction_backlog_age(self) -> float | None:
+        """Seconds the longest-stalled user has had work pending without progress.
+
+        ``pending_since`` is set by the first admission after a drain, restarted
+        by every completed window (``complete_extraction``), and cleared when
+        nothing is left. Measuring "since the queue was last empty" instead
+        alarmed on any user who publishes faster than the queue ever drains.
+
+        Non-goals: a user who progresses but falls further behind does not age
+        here; a failing sibling cursor blocks the restart only within the
+        project scope the completion runs under.
+
+        Returns:
+            float | None: The age in seconds, or None when no work is pending.
+        """
+        with self._stream_sql(read_only=True, coordination=True) as db:
+            first = db.query(
+                f"SELECT MIN(pending_since) AS oldest FROM {db.table('learning_work')} WHERE pending_since>0"
+            )[0]["oldest"]
+            return max(0, db.now() - float(first)) if first is not None else None
+
+    def pending_extraction_effects(
+        self, limit: int = 1, *, user_id: str | None = None, token: str | None = None
+    ) -> list[tuple[Window, dict[str, Any]]]:
+        with self._stream_sql(discovery=True) as db:
+            if token is not None and user_id is not None:
+                self._fence(db, user_id, token)
+            return [
+                (Window.from_row(row), decoded(row["effects"]))
+                for row in db.query(
+                    f"SELECT * FROM {db.table('extraction_windows')} WHERE completed=1 AND effects_done=0 AND effects_retry_at<=? AND (? IS NULL OR user_id=?) LIMIT ?",
+                    (db.now(), user_id, user_id, limit),
+                )
+            ]
+
+    def claim_extraction_derived(self, window: Window, token: str) -> bool:
+        """At-most-once handoff to the existing best-effort derived schedulers.
+
+        Billing and run finalization must succeed first. A subsequent ack/retry
+        cannot reschedule a winner's optimization, aggregation or tagging.
+        """
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            return bool(
+                db.query(
+                    f"UPDATE {db.table('extraction_windows')} SET derived_claimed=1 WHERE window_id=? AND completed=1 AND derived_claimed=0 RETURNING window_id",
+                    (window.window_id,),
+                )
+            )
+
+    def ack_extraction_effects(
+        self, window_id: str, *, user_id: str | None = None, token: str | None = None
+    ) -> None:
+        with self._stream_sql() as db:
+            if token is not None and user_id is not None:
+                self._fence(db, user_id, token)
+            rows = db.query(
+                f"SELECT effects FROM {db.table('extraction_windows')} WHERE window_id=?",
+                (window_id,),
+            )
+            if rows:
+                effects = decoded(rows[0]["effects"]) or {}
+                summary = {
+                    "version": 1,
+                    "skipped": True,
+                    "billing": effects.get("billing"),
+                    "request_ids": effects.get("request_ids", []),
+                }
+                db.query(
+                    f"UPDATE {db.table('extraction_windows')} SET effects_done=1,outcome=NULL,effects=?,manifest='[]' WHERE window_id=?",
+                    (json.dumps(summary), window_id),
+                )
+
+    def invalidate_extraction(self, window: Window, token: str) -> None:
+        """Explicit erasure invalidates compute; surviving inputs are selected anew."""
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            runs = db.query(
+                f"SELECT generation_request_snapshot FROM {db.table('_agent_runs')} "
+                "WHERE id=? AND org_id=? AND user_id=?" + db.lock(),
+                (f"window:{window.window_id}", self.org_id, window.user_id),
+            )
+            if runs:
+                snapshot = decoded(runs[0]["generation_request_snapshot"])
+                manifest = snapshot.get("overflow")
+                if isinstance(manifest, dict):
+                    # Cancellation must remove staged customer quotations and
+                    # continuations, not merely make them undispatchable. Keep
+                    # consumed quota/observed usage as content-free audit data.
+                    manifest["checkpoint"] = {"stage": "invalidated"}
+                    db.query(
+                        f"UPDATE {db.table('_agent_runs')} SET generation_request_snapshot=?,"
+                        "service_config_snapshot='{}',agent_context_snapshot='',committed_output=NULL "
+                        "WHERE id=? AND org_id=? AND user_id=? AND status!='finalized'",
+                        (
+                            json.dumps(snapshot, separators=(",", ":")),
+                            f"window:{window.window_id}",
+                            self.org_id,
+                            window.user_id,
+                        ),
+                    )
+            db.query(
+                f"UPDATE {db.table('extraction_cursors')} SET window_id=NULL WHERE window_id=?",
+                (window.window_id,),
+            )
+            db.query(
+                f"UPDATE {db.table('_agent_runs')} SET status='cancelled',"
+                "claimed_by=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=? AND status NOT IN ('finalized','cancelled','expired')",
+                (f"window:{window.window_id}",),
+            )
+            db.query(
+                f"DELETE FROM {db.table('extraction_windows')} WHERE window_id=? AND completed=0",
+                (window.window_id,),
+            )
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=0,lease_until=0,lease_token=NULL WHERE org_id=? AND user_id=?",
+                (self.org_id, window.user_id),
+            )
+
+    def retry_extraction_effects(self, window: Window) -> None:
+        with self._stream_sql() as db:
+            due = db.now() + 5
+            db.query(
+                f"UPDATE {db.table('extraction_windows')} SET effects_retry_at=? WHERE window_id=?",
+                (due, window.window_id),
+            )
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=MIN(due_at,?) WHERE org_id=? AND user_id=?",
+                (due, self.org_id, window.user_id),
+            )
+
+    def extraction_counts(self, user_id: str, request_id: str) -> dict[str, int]:
+        with self._stream_sql(read_only=True) as db:
+            return self._extraction_counts(
+                db,
+                user_id,
+                request_id,
+                self._request_admission(db, user_id, request_id),
+            )
+
+    def _extraction_counts(
+        self,
+        db: StreamSQL,
+        user_id: str,
+        request_id: str,
+        admission: dict[str, Any] | None,
+    ) -> dict[str, int]:
+        result = {"profile": 0, "playbook": 0}
+        if admission is None:
+            return result
+        after = ""
+        while True:
+            rows = db.query(
+                f"SELECT window_id,kind,effects FROM {db.table('extraction_windows')} "
+                "WHERE user_id=? AND project_id=? AND completed=1 AND predecessor<? AND end_seq>=? "
+                "AND window_id>? ORDER BY window_id LIMIT 200",
+                (
+                    user_id,
+                    current_project_id() or "",
+                    admission["max_seq"],
+                    admission["min_seq"],
+                    after,
+                ),
+            )
+            if not rows:
+                return result
+            for row in rows:
+                effect = decoded(row["effects"])
+                if (
+                    effect
+                    and effect.get("billing")
+                    and request_id in effect.get("request_ids", [])
+                    and admission.get(row["kind"], {}).get("eligible")
+                ):
+                    result[row["kind"]] += len(effect["billing"]["ids"])
+            # StreamSQL executes native SQL (never PostgREST), so LIMIT 200
+            # cannot be shortened by an HTTP server row cap.
+            if len(rows) < 200:
+                return result
+            after = rows[-1]["window_id"]
+
+    def filter_extraction_retention(
+        self, target: str, keys: list[tuple[Any, ...]]
+    ) -> list[tuple[Any, ...]]:
+        """Keep unfinished inputs and the last complete overlap context.
+
+        Only ordinary row-count retention calls this. Explicit deletion never
+        does; the window executor revalidates its manifest before committing.
+        """
+        if target not in {"interactions", "requests"}:
+            return keys
+        with self._stream_sql(read_only=True) as db:
+            floors: dict[str, int] = {}
+            for cursor in db.query(f"SELECT * FROM {db.table('extraction_cursors')}"):
+                user, kind, project = (
+                    cursor["user_id"],
+                    cursor["kind"],
+                    cursor["project_id"],
+                )
+                first = self._inputs(db, user, kind, 0, 1, project_id=project)
+                if not first:
+                    continue
+                after = int(cursor["completed_seq"])
+                floor = int(first[0]["ingestion_seq"])
+                if after:
+                    receipt = db.query(
+                        f"SELECT policy FROM {db.table('extraction_windows')} WHERE user_id=? AND kind=? AND project_id=? AND end_seq=? AND completed=1",
+                        (user, kind, project, after),
+                    )
+                    if receipt:
+                        width = int(decoded(receipt[0]["policy"])["window_size"])
+                        context = self._inputs(
+                            db,
+                            user,
+                            kind,
+                            after,
+                            width,
+                            project_id=project,
+                            context=True,
+                        )
+                        if context:
+                            floor = int(context[0]["ingestion_seq"])
+                floors[user] = min(floors.get(user, floor), floor)
+            protected = set()
+            for row in db.query(
+                f"SELECT manifest FROM {db.table('extraction_windows')} WHERE completed=0 OR effects_done=0"
+            ):
+                for item in decoded(row["manifest"]):
+                    protected.add(
+                        item["interaction_id"]
+                        if target == "interactions"
+                        else item["request_id"]
+                    )
+            id_column = "interaction_id" if target == "interactions" else "request_id"
+            # Bounded chunks keep parameter counts and SQL text bounded.
+            candidates = [key[0] for key in keys]
+            for offset in range(0, len(candidates), 400):
+                ids = candidates[offset : offset + 400]
+                placeholders = ",".join("?" for _ in ids)
+                for row in db.query(
+                    f"SELECT interaction_id,request_id,user_id,ingestion_seq FROM {db.table('interactions')} WHERE {id_column} IN ({placeholders})",
+                    tuple(ids),
+                ):
+                    if (
+                        row["ingestion_seq"] is not None
+                        and row["user_id"] in floors
+                        and row["ingestion_seq"] >= floors[row["user_id"]]
+                    ):
+                        protected.add(row[id_column])
+            return [key for key in keys if key[0] not in protected]
+
+    def begin_extraction_resume(
+        self, run_id: str, claimed_by: str, claimed_at: str
+    ) -> int | None:
+        """Count an actual resume attempt after its user lease is acquired.
+
+        The caller fences the user lease in the enclosing commit scope. A claim
+        lost while waiting cannot spend an attempt belonging to a new owner.
+        """
+        with self._stream_sql() as db:
+            rows = db.query(
+                f"UPDATE {db.table('_agent_runs')} SET resume_attempts=resume_attempts+1 "
+                "WHERE id=? AND status='resuming' AND claimed_by=? AND claimed_at=? "
+                "RETURNING resume_attempts",
+                (run_id, claimed_by, claimed_at),
+            )
+            return int(rows[0]["resume_attempts"]) if rows else None
+
+    def defer_extraction_resume(
+        self,
+        run_id: str,
+        claimed_by: str,
+        claimed_at: str,
+        attempt_count: int,
+        next_resume_at: str,
+    ) -> bool:
+        """Refund one infrastructure deferral under the same fenced user lease.
+
+        Claim, status and attempt checks prevent stale owners or repeated calls
+        from refunding another execution attempt. No agent output is discarded.
+        """
+        with self._stream_sql() as db:
+            rows = db.query(
+                f"UPDATE {db.table('_agent_runs')} SET resume_attempts=resume_attempts-1, "
+                "status='resume_ready', next_resume_at=?, updated_at=?, last_error='ReadinessUnavailableError' "
+                "WHERE id=? AND status='resuming' AND claimed_by=? AND claimed_at=? "
+                "AND resume_attempts=? AND resume_attempts>0 RETURNING id",
+                (
+                    next_resume_at,
+                    datetime.now(UTC).isoformat(),
+                    run_id,
+                    claimed_by,
+                    claimed_at,
+                    attempt_count,
+                ),
+            )
+            return bool(rows)
+
+    def claim_user_extraction(
+        self, user_id: str, owner: str, seconds: int
+    ) -> str | None:
+        """Manual/resume operations share automatic extraction's user lease."""
+        with self._stream_sql() as db:
+            self.lock_extraction_stream(user_id)
+            token = uuid.uuid4().hex
+            now = db.now()
+            rows = db.query(
+                f"UPDATE {db.table('learning_work')} SET lease_token=?,lease_owner=?,lease_until=? "
+                "WHERE org_id=? AND user_id=? AND lease_until<=? RETURNING user_id",
+                (token, owner, now + seconds, self.org_id, user_id, now),
+            )
+            return token if rows else None
+
+    def release_user_extraction(self, user_id: str, token: str) -> None:
+        with self._stream_sql(coordination=True) as db:
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET lease_token=NULL,lease_until=0 "
+                "WHERE org_id=? AND user_id=? AND lease_token=?",
+                (self.org_id, user_id, token),
+            )
+
+    def defer_extraction_setup(self, user_id: str, token: str) -> None:
+        with self._stream_sql(coordination=True) as db:
+            db.query(
+                f"UPDATE {db.table('learning_work')} SET due_at=? "
+                "WHERE org_id=? AND user_id=? AND lease_token=?",
+                (db.now() + 5, self.org_id, user_id, token),
+            )
+
+    def fence_user_extraction(self, user_id: str, token: str) -> None:
+        with self._stream_sql(coordination=True) as db:
+            self._fence(db, user_id, token)
+
+    def adopt_extraction_overflow(
+        self,
+        window: Window,
+        token: str,
+        *,
+        source_digest: str,
+        source_digests: dict[str, str],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Adopt verified saved output without manufacturing historical witnesses.
+
+        Caller holds commit_scope and full source locks. Original interaction
+        witnesses must already exist on the saved parent; a missing legacy
+        witness remains a refusal, never a backfill from today's source.
+        """
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            if window.project_id != (current_project_id() or ""):
+                raise OverflowCheckpointConflictError(
+                    "Extraction project scope changed"
+                )
+            windows = db.query(
+                f"SELECT completed,invalidated FROM {db.table('extraction_windows')} "
+                "WHERE window_id=? AND user_id=? AND kind=? AND project_id=?"
+                + db.lock(),
+                (window.window_id, window.user_id, window.kind, window.project_id),
+            )
+            if not windows or windows[0]["completed"] or windows[0]["invalidated"]:
+                raise WindowInputsDeletedError(
+                    "Extraction coordinator is no longer active"
+                )
+            rows = db.query(
+                f"SELECT generation_request_snapshot,status,committed_output,request_id,agent_version FROM {db.table('_agent_runs')} "
+                "WHERE id=? AND org_id=? AND user_id=? AND extractor_kind=?"
+                + db.lock(),
+                (
+                    f"window:{window.window_id}",
+                    self.org_id,
+                    window.user_id,
+                    window.kind,
+                ),
+            )
+            if not rows:
+                raise OverflowCheckpointConflictError(
+                    "Saved extraction parent is unavailable"
+                )
+            snapshot = decoded(rows[0]["generation_request_snapshot"])
+            existing = snapshot.get("overflow")
+            if "overflow" in snapshot:
+                existing = validate_extraction_overflow_manifest(existing)
+                _validate_package_parent_scope(existing, self.org_id, window, rows[0])
+                if existing.get("source_digest") != source_digest:
+                    raise OverflowCheckpointConflictError(
+                        "Extraction source binding changed"
+                    )
+                if (manifest.get("version") == 2 or existing["version"] == 2) and (
+                    manifest.get("version") != existing["version"]
+                    or manifest.get("input_protocol") != existing.get("input_protocol")
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Frozen package protocol changed"
+                    )
+                return existing
+            if (
+                rows[0]["status"] != "agent_completed"
+                or rows[0]["committed_output"] is None
+                or not source_digests
+                or snapshot.get("source_interaction_digests") != source_digests
+                or snapshot.get("source_interaction_ids")
+                != [item["interaction_id"] for item in window.manifest]
+                or manifest.get("version") != 1
+                or manifest.get("source_digest") != source_digest
+                or manifest.get("revision") != 0
+                or manifest.get("attempts") != []
+                or manifest.get("attempt_limit") != 128
+            ):
+                raise OverflowCheckpointConflictError(
+                    "Saved extraction lacks matching original evidence"
+                )
+            snapshot["overflow"] = manifest
+            from reflexio.server.services.extraction.overflow_coordinator import (
+                legacy_observed_usage,
+            )
+
+            if manifest.get("legacy_observed_usage") != legacy_observed_usage(
+                decoded(rows[0]["committed_output"])
+            ):
+                raise OverflowCheckpointConflictError(
+                    "Historical observed usage changed"
+                )
+            db.query(
+                f"UPDATE {db.table('_agent_runs')} SET generation_request_snapshot=? WHERE id=? AND org_id=? AND user_id=?",
+                (
+                    json.dumps(snapshot, separators=(",", ":")),
+                    f"window:{window.window_id}",
+                    self.org_id,
+                    window.user_id,
+                ),
+            )
+            return manifest
+
+    def _load_locked_extraction_overflow(
+        self,
+        db: StreamSQL,
+        window: Window,
+        token: str,
+        *,
+        expected_revision: int,
+        source_digest: str,
+        expected_input_protocol: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """One authority check shared by mutation and cache-only validation."""
+        self._fence(db, window.user_id, token)
+        if window.project_id != (current_project_id() or ""):
+            raise OverflowCheckpointConflictError("Extraction project scope changed")
+        windows = db.query(
+            f"SELECT invalidated,completed FROM {db.table('extraction_windows')} "
+            "WHERE window_id=? AND user_id=? AND kind=? AND project_id=?" + db.lock(),
+            (window.window_id, window.user_id, window.kind, window.project_id),
+        )
+        if not windows or windows[0]["invalidated"] or windows[0]["completed"]:
+            raise WindowInputsDeletedError("Extraction coordinator is no longer active")
+        run_id = f"window:{window.window_id}"
+        rows = db.query(
+            f"SELECT generation_request_snapshot,status,request_id,agent_version FROM {db.table('_agent_runs')} "
+            "WHERE id=? AND org_id=? AND user_id=? AND extractor_kind=?" + db.lock(),
+            (run_id, self.org_id, window.user_id, window.kind),
+        )
+        if not rows or rows[0]["status"] in ("cancelled", "expired", "finalized"):
+            raise OverflowCheckpointConflictError(
+                "Extraction coordinator is unavailable"
+            )
+        snapshot = decoded(rows[0]["generation_request_snapshot"])
+        manifest = validate_extraction_overflow_manifest(snapshot.get("overflow"))
+        _validate_package_parent_scope(manifest, self.org_id, window, rows[0])
+        if (
+            manifest.get("revision") != expected_revision
+            or manifest.get("source_digest") != source_digest
+            or (
+                manifest["version"] == 2
+                and manifest["input_protocol"] != expected_input_protocol
+            )
+            or (manifest["version"] == 1 and expected_input_protocol is not None)
+        ):
+            raise OverflowCheckpointConflictError(
+                "Extraction checkpoint binding changed"
+            )
+        return run_id, snapshot, manifest
+
+    def validate_extraction_overflow(
+        self,
+        window: Window,
+        token: str,
+        *,
+        expected_revision: int,
+        source_digest: str,
+        expected_input_protocol: dict[str, Any] | None = None,
+    ) -> None:
+        """Lock and validate current parent authority without changing its ledger.
+
+        Use inside the caller's short commit scope alongside input validation.
+        Cached and passthrough work obey the same active window, project, parent
+        status and immutable descriptor/revision checks as paid reservations.
+        """
+        with self._stream_sql() as db:
+            self._load_locked_extraction_overflow(
+                db,
+                window,
+                token,
+                expected_revision=expected_revision,
+                source_digest=source_digest,
+                expected_input_protocol=expected_input_protocol,
+            )
+
+    def checkpoint_extraction_overflow(
+        self,
+        window: Window,
+        token: str,
+        *,
+        expected_revision: int,
+        source_digest: str,
+        expected_input_protocol: dict[str, Any] | None = None,
+        checkpoint: dict[str, Any] | None = None,
+        reserve_attempt_id: str | None = None,
+        reserve_attempt_stage: str | None = None,
+        minimum_remaining_attempts: int = 0,
+        observed_attempt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically advance one scoped coordinator without refunding quota.
+
+        The initial manifest is captured when the existing window agent-run is
+        created. Only this method changes its checkpoint/attempt journal. A
+        reservation is durable before provider dispatch; a crash leaves its
+        usage unknown and never makes that attempt available again.
+        """
+        with self._stream_sql() as db:
+            run_id, snapshot, manifest = self._load_locked_extraction_overflow(
+                db,
+                window,
+                token,
+                expected_revision=expected_revision,
+                source_digest=source_digest,
+                expected_input_protocol=expected_input_protocol,
+            )
+            attempts = manifest["attempts"]
+            if manifest["version"] == 1 and (
+                reserve_attempt_stage is not None or minimum_remaining_attempts != 0
+            ):
+                raise OverflowCheckpointConflictError(
+                    "Legacy attempt attribution changed"
+                )
+            if reserve_attempt_id is None and (
+                reserve_attempt_stage is not None or minimum_remaining_attempts != 0
+            ):
+                raise OverflowCheckpointConflictError(
+                    "Stage budget lacks a reservation"
+                )
+            if reserve_attempt_id is not None:
+                if not reserve_attempt_id or any(
+                    a["id"] == reserve_attempt_id for a in attempts
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Provider attempt identity already reserved"
+                    )
+                if len(attempts) >= manifest["attempt_limit"]:
+                    raise OverflowAttemptBudgetExceededError(
+                        "Extraction provider attempt budget exhausted"
+                    )
+                attempt_record = {
+                    "id": reserve_attempt_id,
+                    "usage": None,
+                    "model_provenance": None,
+                }
+                attempt_record.update(
+                    _package_attempt_stage(
+                        manifest, reserve_attempt_stage, minimum_remaining_attempts
+                    )
+                )
+                attempts.append(attempt_record)
+            if observed_attempt is not None:
+                matches = [a for a in attempts if a["id"] == observed_attempt.get("id")]
+                if len(matches) != 1:
+                    raise OverflowCheckpointConflictError(
+                        "Provider usage lacks a reservation"
+                    )
+                attempt = matches[0]
+                if (
+                    manifest["version"] == 2
+                    and "stage" in observed_attempt
+                    and observed_attempt["stage"] != attempt["stage"]
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Provider attempt stage is immutable"
+                    )
+                usage = observed_attempt.get("usage")
+                if not isinstance(usage, dict):
+                    raise ValueError("Invalid provider usage observation")
+                provenance = observed_attempt.get("model_provenance")
+                if attempt["usage"] is not None and (
+                    attempt["usage"] != usage
+                    or attempt["model_provenance"] != provenance
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Observed provider usage is immutable"
+                    )
+                attempt["usage"], attempt["model_provenance"] = usage, provenance
+            if checkpoint is not None:
+                validate_extraction_overflow_manifest(
+                    {**manifest, "checkpoint": checkpoint}
+                )
+                previous_steps = manifest.get("checkpoint", {}).get(
+                    "completed_steps", {}
+                )
+                if manifest["version"] == 2:
+                    _validate_frozen_profile_checkpoint(
+                        manifest["checkpoint"], checkpoint
+                    )
+                    previous_bindings = manifest["checkpoint"].get(
+                        "profile_attempt_bindings", {}
+                    )
+                    next_bindings = checkpoint.get("profile_attempt_bindings", {})
+                    if any(
+                        next_bindings.get(key) != value
+                        for key, value in previous_bindings.items()
+                    ):
+                        raise OverflowCheckpointConflictError(
+                            "Profile attempt binding is immutable"
+                        )
+                next_steps = checkpoint.get("completed_steps", {})
+                if (
+                    not isinstance(next_steps, dict)
+                    or len(next_steps) > 128
+                    or any(
+                        next_steps.get(key) != value
+                        for key, value in previous_steps.items()
+                    )
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Completed extraction steps cannot be changed or removed"
+                    )
+                previous_history = manifest.get("checkpoint", {}).get(
+                    "historical_chunks", {}
+                )
+                next_history = checkpoint.get("historical_chunks", {})
+                source_count = _validate_overflow_repartition(manifest, checkpoint)
+                if (
+                    not isinstance(next_history, dict)
+                    or any(
+                        next_history.get(key) != value
+                        for key, value in previous_history.items()
+                    )
+                    or any(
+                        not isinstance(value, list) for value in next_history.values()
+                    )
+                    or source_count + sum(map(len, next_history.values())) > 48
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Historical coverage cannot be changed, removed or exceed chunk capacity"
+                    )
+                schema_name = checkpoint.get("output_schema_name")
+                previous_schema = manifest.get("checkpoint", {}).get(
+                    "output_schema_name"
+                )
+                parent_schema = snapshot.get("output_schema_name")
+                if (
+                    (previous_schema is not None and schema_name != previous_schema)
+                    or (
+                        schema_name is not None
+                        and (not isinstance(schema_name, str) or not schema_name)
+                    )
+                    or (
+                        schema_name is not None
+                        and parent_schema is not None
+                        and schema_name != parent_schema
+                    )
+                ):
+                    raise OverflowCheckpointConflictError(
+                        "Extraction output schema is immutable"
+                    )
+                if schema_name is not None:
+                    snapshot["output_schema_name"] = schema_name
+                manifest["checkpoint"] = checkpoint
+            validate_extraction_overflow_manifest(manifest)
+            manifest["revision"] += 1
+            db.query(
+                f"UPDATE {db.table('_agent_runs')} SET generation_request_snapshot=? WHERE id=? AND org_id=? AND user_id=?",
+                (
+                    json.dumps(snapshot, separators=(",", ":")),
+                    run_id,
+                    self.org_id,
+                    window.user_id,
+                ),
+            )
+            return manifest
+
+    def validate_extraction_inputs(self, window: Window) -> None:
+        with self._stream_sql() as db:
+            expected = {m["interaction_id"]: m["seq"] for m in window.manifest}
+            placeholders = ",".join("?" for _ in expected)
+            if not expected:
+                raise WindowInputsDeletedError("Window inputs were erased")
+            rows = db.query(
+                f"SELECT i.interaction_id,i.ingestion_seq FROM {db.table('interactions')} i "
+                f"JOIN {db.table('requests')} r ON i.request_id=r.request_id AND i.user_id=r.user_id "
+                f"WHERE i.user_id=? AND {db.project_filter()} AND i.interaction_id IN ({placeholders})"
+                + db.input_lock(),
+                (window.user_id, window.project_id, *expected),
+            )
+            if {
+                row["interaction_id"]: row["ingestion_seq"] for row in rows
+            } != expected:
+                raise WindowInputsDeletedError("Window inputs were erased")
+
+    def validate_extraction_historical_playbooks(
+        self, window: Window, witnesses: dict[str, str]
+    ) -> None:
+        """Fence only the bounded historical rows actually used by this computation."""
+        from reflexio.server.llm.input_budget import InputBudgetConfigurationError
+        from reflexio.server.services.playbook.components.overflow_evidence import (
+            HISTORICAL_PLAYBOOK_FIELDS,
+            historical_playbook_row_digest,
+        )
+
+        if not witnesses:
+            return
+        if len(witnesses) > 128 or window.project_id != (current_project_id() or ""):
+            raise InputBudgetConfigurationError("Historical playbook scope changed")
+        with self._stream_sql() as db:
+            placeholders = ",".join("?" for _ in witnesses)
+            rows = db.query(
+                f"SELECT {','.join(HISTORICAL_PLAYBOOK_FIELDS)} FROM {db.table('user_playbooks')} r "
+                f"WHERE user_id=? AND {db.project_filter()} AND user_playbook_id IN ({placeholders}) "
+                "AND status IS NULL AND merged_into IS NULL AND superseded_by IS NULL AND retired_at IS NULL "
+                "ORDER BY user_playbook_id" + db.lock(),
+                (
+                    window.user_id,
+                    window.project_id,
+                    *(int(key) for key in sorted(witnesses)),
+                ),
+            )
+            observed = {
+                str(row["user_playbook_id"]): historical_playbook_row_digest(row)
+                for row in rows
+            }
+            if observed != witnesses:
+                raise InputBudgetConfigurationError(
+                    "Historical playbook changed after computation"
+                )
+
+    def validate_extraction_historical_profiles(
+        self, window: Window, witnesses: dict[str, str]
+    ) -> None:
+        """Lock precisely the current OLD rows actually shown to this profile run.
+
+        All callers use sorted primary-key order. Bounded ID batches keep both
+        projections and row counts finite without truncating a frozen decision.
+        Enter the existing commit scope to retain these locks through publication.
+        """
+        from reflexio.server.llm.input_budget import InputBudgetConfigurationError
+        from reflexio.server.services.extraction.profile_package_state import (
+            PROFILE_WITNESS_FIELDS,
+            profile_row_witness,
+        )
+
+        if window.kind != "profile" or window.project_id != (
+            current_project_id() or ""
+        ):
+            raise InputBudgetConfigurationError("Historical profile scope changed")
+        if not witnesses:
+            return
+        identities = sorted(witnesses)
+        with self._stream_sql() as db:
+            now = int(db.now())
+            observed = {}
+            for start in range(0, len(identities), 128):
+                batch = identities[start : start + 128]
+                placeholders = ",".join("?" for _ in batch)
+                rows = db.query(
+                    f"SELECT {','.join(PROFILE_WITNESS_FIELDS)} FROM {db.table('profiles')} r "
+                    f"WHERE user_id=? AND {db.project_filter()} AND profile_id IN ({placeholders}) "
+                    "AND status IS NULL AND merged_into IS NULL AND superseded_by IS NULL "
+                    "AND retired_at IS NULL AND expiration_timestamp>=? "
+                    "ORDER BY profile_id LIMIT 128" + db.lock(),
+                    (window.user_id, window.project_id, *batch, now),
+                )
+                try:
+                    observed.update(
+                        {row["profile_id"]: profile_row_witness(row) for row in rows}
+                    )
+                except (KeyError, TypeError, ValueError):
+                    raise InputBudgetConfigurationError(
+                        "Historical profile is malformed"
+                    ) from None
+            if observed != witnesses:
+                raise InputBudgetConfigurationError(
+                    "Historical profile changed after computation"
+                )
+
+    def consume_extraction_answer_dependencies(
+        self, window: Window, token: str, resolved: dict[str, str]
+    ) -> dict[str, Any]:
+        """Consume only this child’s locked dependencies in its checkpoint commit."""
+        from reflexio.server.llm.input_budget import InputBudgetConfigurationError
+        from reflexio.server.services.extraction.overflow_answers import (
+            dependency_witness,
+        )
+
+        if not resolved or len(resolved) > 128:
+            raise InputBudgetConfigurationError("Extraction dependency limit changed")
+        with self._stream_sql() as db:
+            self._fence(db, window.user_id, token)
+            run_id = f"window:{window.window_id}"
+            placeholders = ",".join("?" for _ in resolved)
+            table = db.table("_run_tool_dependencies")
+            rows = db.query(
+                f"SELECT d.run_id,d.pending_tool_call_id,d.resolved_at,d.consumed_at FROM {table} d "
+                f"JOIN {db.table('_agent_runs')} r ON r.id=d.run_id "
+                f"WHERE d.run_id=? AND r.org_id=? AND {db.project_filter()} AND d.pending_tool_call_id IN ({placeholders})"
+                + db.lock(),
+                (run_id, self.org_id, window.project_id, *sorted(resolved)),
+            )
+            observed = {
+                row["pending_tool_call_id"]: dependency_witness(row) for row in rows
+            }
+            # Resolution may precede attaching a formerly pending dependency.
+            # The answer row is already locked and its exact result/time checked;
+            # fill only that missed notification, never replace a resolved witness.
+            for call_id, witness in observed.items():
+                if witness["resolved_at"] is None:
+                    db.query(
+                        f"UPDATE {table} SET resolved_at=? WHERE run_id=? AND pending_tool_call_id=? AND resolved_at IS NULL",
+                        (resolved[call_id], run_id, call_id),
+                    )
+                    witness["resolved_at"] = resolved[call_id]
+            if set(observed) != set(resolved) or any(
+                witness["consumed_at"] is not None
+                or witness["resolved_at"] != resolved[call_id]
+                for call_id, witness in observed.items()
+            ):
+                raise InputBudgetConfigurationError(
+                    "Extraction answer dependency changed"
+                )
+            consumed_at = datetime.fromtimestamp(db.now(), UTC).isoformat()
+            rows = db.query(
+                f"UPDATE {table} SET consumed_at=? WHERE run_id=? "
+                f"AND consumed_at IS NULL AND pending_tool_call_id IN ({placeholders}) "
+                "RETURNING run_id,pending_tool_call_id,resolved_at,consumed_at",
+                (consumed_at, run_id, *sorted(resolved)),
+            )
+            if len(rows) != len(resolved):
+                raise InputBudgetConfigurationError(
+                    "Extraction answer consumption lost ownership"
+                )
+            return {
+                row["pending_tool_call_id"]: dependency_witness(row) for row in rows
+            }
+
+    def validate_extraction_answer_dependencies(
+        self, window: Window, witnesses: dict[str, Any]
+    ) -> None:
+        from reflexio.server.llm.input_budget import InputBudgetConfigurationError
+        from reflexio.server.services.extraction.overflow_answers import (
+            dependency_witness,
+        )
+
+        if not witnesses:
+            return
+        if len(witnesses) > 128:
+            raise InputBudgetConfigurationError("Extraction dependency limit changed")
+        with self._stream_sql() as db:
+            placeholders = ",".join("?" for _ in witnesses)
+            rows = db.query(
+                "SELECT d.run_id,d.pending_tool_call_id,d.resolved_at,d.consumed_at "
+                f"FROM {db.table('_run_tool_dependencies')} d "
+                f"JOIN {db.table('_agent_runs')} r ON r.id=d.run_id "
+                f"WHERE d.run_id=? AND r.org_id=? AND {db.project_filter()} AND d.pending_tool_call_id IN ({placeholders})"
+                + db.lock(),
+                (
+                    f"window:{window.window_id}",
+                    self.org_id,
+                    window.project_id,
+                    *sorted(witnesses),
+                ),
+            )
+            if {
+                row["pending_tool_call_id"]: dependency_witness(row) for row in rows
+            } != witnesses:
+                raise InputBudgetConfigurationError(
+                    "Extraction answer dependency changed"
+                )
+
+    def validate_extraction_answers(self, witnesses: dict[str, Any]) -> None:
+        """Lock precisely the answers used, in the final learning transaction."""
+        from reflexio.server.llm.input_budget import InputBudgetConfigurationError
+        from reflexio.server.services.extraction.overflow_answers import (
+            ANSWER_FIELDS,
+            answer_witness,
+            require_current_answer,
+        )
+
+        if not witnesses:
+            return
+        if len(witnesses) > 128:
+            raise InputBudgetConfigurationError(
+                "Extraction answer witness limit exceeded"
+            )
+        with self._stream_sql() as db:
+            placeholders = ",".join("?" for _ in witnesses)
+            rows = db.query(
+                f"SELECT {','.join(ANSWER_FIELDS)} FROM {db.table('_pending_tool_calls')} r "
+                f"WHERE org_id=? AND {db.project_filter()} AND id IN ({placeholders})"
+                + db.lock(),
+                (self.org_id, current_project_id() or "", *sorted(witnesses)),
+            )
+            observed = {row["id"]: answer_witness(row) for row in rows}
+            if observed != witnesses:
+                raise InputBudgetConfigurationError("Extraction human answer changed")
+            now = datetime.fromtimestamp(db.now(), UTC)
+            for witness in observed.values():
+                require_current_answer(witness, self.org_id, now)
+
+    def validate_extraction_source_digest(
+        self, window: Window, source_digest: str
+    ) -> None:
+        """Compare full source content under final input locks, not just IDs.
+
+        Caller holds the short learning/window commit scope. This read is once
+        per commit attempt, never once per provider dispatch. Derived embeddings
+        and token counts are deliberately excluded from the witness.
+        """
+        with self._stream_sql() as db:
+            expected = {m["interaction_id"]: m["seq"] for m in window.manifest}
+            if not expected:
+                raise WindowInputsDeletedError("Window inputs were erased")
+            placeholders = ",".join("?" for _ in expected)
+            rows = db.query(
+                f"SELECT i.interaction_id,i.ingestion_seq,i.user_id,i.request_id,i.created_at,i.role,"
+                "i.content,i.user_action,i.user_action_description,i.interacted_image_url,i.image_encoding,"
+                "i.shadow_content,i.expert_content,i.tools_used,i.citations,i.retrieved_learnings,"
+                "r.created_at AS request_created_at,r.source AS request_source,"
+                "r.agent_version AS request_agent_version,r.session_id AS request_session_id,"
+                "r.evaluation_only AS request_evaluation_only,"
+                "r.retrieval_experiment_id AS request_retrieval_experiment_id,"
+                "r.retrieval_experiment_arm AS request_retrieval_experiment_arm "
+                f"FROM {db.table('interactions')} i JOIN {db.table('requests')} r "
+                "ON i.request_id=r.request_id AND i.user_id=r.user_id "
+                f"WHERE i.user_id=? AND {db.project_filter()} AND i.interaction_id IN ({placeholders}) "
+                "ORDER BY i.ingestion_seq" + db.input_lock(),
+                (window.user_id, window.project_id, *expected),
+            )
+            if {
+                row["interaction_id"]: row["ingestion_seq"] for row in rows
+            } != expected:
+                raise WindowInputsDeletedError("Window inputs were erased")
+            digest = hashlib.sha256()
+            for row in rows:
+                digest.update(db.source_witness_bytes(row))
+            if digest.hexdigest() != source_digest:
+                raise WindowInputsDeletedError("Extraction source content was replaced")
+
+    def cleanup_extraction_work(self, user_id: str) -> None:
+        """After erasure commits, remove the counter only if ALL scopes are gone.
+
+        Cross-project discovery is read internally; the org/user row lock also
+        serializes a concurrent new publish with this final cleanup.
+        """
+        with self._stream_sql(discovery=True) as db:
+            db.query(
+                f"SELECT user_id FROM {db.table('learning_work')} WHERE org_id=? AND user_id=?"
+                + db.lock(),
+                (self.org_id, user_id),
+            )
+            if not db.query(
+                f"SELECT user_id FROM {db.table('extraction_cursors')} WHERE user_id=? LIMIT 1",
+                (user_id,),
+            ):
+                db.query(
+                    f"DELETE FROM {db.table('learning_work')} WHERE org_id=? AND user_id=?",
+                    (self.org_id, user_id),
+                )
+
+
+def _package_attempt_stage(
+    manifest: dict[str, Any], stage: str | None, minimum_remaining: int
+) -> dict[str, str]:
+    if manifest["version"] == 1:
+        return {}
+    caps = manifest["input_protocol"]["stage_caps"]
+    if (
+        not isinstance(stage, str)
+        or stage not in caps
+        or type(minimum_remaining) is not int
+        or minimum_remaining < 0
+    ):
+        raise OverflowCheckpointConflictError("Invalid package attempt stage")
+    used = sum(attempt["stage"] == stage for attempt in manifest["attempts"])
+    if used + 1 + minimum_remaining > caps[stage]:
+        raise OverflowAttemptBudgetExceededError(
+            "Package stage attempt budget exhausted"
+        )
+    return {"stage": stage}
+
+
+def _validate_package_parent_scope(
+    manifest: dict[str, Any], org_id: str, window: Window, row: dict[str, Any]
+) -> None:
+    if manifest["version"] != 2:
+        return
+    from reflexio.server.services.extraction.overflow_protocol import (
+        validate_package_scope,
+    )
+
+    try:
+        validate_package_scope(
+            manifest,
+            {
+                "org_id": org_id,
+                "project_id": window.project_id,
+                "user_id": window.user_id,
+                "window_id": window.window_id,
+                "kind": window.kind,
+                "request_id": row["request_id"],
+                "agent_version": row["agent_version"],
+            },
+        )
+    except ValueError as exc:
+        raise OverflowCheckpointConflictError(
+            "Frozen package parent binding changed"
+        ) from exc
+
+
+def _validate_overflow_repartition(
+    manifest: dict[str, Any], checkpoint: dict[str, Any]
+) -> int:
+    original = manifest.get("chunk_digests", [])
+    previous = manifest.get("checkpoint", {}).get("repartition")
+    plan = checkpoint.get("repartition")
+    if previous is not None and plan != previous:
+        raise OverflowCheckpointConflictError(
+            "Frozen extraction repartition is immutable"
+        )
+    if plan is None:
+        return len(original)
+    if not isinstance(plan, dict):
+        raise OverflowCheckpointConflictError("Invalid extraction repartition")
+    index, digests = plan.get("chunk_index"), plan.get("chunk_digests")
+    if (
+        type(plan.get("count")) is not int
+        or plan["count"] != 1
+        or type(index) is not int
+        or not 0 <= index < len(original)
+        or type(plan.get("split_after")) is not int
+        or plan["split_after"] <= 0
+        or plan.get("original_chunk_digest") != original[index]
+        or not isinstance(digests, list)
+        or len(digests) != len(original) + 1
+        or digests[:index] != original[:index]
+        or digests[index + 2 :] != original[index + 1 :]
+        or any(not isinstance(value, str) or len(value) != 64 for value in digests)
+        or not isinstance(plan.get("rejected_request_fingerprint"), str)
+        or len(plan["rejected_request_fingerprint"]) != 64
+        or not any(
+            attempt["id"] == plan.get("rejected_attempt_id")
+            for attempt in manifest["attempts"]
+        )
+    ):
+        raise OverflowCheckpointConflictError("Invalid frozen extraction source plan")
+    return len(digests)

@@ -1,0 +1,1026 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Literal, Self
+
+from pydantic import BaseModel, Field, model_validator
+
+from ..config_schema import RetrievalExperimentRecord, SearchMode
+from ..structured_output import StrictStructuredOutput
+from .domain import CitationKind
+from .service_schemas import (
+    AgentPlaybook,
+    AgentSuccessEvaluationResult,
+    Interaction,
+    PlaybookStatus,
+    Request,
+    RetrievedLearningEvaluationResult,
+    Status,
+    UserPlaybook,
+    UserProfile,
+)
+from .ui.entities import (
+    AgentPlaybookView,
+    EvaluationResultView,
+    InteractionView,
+    ProfileChangeLogView,
+    ProfileView,
+    UserPlaybookView,
+)
+from .validators import (
+    NonEmptyStr,
+    SessionOutcomeSource,
+    TimeRangeValidatorMixin,
+)
+
+
+class SearchInteractionRequest(BaseModel):
+    user_id: NonEmptyStr
+    request_id: str | None = None
+    query: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    top_k: int | None = Field(default=None, gt=0)
+    most_recent_k: int | None = Field(default=None, gt=0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    search_mode: SearchMode = SearchMode.HYBRID
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class SearchUserProfileRequest(BaseModel):
+    user_id: NonEmptyStr
+    generated_from_request_id: str | None = None
+    # Caller correlation IDs for billing attribution on the Application line.
+    # Optional; when populated they flow into the usage event request_id /
+    # session_id columns via _meter_applied_learnings in server/api.py.
+    request_id: str | None = None
+    session_id: str | None = None
+    query: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    top_k: int | None = Field(default=10, gt=0)
+    source: SessionOutcomeSource | None = None
+    custom_feature: str | None = None
+    extractor_name: str | None = (
+        None  # Deprecated compatibility field; accepted but ignored.
+    )
+    tags: list[str] | None = None
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    enable_reformulation: bool | None = False
+    search_mode: SearchMode = SearchMode.HYBRID
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class SearchInteractionResponse(BaseModel):
+    success: bool
+    interactions: list[Interaction]
+    msg: str | None = None
+
+
+class SearchUserProfileResponse(BaseModel):
+    success: bool
+    user_profiles: list[UserProfile]
+    msg: str | None = None
+
+
+class RerankUserProfilesRequest(BaseModel):
+    """Cross-encoder rerank for a list of profile ids.
+
+    Use after ``search_user_profiles`` (or any other source of candidate ids)
+    when initial results are noisy. The server fetches each candidate's full
+    content, scores ``(query, content)`` pairs with a cross-encoder, and
+    returns the top_k profiles sorted by descending score.
+
+    Args:
+        user_id (str): The user whose profiles to rerank.
+        query (str): The reranking query.
+        profile_ids (list[str]): Candidate profile ids; ids that don't belong
+            to ``user_id`` (or don't exist) are silently dropped.
+        top_k (int): Maximum number of profiles to return. Defaults to 10.
+    """
+
+    user_id: NonEmptyStr
+    query: NonEmptyStr
+    profile_ids: list[str]
+    top_k: int = Field(default=10, gt=0)
+
+
+class RerankUserProfilesResponse(BaseModel):
+    """Response from :class:`RerankUserProfilesRequest`.
+
+    Args:
+        success (bool): Whether the rerank call succeeded.
+        user_profiles (list[UserProfile]): Profiles sorted by descending
+            cross-encoder score, capped at ``top_k``.
+        msg (str, optional): Diagnostic message (e.g. how many ids were
+            silently dropped because they didn't resolve).
+    """
+
+    success: bool
+    user_profiles: list[UserProfile]
+    msg: str | None = None
+
+
+class StorageStatsRequest(BaseModel):
+    """Request lightweight metadata about a user's stored profiles + playbooks.
+
+    Useful before deciding ``top_k`` for retrieval — sized counts and
+    timestamp ranges let the agent pick a sensible cap rather than a fixed
+    constant.
+
+    Args:
+        user_id (str): The user to inspect.
+    """
+
+    user_id: NonEmptyStr
+
+
+class StorageStatsResponse(BaseModel):
+    """Response from :class:`StorageStatsRequest`.
+
+    Args:
+        profile_count (int): Total number of profiles for the user across
+            all statuses.
+        playbook_count (int): Total number of user playbooks for the user
+            across all statuses.
+        oldest_profile_modified (datetime, optional): UTC timestamp of the
+            oldest profile's ``last_modified_timestamp``; None when the user
+            has no profiles.
+        newest_profile_modified (datetime, optional): UTC timestamp of the
+            newest profile's ``last_modified_timestamp``; None when the user
+            has no profiles.
+        success (bool): Whether the lookup succeeded.
+        msg (str, optional): Diagnostic message.
+    """
+
+    profile_count: int = Field(default=0, ge=0)
+    playbook_count: int = Field(default=0, ge=0)
+    oldest_profile_modified: datetime | None = None
+    newest_profile_modified: datetime | None = None
+    success: bool
+    msg: str | None = None
+
+
+class GetInteractionsRequest(BaseModel):
+    user_id: NonEmptyStr
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    top_k: int | None = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetInteractionsResponse(BaseModel):
+    success: bool
+    interactions: list[Interaction]
+    msg: str | None = None
+
+
+class GetUserProfilesRequest(BaseModel):
+    user_id: NonEmptyStr
+    profile_id: str | None = None
+    query: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    top_k: int | None = Field(default=30, gt=0)
+    source: SessionOutcomeSource | None = None
+    profile_time_to_live: str | None = None
+    status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetUserProfilesResponse(BaseModel):
+    success: bool
+    user_profiles: list[UserProfile]
+    msg: str | None = None
+
+
+class GetProfileStatisticsResponse(BaseModel):
+    success: bool
+    current_count: int = 0
+    pending_count: int = 0
+    archived_count: int = 0
+    expiring_soon_count: int = 0
+    msg: str | None = None
+
+
+class SetConfigResponse(BaseModel):
+    success: bool
+    msg: str | None = None
+
+
+class GetUserPlaybooksRequest(BaseModel):
+    limit: int | None = Field(default=100, gt=0)
+    user_playbook_id: int | None = Field(default=None, gt=0)
+    user_id: str | None = None
+    request_id: str | None = None
+    query: str | None = None
+    playbook_name: str | None = None
+    agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetUserPlaybooksResponse(BaseModel):
+    success: bool
+    user_playbooks: list[UserPlaybook]
+    msg: str | None = None
+
+
+class GetAgentPlaybooksRequest(BaseModel):
+    limit: int | None = Field(default=100, gt=0)
+    agent_playbook_id: int | None = Field(default=None, gt=0)
+    query: str | None = None
+    playbook_name: str | None = None
+    agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    status_filter: list[Status | None] | None = None
+    playbook_status_filter: PlaybookStatus | None = None
+    tags: list[str] | None = None
+    # Caller correlation IDs for billing attribution on the Application line.
+    # Optional; consumed by _meter_applied_learnings in server/api.py.
+    request_id: str | None = None
+    session_id: str | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetAgentPlaybooksResponse(BaseModel):
+    success: bool
+    agent_playbooks: list[AgentPlaybook]
+    msg: str | None = None
+
+
+class GetLearningProvenanceRequest(BaseModel):
+    kind: Literal["profile", "user_playbook", "agent_playbook"]
+    id: str
+
+
+class SourceUserPlaybookProvenanceView(BaseModel):
+    user_playbook: UserPlaybookView
+    interactions: list[InteractionView] = Field(default_factory=list)
+    source_interaction_ids: list[int] = Field(default_factory=list)
+
+
+class LearningProvenanceViewResponse(BaseModel):
+    success: bool
+    target_kind: Literal["profile", "user_playbook", "agent_playbook"]
+    target_id: str
+    provenance_status: Literal["exact", "best_effort", "unavailable"] = "unavailable"
+    trigger_request_id: str | None = None
+    interactions: list[InteractionView] = Field(default_factory=list)
+    source_user_playbooks: list[SourceUserPlaybookProvenanceView] = Field(
+        default_factory=list
+    )
+    msg: str | None = None
+
+
+class SearchUserPlaybookRequest(BaseModel):
+    """Request for searching user playbooks with semantic/text search and filtering.
+
+    Args:
+        query (str, optional): Query for semantic/text search
+        user_id (str, optional): Filter by user (via request_id linkage to requests table)
+        agent_version (str, optional): Filter by agent version
+        playbook_name (str, optional): Filter by playbook name
+        source (str, optional): Filter by exact interaction source
+        start_time (datetime, optional): Start time for created_at filter
+        end_time (datetime, optional): End time for created_at filter
+        status_filter (list[Optional[Status]], optional): Filter by status (None for CURRENT, PENDING, ARCHIVED)
+        top_k (int, optional): Maximum results to return, up to 100. Defaults to 10
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
+    """
+
+    query: str | None = None
+    user_id: str | None = Field(default=None, max_length=255)
+    agent_version: str | None = None
+    playbook_name: str | None = None
+    source: SessionOutcomeSource | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    status_filter: list[Status | None] | None = None
+    tags: list[str] | None = None
+    top_k: int | None = Field(default=10, gt=0, le=100)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    enable_reformulation: bool | None = False
+    search_mode: SearchMode = SearchMode.HYBRID
+    # Caller correlation IDs for billing attribution on the Application line.
+    # Optional; consumed by _meter_applied_learnings in server/api.py.
+    request_id: str | None = Field(default=None, max_length=255)
+    session_id: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class SearchUserPlaybookResponse(BaseModel):
+    """Response for searching user playbooks.
+
+    Args:
+        success (bool): Whether the search was successful
+        user_playbooks (list[UserPlaybook]): List of matching user playbooks
+        msg (str, optional): Additional message
+    """
+
+    success: bool
+    user_playbooks: list[UserPlaybook]
+    msg: str | None = None
+
+
+class SearchAgentPlaybookRequest(BaseModel):
+    """Request for searching aggregated agent playbooks with semantic/text search and filtering.
+
+    Args:
+        query (str, optional): Query for semantic/text search
+        user_id (str, optional): User receiving the retrieved playbooks. This
+            does not filter agent playbooks; it is used for retrieval-experiment
+            assignment when an experiment is active.
+        agent_version (str, optional): Filter by agent version
+        playbook_name (str, optional): Filter by playbook name
+        source (str, optional): Match agent playbooks linked to at least one
+            user playbook with this exact source
+        start_time (datetime, optional): Start time for created_at filter
+        end_time (datetime, optional): End time for created_at filter
+        status_filter (list[Optional[Status]], optional): Filter by lifecycle status.
+            Defaults to CURRENT and PENDING when omitted.
+        playbook_status_filter (PlaybookStatus | list[PlaybookStatus], optional):
+            Filter by playbook approval status. Accepts either a single
+            ``PlaybookStatus`` (matched with ``=``) or a list (matched with
+            ``IN (...)``) so callers can request multiple approval states in
+            a single storage query without per-status fan-out. Defaults to
+            None (no status predicate).
+        top_k (int, optional): Maximum number of results to return. Defaults to 10
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
+    """
+
+    query: str | None = None
+    user_id: NonEmptyStr | None = None
+    agent_version: str | None = None
+    playbook_name: str | None = None
+    source: SessionOutcomeSource | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    status_filter: list[Status | None] | None = None
+    playbook_status_filter: PlaybookStatus | list[PlaybookStatus] | None = None
+    tags: list[str] | None = None
+    top_k: int | None = Field(default=10, gt=0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    enable_reformulation: bool | None = False
+    search_mode: SearchMode = SearchMode.HYBRID
+    # Caller correlation IDs for billing attribution on the Application line.
+    # Optional; consumed by _meter_applied_learnings in server/api.py.
+    request_id: str | None = None
+    session_id: str | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class SearchAgentPlaybookResponse(BaseModel):
+    """Response for searching aggregated agent playbooks.
+
+    Args:
+        success (bool): Whether the search was successful
+        agent_playbooks (list[AgentPlaybook]): List of matching agent playbooks
+        msg (str, optional): Additional message
+    """
+
+    success: bool
+    agent_playbooks: list[AgentPlaybook]
+    msg: str | None = None
+
+
+class GetAgentSuccessEvaluationResultsRequest(BaseModel):
+    limit: int | None = Field(default=100, gt=0)
+    agent_version: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetAgentSuccessEvaluationResultsResponse(BaseModel):
+    success: bool
+    agent_success_evaluation_results: list[AgentSuccessEvaluationResult]
+    msg: str | None = None
+
+
+class GetRetrievedLearningEvaluationResultsRequest(BaseModel):
+    """Read per-learning retrieved-learning evaluation verdicts.
+
+    Attributes:
+        user_id (str | None): Filter by session owner.
+        session_id (str | None): Filter by session.
+        start_time (datetime | None): Filter by target interaction timestamp.
+        end_time (datetime | None): Filter by target interaction timestamp.
+        limit (int): Maximum rows. Time-filtered reads group newest target
+            interactions first; otherwise rows use created_at DESC.
+    """
+
+    user_id: str | None = None
+    session_id: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    limit: int = Field(default=100, ge=1, le=1_000)
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class GetRetrievedLearningEvaluationResultsResponse(BaseModel):
+    success: bool
+    results: list[RetrievedLearningEvaluationResult] = Field(default_factory=list)
+    msg: str | None = None
+
+
+class GetRequestsRequest(BaseModel):
+    user_id: str | None = None
+    request_id: str | None = None
+    session_id: str | None = None
+    source: SessionOutcomeSource | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    top_k: int | None = Field(
+        default=30,
+        gt=0,
+        description="Maximum number of sessions to return. Pagination is "
+        "per-session: every returned session includes all of its requests.",
+    )
+    offset: int | None = Field(
+        default=0, ge=0, description="Number of sessions to skip for pagination."
+    )
+
+    @model_validator(mode="after")
+    def check_time_range(self) -> Self:
+        """Validate that end_time is after start_time."""
+        TimeRangeValidatorMixin.validate_time_range(self.start_time, self.end_time)
+        return self
+
+
+class RequestData(BaseModel):
+    request: Request
+    interactions: list[Interaction]
+
+
+class Session(BaseModel):
+    session_id: str
+    requests: list[RequestData]
+
+
+class GetRequestsResponse(BaseModel):
+    success: bool
+    sessions: list[Session]
+    has_more: bool = False
+    msg: str | None = None
+
+
+class UpdatePlaybookStatusRequest(BaseModel):
+    agent_playbook_id: int = Field(gt=0)
+    playbook_status: PlaybookStatus
+
+
+class UpdatePlaybookStatusResponse(BaseModel):
+    success: bool
+    msg: str | None = None
+
+
+class UpdateAgentPlaybookRequest(BaseModel):
+    """Generic update for an agent playbook. All fields except ID are optional."""
+
+    agent_playbook_id: int = Field(gt=0)
+    playbook_name: str | None = None
+    content: str | None = None
+    trigger: str | None = None
+    rationale: str | None = None
+    playbook_status: PlaybookStatus | None = None
+
+
+class UpdateAgentPlaybookResponse(BaseModel):
+    success: bool
+    msg: str | None = None
+
+
+class UpdateUserPlaybookRequest(BaseModel):
+    """Generic update for a user playbook. All fields except ID are optional."""
+
+    user_playbook_id: int = Field(gt=0)
+    playbook_name: str | None = None
+    content: str | None = None
+    trigger: str | None = None
+    rationale: str | None = None
+
+
+class UpdateUserPlaybookResponse(BaseModel):
+    success: bool
+    msg: str | None = None
+
+
+class UpdateUserProfileRequest(BaseModel):
+    """Partial update for an existing user profile.
+
+    Only non-None fields are applied. ``user_id`` and ``profile_id`` are
+    required; all other fields are optional, matching the UI edit flow
+    where the user typically changes ``content`` and/or ``custom_features``.
+    """
+
+    user_id: str
+    profile_id: str
+    content: str | None = None
+    custom_features: dict[str, object] | None = None
+
+
+class UpdateUserProfileResponse(BaseModel):
+    success: bool
+    msg: str | None = None
+
+
+class TimeSeriesDataPoint(BaseModel):
+    """A single data point in a time series."""
+
+    timestamp: int = Field(gt=0)  # Unix timestamp
+    value: float = Field(ge=0)  # Count or metric value
+    count: int | None = Field(default=None, ge=0)  # Optional weight for rate metrics
+
+
+class PeriodStats(BaseModel):
+    """Statistics for a specific time period."""
+
+    total_profiles: int = Field(ge=0)
+    total_interactions: int = Field(ge=0)
+    total_playbooks: int = Field(ge=0)
+    success_rate: float = Field(ge=0.0, le=100.0)  # Percentage (0-100)
+
+
+class DashboardStats(BaseModel):
+    """Comprehensive dashboard statistics including current and previous periods."""
+
+    current_period: PeriodStats
+    previous_period: PeriodStats
+    interactions_time_series: list[TimeSeriesDataPoint]
+    profiles_time_series: list[TimeSeriesDataPoint]
+    playbooks_time_series: list[TimeSeriesDataPoint]
+    evaluations_time_series: list[TimeSeriesDataPoint]  # Success rate over time
+
+
+class GetDashboardStatsRequest(BaseModel):
+    """Request for dashboard statistics.
+
+    Args:
+        days_back (int): Number of days to include in time series data. Defaults to 30.
+    """
+
+    days_back: int | None = Field(default=30, gt=0)
+
+
+class GetDashboardStatsResponse(BaseModel):
+    """Response containing dashboard statistics."""
+
+    success: bool
+    stats: DashboardStats | None = None
+    msg: str | None = None
+
+
+class PlaybookApplicationStat(BaseModel):
+    """Per-rule application stats derived from interaction citations.
+
+    Aggregates the JSON ``citations`` column on interactions to surface how
+    often each individual playbook or profile has been cited by the agent in
+    a given time window. Used by the claude-smart dashboard to show users a
+    "track record" for each rule so the impact of a learning is visible
+    rather than abstract.
+
+    Args:
+        real_id (str): Stable id of the cited item — ``user_playbook_id``,
+            ``agent_playbook_id``, or ``profile_id`` (always serialized as a
+            string).
+        kind (CitationKind): Citation kind recorded on
+            ``Interaction.citations``. ``"playbook"`` is the legacy
+            compatibility value; ``"user_playbook"`` is the explicit
+            direct-tuner target.
+        title (str): Human-readable label for the rule. Empty string when
+            the underlying row has been deleted but old citations remain.
+        applied_count (int): Number of interactions in the window whose
+            citations referenced this ``(kind, real_id)``.
+        last_applied_at (int | None): Unix epoch seconds of the most recent
+            interaction citing this rule. ``None`` when no citation matches.
+            Matches the int-epoch convention used elsewhere in the dashboard
+            (e.g. ``Interaction.created_at``).
+        last_interaction_id (int | None): ``interaction_id`` of the most
+            recent citing interaction; useful for deep-linking from the
+            dashboard.
+    """
+
+    real_id: str
+    kind: CitationKind
+    title: str = ""
+    applied_count: int = Field(ge=0)
+    last_applied_at: int | None = None
+    last_interaction_id: int | None = None
+
+
+class GetPlaybookApplicationStatsRequest(BaseModel):
+    """Request for per-rule application stats.
+
+    Args:
+        days_back (int): Look-back window in days. Defaults to 30; must be
+            positive.
+    """
+
+    days_back: int = Field(default=30, gt=0)
+
+
+class GetPlaybookApplicationStatsResponse(BaseModel):
+    """Response containing per-rule application stats.
+
+    Args:
+        success (bool): Whether the call succeeded.
+        stats (list[PlaybookApplicationStat]): One row per cited rule, sorted
+            by ``applied_count`` descending.
+        msg (str | None): Optional error message when ``success`` is False.
+    """
+
+    success: bool
+    stats: list[PlaybookApplicationStat] = Field(default_factory=list)
+    msg: str | None = None
+
+
+# ===============================
+# Query Reformulation Models
+# ===============================
+
+
+class ConversationTurn(BaseModel):
+    """A single turn in a conversation history.
+
+    Args:
+        role (str): The role of the speaker (e.g., "user", "agent")
+        content (str): The message content
+    """
+
+    role: NonEmptyStr
+    content: NonEmptyStr
+
+
+class ReformulationResult(StrictStructuredOutput):
+    """Output of the query reformulation pipeline.
+
+    Besides the rewritten query, carries the query's TEMPORAL SIGNALS so the
+    search pipeline can be time-sensitive without any additional LLM call
+    (the reformulation call already runs before retrieval when
+    ``enable_reformulation`` is set). Time windows are relative day offsets
+    (never absolute dates) so results don't rot with calendar time.
+
+    Args:
+        standalone_query (str): Clean, normalized natural language query with
+            conversation context resolved, abbreviations expanded, grammar fixed.
+        start_days_ago (float, optional): Older bound of a query time window
+            ("in the last 7 days" → 7).
+        end_days_ago (float, optional): Newer bound ("before this month" →
+            ~30, with no start bound).
+        recency_dominant (bool): The query asks for the CURRENT/LATEST value —
+            final ordering becomes timestamp-based.
+        wants_current (bool): Present-tense question about a mutable
+            fact/policy — near-duplicate competing facts collapse to the
+            freshest, while relevance ordering is otherwise preserved.
+            (Superseded/TTL-expired rows never reach results: storage search
+            excludes tombstone statuses and expired profiles at SQL level.)
+    """
+
+    standalone_query: str
+    start_days_ago: float | None = Field(default=None, ge=0)
+    end_days_ago: float | None = Field(default=None, ge=0)
+    recency_dominant: bool = False
+    wants_current: bool = False
+
+
+# ===============================
+# Unified Search Models
+# ===============================
+
+
+UnifiedSearchEntityType = Literal["profiles", "user_playbooks", "agent_playbooks"]
+RetrievalExperimentArm = Literal["treatment", "holdout"]
+
+
+class RetrievalExperimentAssignment(BaseModel):
+    """Experiment attribution returned by learning-search endpoints."""
+
+    experiment_id: str
+    arm: RetrievalExperimentArm
+
+
+class StartRetrievalExperimentRequest(BaseModel):
+    experiment_id: NonEmptyStr = Field(max_length=128)
+    holdout_percentage: float = Field(gt=0, lt=100)
+
+
+class StopRetrievalExperimentRequest(BaseModel):
+    experiment_id: NonEmptyStr = Field(max_length=128)
+
+
+class RetrievalExperimentListResponse(BaseModel):
+    active_experiment: RetrievalExperimentRecord | None = None
+    experiments: list[RetrievalExperimentRecord] = Field(default_factory=list)
+
+
+class RetrievalExperimentArmMetrics(BaseModel):
+    arm: RetrievalExperimentArm
+    assigned_user_count: int = 0
+    published_session_count: int = 0
+    evaluated_user_count: int = 0
+    evaluated_session_count: int = 0
+    success_rate: float | None = None
+    average_corrections: float | None = None
+    average_turns_to_resolution: float | None = None
+    escalation_rate: float | None = None
+    average_output_tokens: float | None = None
+    output_token_session_count: int = 0
+
+
+class RetrievalExperimentResultsResponse(BaseModel):
+    experiment: RetrievalExperimentRecord
+    treatment: RetrievalExperimentArmMetrics
+    holdout: RetrievalExperimentArmMetrics
+    success_rate_lift_percentage_points: float | None = None
+    relative_success_lift: float | None = None
+    confidence_interval_95_percentage_points: tuple[float, float] | None = None
+    evaluated_session_coverage: float | None = None
+    unattributed_evaluated_session_count: int = 0
+
+
+class UnifiedSearchRequest(BaseModel):
+    """Request for unified search across all entity types.
+
+    Args:
+        query (str): Search query text
+        top_k (int, optional): Maximum results per entity type, up to 100.
+            Defaults to 5.
+        threshold (float, optional): Similarity threshold for vector search.
+            When omitted, the embedding model's default is used.
+        agent_version (str, optional): Filter by agent version (agent_playbooks, user_playbooks)
+        playbook_name (str, optional): Filter by playbook name (agent_playbooks, user_playbooks)
+        user_id (str, optional): Filter by user ID (profiles, user_playbooks)
+        source (str, optional): Filter all selected entity types by exact
+            source. Agent playbooks match through linked user playbooks.
+        tags (list[str], optional): Match entities having any requested tag.
+        entity_types (list[str], optional): Entity types to search. When omitted,
+            searches profiles, user_playbooks, and agent_playbooks.
+        agent_playbook_status_filter (list[PlaybookStatus], optional): Approval
+            statuses to include for agent_playbooks. When omitted, defaults to
+            ``[APPROVED, PENDING]`` so that REJECTED playbooks are suppressed
+            from results — a rejection in the dashboard immediately hides the
+            playbook. Pass an explicit list to opt into REJECTED items.
+        conversation_history (list[ConversationTurn], optional): Prior conversation turns for context-aware query rewriting
+    """
+
+    query: NonEmptyStr
+    top_k: int | None = Field(default=5, gt=0, le=100)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    agent_version: str | None = None
+    playbook_name: str | None = None
+    user_id: str | None = Field(default=None, max_length=255)
+    source: SessionOutcomeSource | None = None
+    tags: list[str] | None = None
+    entity_types: list[UnifiedSearchEntityType] | None = None
+    agent_playbook_status_filter: list[PlaybookStatus] | None = None
+    conversation_history: list[ConversationTurn] | None = None
+    enable_reformulation: bool | None = False
+    enable_agent_answer: bool | None = False
+    search_mode: SearchMode = SearchMode.HYBRID
+    # Caller correlation IDs for billing attribution on the Application line.
+    # Optional; consumed by _meter_applied_learnings in server/api.py.
+    # ``session_id`` additionally enables session-scoped result dedup: items
+    # already served to the same (org, session) are skipped and the next-best
+    # matches backfilled (see server/services/retrieval/session_dedup.py).
+    request_id: str | None = Field(default=None, max_length=255)
+    session_id: str | None = Field(default=None, max_length=255)
+    interaction_id: int | None = Field(default=None, gt=0)
+
+
+class UnifiedSearchResponse(BaseModel):
+    """Response containing search results from all entity types.
+
+    Args:
+        success (bool): Whether the search was successful
+        profiles (list[UserProfile]): Matching user profiles
+        agent_playbooks (list[AgentPlaybook]): Matching aggregated agent playbooks
+        user_playbooks (list[UserPlaybook]): Matching user playbooks
+        reformulated_query (str, optional): The query used after reformulation (None if reformulation disabled)
+        msg (str, optional): Additional message
+        agent_answer (str, optional): LLM-synthesised answer populated by the agentic backend;
+            None for classic backend.
+        degraded (bool): True when the search silently fell back from the
+            requested vector/hybrid mode to full-text search because query
+            embedding generation failed. Results are still returned (via FTS),
+            but relevance may be lower than a healthy vector/hybrid run.
+            Defaults to False.
+        search_mode_effective (str, optional): The search mode actually used
+            when it differs from the requested mode — currently ``"fts"`` on
+            the degrade path. None when the requested mode was honored.
+    """
+
+    success: bool
+    profiles: list[UserProfile] = []
+    agent_playbooks: list[AgentPlaybook] = []
+    user_playbooks: list[UserPlaybook] = []
+    reformulated_query: str | None = None
+    msg: str | None = None
+    agent_answer: str | None = None
+    agent_trace: str | None = None
+    rehydrated_text: str | None = None
+    degraded: bool = False
+    search_mode_effective: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
+
+
+# ===============================
+# View Response Types (user-facing, without embeddings)
+# ===============================
+
+
+class GetInteractionsViewResponse(BaseModel):
+    """API response for retrieving interactions — uses View types."""
+
+    success: bool
+    interactions: list[InteractionView]
+    msg: str | None = None
+
+
+class GetProfilesViewResponse(BaseModel):
+    """API response for retrieving profiles — uses View types."""
+
+    success: bool
+    user_profiles: list[ProfileView]
+    msg: str | None = None
+
+
+class SearchInteractionsViewResponse(BaseModel):
+    """API response for searching interactions — uses View types."""
+
+    success: bool
+    interactions: list[InteractionView]
+    msg: str | None = None
+
+
+class SearchProfilesViewResponse(BaseModel):
+    """API response for searching profiles — uses View types."""
+
+    success: bool
+    user_profiles: list[ProfileView]
+    msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
+
+
+class GetEvaluationResultsViewResponse(BaseModel):
+    """API response for retrieving evaluation results — uses View types."""
+
+    success: bool
+    agent_success_evaluation_results: list[EvaluationResultView]
+    msg: str | None = None
+
+
+class ProfileChangeLogViewResponse(BaseModel):
+    """API response for profile change logs — uses View types."""
+
+    success: bool
+    profile_change_logs: list[ProfileChangeLogView]
+
+
+class RequestDataView(BaseModel):
+    """A single request with its interactions, using View types."""
+
+    request: Request
+    interactions: list[InteractionView]
+
+
+class SessionView(BaseModel):
+    """A session containing requests, using View types."""
+
+    session_id: str
+    requests: list[RequestDataView]
+
+
+class GetRequestsViewResponse(BaseModel):
+    """API response for retrieving requests — uses View types."""
+
+    success: bool
+    sessions: list[SessionView]
+    has_more: bool = False
+    msg: str | None = None
+
+
+class UnifiedSearchViewResponse(BaseModel):
+    """API response for unified search — uses View types.
+
+    ``degraded`` and ``search_mode_effective`` mirror the same fields on
+    :class:`UnifiedSearchResponse`. They are on the VIEW model because a
+    degradation the caller cannot see is not a signal: the service computed
+    both for the degrade-to-FTS path and this view dropped them, so over HTTP a
+    partial storage failure was indistinguishable from "nothing matched" --
+    the bug the 503/degraded split exists to fix (the pooled-connection incident).
+
+    Attributes:
+        degraded (bool): True when the search returned results but one of its
+            arms did not answer -- a failed profiles arm, or a fall back from
+            vector/hybrid to FTS because query embedding generation failed.
+            Results are still usable; an EMPTY arm is not a fact. Always
+            present in the body (``False`` survives
+            ``response_model_exclude_none``) so a caller may rely on the key.
+        search_mode_effective (str, optional): The search mode actually used
+            when it differs from the one requested. None -- and so omitted from
+            the body -- when the requested mode was honored.
+    """
+
+    success: bool
+    profiles: list[ProfileView] = []
+    agent_playbooks: list[AgentPlaybookView] = []
+    user_playbooks: list[UserPlaybookView] = []
+    reformulated_query: str | None = None
+    msg: str | None = None
+    agent_trace: str | None = None
+    rehydrated_text: str | None = None
+    degraded: bool = False
+    search_mode_effective: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
+
+
+class GetUserPlaybooksViewResponse(BaseModel):
+    """API response for retrieving user playbooks — uses View types."""
+
+    success: bool
+    user_playbooks: list[UserPlaybookView]
+    msg: str | None = None
+
+
+class GetAgentPlaybooksViewResponse(BaseModel):
+    """API response for retrieving agent playbooks — uses View types."""
+
+    success: bool
+    agent_playbooks: list[AgentPlaybookView]
+    msg: str | None = None
+
+
+class SearchUserPlaybooksViewResponse(BaseModel):
+    """API response for searching user playbooks — uses View types."""
+
+    success: bool
+    user_playbooks: list[UserPlaybookView]
+    msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None
+
+
+class SearchAgentPlaybooksViewResponse(BaseModel):
+    """API response for searching agent playbooks — uses View types."""
+
+    success: bool
+    agent_playbooks: list[AgentPlaybookView]
+    msg: str | None = None
+    experiment: RetrievalExperimentAssignment | None = None

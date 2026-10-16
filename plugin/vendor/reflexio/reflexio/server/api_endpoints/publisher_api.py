@@ -1,0 +1,621 @@
+"""
+Create, edit, delete user interaction and user profile
+"""
+
+import logging
+
+from reflexio.models.api_schema.retriever_schema import (
+    UpdateAgentPlaybookRequest,
+    UpdateAgentPlaybookResponse,
+    UpdatePlaybookStatusRequest,
+    UpdatePlaybookStatusResponse,
+    UpdateUserPlaybookRequest,
+    UpdateUserPlaybookResponse,
+    UpdateUserProfileRequest,
+    UpdateUserProfileResponse,
+)
+from reflexio.models.api_schema.service_schemas import (
+    AddAgentPlaybookRequest,
+    AddAgentPlaybookResponse,
+    AddUserPlaybookRequest,
+    AddUserPlaybookResponse,
+    AddUserProfileRequest,
+    AddUserProfileResponse,
+    BulkDeleteResponse,
+    ClearUserDataRequest,
+    ClearUserDataResponse,
+    DeleteAgentPlaybookRequest,
+    DeleteAgentPlaybookResponse,
+    DeleteAgentPlaybooksByIdsRequest,
+    DeleteProfilesByIdsRequest,
+    DeleteRequestRequest,
+    DeleteRequestResponse,
+    DeleteRequestsByIdsRequest,
+    DeleteSessionRequest,
+    DeleteSessionResponse,
+    DeleteUserInteractionRequest,
+    DeleteUserInteractionResponse,
+    DeleteUserPlaybookRequest,
+    DeleteUserPlaybookResponse,
+    DeleteUserPlaybooksByIdsRequest,
+    DeleteUserProfileRequest,
+    DeleteUserProfileResponse,
+    GetSessionOutcomesRequest,
+    GetSessionOutcomesResponse,
+    PublishUserInteractionRequest,
+    PublishUserInteractionResponse,
+    RunPlaybookAggregationRequest,
+    RunPlaybookAggregationResponse,
+    SetSessionOutcomeRequest,
+    SetSessionOutcomeResponse,
+)
+from reflexio.server import publish_timing
+from reflexio.server.api_endpoints.precondition_checks import (
+    validate_delete_user_profile_request,
+    validate_publish_user_interaction_request,
+)
+from reflexio.server.cache.reflexio_cache import get_reflexio
+from reflexio.server.error_reporting import error_tags
+
+logger = logging.getLogger(__name__)
+
+
+def set_session_outcome(
+    org_id: str, request: SetSessionOutcomeRequest
+) -> SetSessionOutcomeResponse:
+    return get_reflexio(org_id=org_id).mark_session_outcome(request)
+
+
+def get_session_outcomes(
+    org_id: str, request: GetSessionOutcomesRequest
+) -> GetSessionOutcomesResponse:
+    return get_reflexio(org_id=org_id).get_session_outcomes(request)
+
+
+# ==============================
+# Create user interaction and profile
+# ==============================
+
+
+def add_user_interaction(
+    org_id: str,
+    request: PublishUserInteractionRequest,
+    *,
+    use_publish_limiter: bool = True,
+    publish_limiter_wait_forever: bool = True,
+    defer_learning: bool = False,
+) -> PublishUserInteractionResponse:
+    """Add user interaction
+
+    Args:
+        org_id (str): Organization ID
+        request (PublishUserInteractionRequest): The request containing interaction data
+        use_publish_limiter (bool): Whether GenerationService should throttle the
+            post-write learning pipeline.
+        publish_limiter_wait_forever (bool): Whether GenerationService should queue
+            indefinitely for that post-write learning limiter.
+        defer_learning (bool): Whether to enqueue post-persist learning instead
+            of running it inline.
+
+    Returns:
+        PublishUserInteractionResponse: Response containing success status and message
+    """
+    # The publish-timing line is emitted HERE, from the worker's outermost
+    # frame, because this is the only place that sees the whole of what
+    # serving a publish costs. `GenerationService.run` is too early -- the
+    # post-commit coverage reads in `lib/_interactions.py::_safe_coverage` are
+    # two more remote round trips after it returns -- and `get_reflexio` below
+    # can itself stall or raise on a cold construction, which `run` never sees
+    # at all. `emit` is at-most-once per scope and a no-op outside one, so a
+    # library or CLI caller pays a `ContextVar.get`.
+    publish_timing.worker_started()
+    try:
+        is_valid, message = validate_publish_user_interaction_request(request)
+        if not is_valid:
+            return PublishUserInteractionResponse(success=False, message=message)
+
+        # Named in the comment above as invisible to `run`: a cold construction
+        # decrypts config, builds storage pools and LLM clients. Phased so a
+        # slow one is attributable instead of landing in the unnamed remainder.
+        with publish_timing.phase("context_acquire"):
+            reflexio = get_reflexio(org_id=org_id)
+        from reflexio.server.services.storage.retention_sweep import (
+            scheduler_managed_retention,
+        )
+
+        with scheduler_managed_retention():
+            return reflexio.publish_interaction(
+                request=request,
+                use_publish_limiter=use_publish_limiter,
+                publish_limiter_wait_forever=publish_limiter_wait_forever,
+                defer_learning=defer_learning,
+            )
+    finally:
+        publish_timing.emit(
+            org_id=org_id,
+            # The route assigns one before calling; `unknown` covers a direct
+            # caller that did not, where an empty `request_id=` would not read.
+            request_id=request.request_id or "unknown",
+        )
+
+
+def add_user_playbook(
+    org_id: str,
+    request: AddUserPlaybookRequest,
+) -> AddUserPlaybookResponse:
+    """Add user playbook directly to storage.
+
+    Args:
+        org_id (str): Organization ID
+        request (AddUserPlaybookRequest): The request containing user playbooks
+
+    Returns:
+        AddUserPlaybookResponse: Response containing success status, message, and added count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.add_user_playbook(request=request)
+
+
+def add_agent_playbook(
+    org_id: str,
+    request: AddAgentPlaybookRequest,
+) -> AddAgentPlaybookResponse:
+    """Add agent playbook directly to storage.
+
+    Args:
+        org_id (str): Organization ID
+        request (AddAgentPlaybookRequest): The request containing agent playbooks
+
+    Returns:
+        AddAgentPlaybookResponse: Response containing success status, message, and added count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.add_agent_playbook(request=request)
+
+
+def add_user_profile(
+    org_id: str,
+    request: AddUserProfileRequest,
+) -> AddUserProfileResponse:
+    """Add user profile directly to storage, bypassing inference.
+
+    Mirror of :func:`add_user_playbook` for the profile resource —
+    useful for seeding a known fact about the user (testing, migration,
+    manual fact injection) without producing an interaction first.
+
+    Args:
+        org_id (str): Organization ID
+        request (AddUserProfileRequest): The request containing user profiles
+
+    Returns:
+        AddUserProfileResponse: Response containing success status, message, and added count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.add_user_profile(request=request)
+
+
+def delete_user_profile(
+    org_id: str, request: DeleteUserProfileRequest
+) -> DeleteUserProfileResponse:
+    """Delete user profile
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteUserProfileRequest): The delete request
+
+    Returns:
+        DeleteUserProfileResponse: Response containing success status and message
+    """
+    is_valid, message = validate_delete_user_profile_request(request)
+    if not is_valid:
+        return DeleteUserProfileResponse(success=False, message=message)
+
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_profile(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_user_profile", org_id=org_id
+        ):
+            logger.exception("Failed to delete user profile")
+        return DeleteUserProfileResponse(success=False, message=str(e))
+
+
+def delete_user_interaction(
+    org_id: str, request: DeleteUserInteractionRequest
+) -> DeleteUserInteractionResponse:
+    """Delete user interaction
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteUserInteractionRequest): The delete request
+
+    Returns:
+        DeleteUserInteractionResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_interaction(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_user_interaction", org_id=org_id
+        ):
+            logger.exception("Failed to delete user interaction")
+        return DeleteUserInteractionResponse(success=False, message=str(e))
+
+
+def delete_request(org_id: str, request: DeleteRequestRequest) -> DeleteRequestResponse:
+    """Delete request and all its associated interactions
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteRequestRequest): The delete request
+
+    Returns:
+        DeleteRequestResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_request(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_request", org_id=org_id
+        ):
+            logger.exception("Failed to delete request")
+        return DeleteRequestResponse(success=False, message=str(e))
+
+
+def delete_session(org_id: str, request: DeleteSessionRequest) -> DeleteSessionResponse:
+    """Delete all requests and interactions in a session
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteSessionRequest): The delete request
+
+    Returns:
+        DeleteSessionResponse: Response containing success status, message, and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_session(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_session", org_id=org_id
+        ):
+            logger.exception("Failed to delete session")
+        return DeleteSessionResponse(success=False, message=str(e))
+
+
+def delete_agent_playbook(
+    org_id: str, request: DeleteAgentPlaybookRequest
+) -> DeleteAgentPlaybookResponse:
+    """Delete agent playbook by ID.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteAgentPlaybookRequest): The delete request
+
+    Returns:
+        DeleteAgentPlaybookResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_agent_playbook(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_agent_playbook", org_id=org_id
+        ):
+            logger.exception("Failed to delete agent playbook")
+        return DeleteAgentPlaybookResponse(success=False, message=str(e))
+
+
+def delete_user_playbook(
+    org_id: str, request: DeleteUserPlaybookRequest
+) -> DeleteUserPlaybookResponse:
+    """Delete user playbook by ID.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteUserPlaybookRequest): The delete request
+
+    Returns:
+        DeleteUserPlaybookResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.delete_user_playbook(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="delete_user_playbook", org_id=org_id
+        ):
+            logger.exception("Failed to delete user playbook")
+        return DeleteUserPlaybookResponse(success=False, message=str(e))
+
+
+# ==============================
+# Bulk delete operations
+# ==============================
+
+
+def delete_all_interactions_bulk(org_id: str) -> BulkDeleteResponse:
+    """Delete all requests and their associated interactions.
+
+    Args:
+        org_id (str): Organization ID
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_all_interactions_bulk()
+
+
+def delete_all_profiles_bulk(org_id: str) -> BulkDeleteResponse:
+    """Delete all profiles.
+
+    Args:
+        org_id (str): Organization ID
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_all_profiles_bulk()
+
+
+def delete_all_playbooks_bulk(org_id: str) -> BulkDeleteResponse:
+    """Delete all playbooks (both user and agent).
+
+    Args:
+        org_id (str): Organization ID
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_all_playbooks_bulk()
+
+
+def delete_all_user_playbooks_bulk(org_id: str) -> BulkDeleteResponse:
+    """Delete all user playbooks (user only, not agent).
+
+    Args:
+        org_id (str): Organization ID
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_all_user_playbooks_bulk()
+
+
+def delete_all_agent_playbooks_bulk(org_id: str) -> BulkDeleteResponse:
+    """Delete all agent playbooks (agent only, not user).
+
+    Args:
+        org_id (str): Organization ID
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_all_agent_playbooks_bulk()
+
+
+def delete_requests_by_ids(
+    org_id: str, request: DeleteRequestsByIdsRequest
+) -> BulkDeleteResponse:
+    """Delete requests by their IDs.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteRequestsByIdsRequest): The delete request
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_requests_by_ids(request)
+
+
+def delete_profiles_by_ids(
+    org_id: str, request: DeleteProfilesByIdsRequest
+) -> BulkDeleteResponse:
+    """Delete profiles by their IDs.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteProfilesByIdsRequest): The delete request
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_profiles_by_ids(request)
+
+
+def delete_agent_playbooks_by_ids_bulk(
+    org_id: str, request: DeleteAgentPlaybooksByIdsRequest
+) -> BulkDeleteResponse:
+    """Delete agent playbooks by their IDs.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteAgentPlaybooksByIdsRequest): The delete request
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_agent_playbooks_by_ids_bulk(request)
+
+
+def delete_user_playbooks_by_ids_bulk(
+    org_id: str, request: DeleteUserPlaybooksByIdsRequest
+) -> BulkDeleteResponse:
+    """Delete user playbooks by their IDs.
+
+    Args:
+        org_id (str): Organization ID
+        request (DeleteUserPlaybooksByIdsRequest): The delete request
+
+    Returns:
+        BulkDeleteResponse: Response containing success status and deleted count
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.delete_user_playbooks_by_ids_bulk(request)
+
+
+def clear_user_data(
+    org_id: str, request: ClearUserDataRequest
+) -> ClearUserDataResponse:
+    """Delete all rows scoped to a single ``user_id``.
+
+    Args:
+        org_id (str): Organization ID
+        request (ClearUserDataRequest): Request containing the target user_id
+
+    Returns:
+        ClearUserDataResponse: Response with per-entity deletion counts
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    return reflexio.clear_user_data(request)
+
+
+# ==============================
+# Run playbook aggregation
+# ==============================
+
+
+def run_playbook_aggregation(
+    org_id: str, request: RunPlaybookAggregationRequest
+) -> RunPlaybookAggregationResponse:
+    """Run playbook aggregation for a given agent version and playbook name.
+
+    Args:
+        org_id (str): Organization ID
+        request (RunPlaybookAggregationRequest): The run playbook aggregation request
+
+    Returns:
+        RunPlaybookAggregationResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        result = reflexio.run_playbook_aggregation(
+            request.agent_version, request.playbook_name
+        )
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="run_playbook_aggregation", org_id=org_id
+        ):
+            logger.exception("Failed to run playbook aggregation")
+        return RunPlaybookAggregationResponse(success=False, message=str(e))
+
+    if result.get("skipped"):
+        return RunPlaybookAggregationResponse(
+            success=True, message=f"Skipped: {result['skipped']}"
+        )
+
+    message = (
+        f"Processed {result['user_playbooks_processed']} user playbooks, "
+        f"found {result['clusters_found']} clusters, "
+        f"generated {result['playbooks_generated']} agent playbooks"
+    )
+    return RunPlaybookAggregationResponse(success=True, message=message)
+
+
+# ==============================
+# Update playbook status
+# ==============================
+
+
+def update_agent_playbook_status(
+    org_id: str, request: UpdatePlaybookStatusRequest
+) -> UpdatePlaybookStatusResponse:
+    """Update the status of a specific playbook.
+
+    Args:
+        org_id (str): Organization ID
+        request (UpdatePlaybookStatusRequest): The update request
+
+    Returns:
+        UpdatePlaybookStatusResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.update_agent_playbook_status(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="update_playbook_status", org_id=org_id
+        ):
+            logger.exception("Failed to update playbook status")
+        return UpdatePlaybookStatusResponse(success=False, msg=str(e))
+
+
+def update_agent_playbook(
+    org_id: str, request: UpdateAgentPlaybookRequest
+) -> UpdateAgentPlaybookResponse:
+    """Update editable fields of an agent playbook.
+
+    Args:
+        org_id (str): Organization ID
+        request (UpdateAgentPlaybookRequest): The update request
+
+    Returns:
+        UpdateAgentPlaybookResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.update_agent_playbook(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="update_agent_playbook", org_id=org_id
+        ):
+            logger.exception("Failed to update agent playbook")
+        return UpdateAgentPlaybookResponse(success=False, msg=str(e))
+
+
+def update_user_playbook(
+    org_id: str, request: UpdateUserPlaybookRequest
+) -> UpdateUserPlaybookResponse:
+    """Update editable fields of a user playbook.
+
+    Args:
+        org_id (str): Organization ID
+        request (UpdateUserPlaybookRequest): The update request
+
+    Returns:
+        UpdateUserPlaybookResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.update_user_playbook(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="update_user_playbook", org_id=org_id
+        ):
+            logger.exception("Failed to update user playbook")
+        return UpdateUserPlaybookResponse(success=False, msg=str(e))
+
+
+def update_user_profile(
+    org_id: str, request: UpdateUserProfileRequest
+) -> UpdateUserProfileResponse:
+    """Apply a partial update to an existing user profile.
+
+    Args:
+        org_id (str): Organization ID
+        request (UpdateUserProfileRequest): The update request
+
+    Returns:
+        UpdateUserProfileResponse: Response containing success status and message
+    """
+    reflexio = get_reflexio(org_id=org_id)
+    try:
+        return reflexio.update_user_profile(request)
+    except Exception as e:
+        with error_tags(
+            subsystem="publisher_api", action="update_user_profile", org_id=org_id
+        ):
+            logger.exception("Failed to update user profile")
+        return UpdateUserProfileResponse(success=False, msg=str(e))

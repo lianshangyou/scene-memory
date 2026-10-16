@@ -1,0 +1,750 @@
+"""Strict shared contracts for atomic user-playbook publication."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import Literal, Protocol, get_args
+
+from reflexio.models.api_schema.domain.entities import (
+    OpenWorldDeploymentLifecycleState,
+    OptimizerKind,
+    UserPlaybook,
+)
+
+PublicationOutcome = Literal["applied", "incumbent_changed"]
+# Derived from the exported Literal rather than restated, so the SQL state
+# CHECK, the Literal, and this set cannot drift into three different answers.
+LIFECYCLE_TERMINAL_STATES: frozenset[str] = frozenset(
+    get_args(OpenWorldDeploymentLifecycleState)
+) - {"provisional"}
+# Mirrors user_playbook_deployment_lifecycles_terminal_reason_check, which is
+# now NINE values wide (20260827070000). 'governed_erasure' is the live
+# governance erase path's, and 'observed_regression' and
+# 'confirmed_online_support' are Phase 6's two opposite outcomes; all are
+# accepted here because a terminal tuple READ BACK from an idempotent replay may
+# legitimately carry any of them. The restoration RPC accepts a strictly
+# narrower set, and the confirm RPC accepts exactly one.
+LIFECYCLE_TERMINAL_REASONS: frozenset[str] = frozenset(
+    {
+        "insufficient_online_support",
+        "analyst_unqualified",
+        "confirmation_capability_invalidated",
+        "governance_invalidated",
+        "tuner_disabled",
+        "stale_incumbent",
+        "observed_regression",
+        "governed_erasure",
+        "confirmed_online_support",
+    }
+)
+PublishableOptimizerKind = Literal["gepa", "offline_tuner_open_world"]
+# 'offline_optimizer' remains in the union because it is a value already
+# PERSISTED on user_playbooks.source rows. Phase 7 removed the only optimizer
+# kind that produced it, and Task 10 took the tenant RPC's matching CASE arm
+# with it: commit_user_playbook_publication now writes the staged optimizer kind
+# straight through to user_playbooks.source (20260830020000). No path can write
+# 'offline_optimizer' any more -- it is read-only history.
+PublicationSource = Literal["gepa", "offline_optimizer"]
+
+# Phase 7 retired 'offline_tuner_replay'. The legacy publication path is now
+# GEPA-only: the open-world path publishes through its own provisional
+# publisher, not through publication_source_for_optimizer.
+_LEGACY_PUBLICATION_OPTIMIZERS = frozenset({"gepa"})
+_DECISION_PROOF_OPTIMIZERS = frozenset({"gepa", "offline_tuner_open_world"})
+_PROJECTION_SCHEMA_VERSION = "offline-tuner-candidate-search-projection-v1"
+_USER_PLAYBOOK_FULL_VERSION_SCHEMA = "user-playbook-full-version-v1"
+_CANONICAL_DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
+PUBLICATION_SUBJECT_EPOCHS_METADATA_KEY = "publication_subject_epochs"
+PUBLICATION_PROOF_JSON_METADATA_KEY = "publication_proof_json"
+PUBLICATION_PROJECTION_JSON_METADATA_KEY = "publication_projection_json"
+PUBLICATION_INCUMBENT_CONTENT_DIGEST_METADATA_KEY = (
+    "publication_incumbent_content_digest"
+)
+PUBLICATION_INCUMBENT_TRIGGER_METADATA_KEY = "publication_incumbent_trigger"
+PUBLICATION_INCUMBENT_SEMANTIC_DIGEST_METADATA_KEY = (
+    "publication_incumbent_semantic_digest"
+)
+
+
+def _require_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be non-empty")
+    return value
+
+
+def _require_digest(name: str, value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ValueError(f"{name} must be lowercase SHA-256 hex")
+    return value
+
+
+def canonical_json_bytes(payload: object) -> bytes:
+    """Encode integer/string-only JSON values using RFC 8785 ordering."""
+    return _canonical_json(payload).encode("utf-8")
+
+
+def _canonical_json(value: object) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        _reject_surrogates(value)
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, int):
+        if not -(2**53) < value < 2**53:
+            raise ValueError(
+                "RFC 8785 integers must be exactly representable by IEEE 754"
+            )
+        return str(value)
+    if isinstance(value, tuple | list):
+        return "[" + ",".join(_canonical_json(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("RFC 8785 object keys must be strings")
+        for key in value:
+            _reject_surrogates(key)
+        keys = sorted(value, key=lambda key: key.encode("utf-16be"))
+        return (
+            "{"
+            + ",".join(
+                f"{_canonical_json(key)}:{_canonical_json(value[key])}" for key in keys
+            )
+            + "}"
+        )
+    raise TypeError(f"Unsupported RFC 8785 value: {type(value).__name__}")
+
+
+def _reject_surrogates(value: str) -> None:
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError("RFC 8785 strings cannot contain surrogate code points")
+
+
+def _canonical_payload(name: str, value: str) -> object:
+    try:
+        payload = json.loads(
+            value,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {constant}")
+            ),
+        )
+        canonical = canonical_json_bytes(payload).decode("utf-8")
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError(f"{name} must be canonical JSON") from exc
+    if canonical != value:
+        raise ValueError(f"{name} must use canonical JSON bytes")
+    return payload
+
+
+def _validate_subject_epochs_json(value: str) -> None:
+    epochs = _canonical_payload("subject_epochs_json", value)
+    if (
+        not isinstance(epochs, dict)
+        or set(epochs) != {"subjects"}
+        or not isinstance(epochs.get("subjects"), list)
+        or not epochs["subjects"]
+    ):
+        raise ValueError("subject epochs must contain a non-empty subjects list")
+    subject_refs: set[str] = set()
+    for item in epochs["subjects"]:
+        if not isinstance(item, dict):
+            raise ValueError("subject epochs must contain objects")
+        if set(item) != {"ref", "epoch"}:
+            raise ValueError("subject epochs must use ref and epoch fields")
+        subject_ref = item["ref"]
+        epoch = item["epoch"]
+        if (
+            not isinstance(subject_ref, str)
+            or not subject_ref
+            or type(epoch) is not int
+            or epoch < 0
+        ):
+            raise ValueError("subject epochs contain an invalid identity or epoch")
+        if subject_ref in subject_refs:
+            raise ValueError("subject epochs must contain unique subject refs")
+        subject_refs.add(subject_ref)
+
+
+def _validate_legacy_publication_optimizer(value: object) -> None:
+    if value not in _LEGACY_PUBLICATION_OPTIMIZERS:
+        raise ValueError("optimizer_kind is not publishable")
+
+
+def _validate_decision_proof_optimizer(value: object) -> None:
+    if value not in _DECISION_PROOF_OPTIMIZERS:
+        raise ValueError("optimizer_kind is not publishable")
+
+
+def publication_source_for_optimizer(
+    optimizer_kind: OptimizerKind,
+) -> PublicationSource:
+    # The 'offline_optimizer' arm was reachable only for 'offline_tuner_replay',
+    # which Phase 7 retired. _validate_legacy_publication_optimizer now admits
+    # 'gepa' alone, so the branch is gone rather than left dead.
+    _validate_legacy_publication_optimizer(optimizer_kind)
+    return "gepa"
+
+
+def incumbent_user_playbook_semantic_digest(
+    *, content_digest: str, trigger: str | None
+) -> str:
+    """Bind the behaviorally mutable incumbent fields used by publication."""
+    _require_digest("incumbent content digest", content_digest)
+    if trigger is not None and not isinstance(trigger, str):
+        raise TypeError("incumbent trigger must be a string or null")
+    payload = {
+        "content_digest": content_digest,
+        "schema_version": "user-playbook-incumbent-semantic-v1",
+        "trigger": trigger,
+    }
+    return sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+@dataclass(frozen=True)
+class PublicationClaim:
+    job_id: int
+    owner: str
+    fence: int
+
+    def __post_init__(self) -> None:
+        if type(self.job_id) is not int or self.job_id <= 0:
+            raise ValueError("publication claim job_id must be positive")
+        _require_text("publication claim owner", self.owner)
+        if type(self.fence) is not int or self.fence <= 0:
+            raise ValueError("publication claim fence must be positive")
+
+
+@dataclass(frozen=True)
+class DecisionProofEnvelope:
+    optimizer_kind: OptimizerKind
+    schema_version: str
+    canonical_json: str
+    digest: str
+    decision: Literal["apply"]
+
+    def __post_init__(self) -> None:
+        _validate_decision_proof_optimizer(self.optimizer_kind)
+        _require_text("decision proof schema_version", self.schema_version)
+        _require_digest("decision proof digest", self.digest)
+        if self.decision != "apply":
+            raise ValueError("publication decision must be apply")
+        payload = _canonical_payload(
+            "decision proof canonical_json", self.canonical_json
+        )
+        if sha256(self.canonical_json.encode("utf-8")).hexdigest() != self.digest:
+            raise ValueError("decision proof digest does not match canonical JSON")
+        if not isinstance(payload, dict):
+            raise ValueError("decision proof canonical JSON must be an object")
+        if payload.get("optimizer_kind") != self.optimizer_kind:
+            raise ValueError("decision proof optimizer_kind does not match envelope")
+        if payload.get("schema_version") != self.schema_version:
+            raise ValueError("decision proof schema_version does not match envelope")
+        if payload.get("decision") != self.decision:
+            raise ValueError("decision proof decision does not match envelope")
+
+
+@dataclass(frozen=True)
+class PublicationSearchProjection:
+    schema_version: str
+    canonical_json: str
+    digest: str
+    projector_id: str
+    projector_version: str
+    projector_code_digest: str
+    candidate_content_digest: str
+    preserved_trigger: str | None
+    embedding_model_id: str
+    embedding: tuple[str, ...]
+    expanded_terms: tuple[str, ...]
+    lexical_document: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != _PROJECTION_SCHEMA_VERSION:
+            raise ValueError("search projection schema is unsupported")
+        _require_digest("search projection digest", self.digest)
+        _require_text("search projection projector_id", self.projector_id)
+        _require_text("search projection projector_version", self.projector_version)
+        _require_digest(
+            "search projection projector_code_digest", self.projector_code_digest
+        )
+        _require_digest(
+            "search projection candidate_content_digest",
+            self.candidate_content_digest,
+        )
+        _require_text("search projection embedding_model_id", self.embedding_model_id)
+        _require_text("search projection lexical_document", self.lexical_document)
+        if self.preserved_trigger is not None:
+            _require_text("search projection preserved_trigger", self.preserved_trigger)
+        if not isinstance(self.embedding, tuple) or not self.embedding:
+            raise ValueError("search projection embedding must be a non-empty tuple")
+        if not isinstance(self.expanded_terms, tuple) or any(
+            not isinstance(term, str) or not term.strip()
+            for term in self.expanded_terms
+        ):
+            raise ValueError(
+                "search projection expanded_terms must contain non-empty text"
+            )
+        for coordinate in self.embedding:
+            if (
+                not isinstance(coordinate, str)
+                or coordinate == "-0"
+                or _CANONICAL_DECIMAL.fullmatch(coordinate) is None
+            ):
+                raise ValueError(
+                    "search projection embedding must contain canonical decimals"
+                )
+        payload = _canonical_payload(
+            "search projection canonical_json", self.canonical_json
+        )
+        if sha256(self.canonical_json.encode("utf-8")).hexdigest() != self.digest:
+            raise ValueError("search projection digest does not match canonical JSON")
+        expected = {
+            "candidate_content_digest": self.candidate_content_digest,
+            "embedding": list(self.embedding),
+            "embedding_model_id": self.embedding_model_id,
+            "expanded_terms": list(self.expanded_terms),
+            "lexical_document": self.lexical_document,
+            "preserved_trigger": self.preserved_trigger,
+            "projector_code_digest": self.projector_code_digest,
+            "projector_id": self.projector_id,
+            "projector_version": self.projector_version,
+            "schema_version": self.schema_version,
+        }
+        if payload != expected:
+            raise ValueError("search projection fields do not match canonical JSON")
+
+
+@dataclass(frozen=True)
+class PublicationRequest:
+    optimizer_kind: OptimizerKind
+    job_id: int
+    attempt_key: str
+    publication_claim: PublicationClaim
+    worker_fence: int
+    incumbent_user_playbook_id: int
+    incumbent_content_digest: str
+    incumbent_trigger: str | None
+    incumbent_semantic_digest: str
+    revised_content: str
+    projection: PublicationSearchProjection
+    decision_proof: DecisionProofEnvelope
+    subject_epochs_json: str
+    request_id: str
+
+    def __post_init__(self) -> None:
+        _validate_legacy_publication_optimizer(self.optimizer_kind)
+        if type(self.job_id) is not int or self.job_id <= 0:
+            raise ValueError("publication job_id must be positive")
+        _require_text("publication attempt_key", self.attempt_key)
+        if self.publication_claim.job_id != self.job_id:
+            raise ValueError("publication claim job_id must match request job_id")
+        if type(self.worker_fence) is not int or self.worker_fence <= 0:
+            raise ValueError("worker_fence must be positive")
+        if (
+            type(self.incumbent_user_playbook_id) is not int
+            or self.incumbent_user_playbook_id <= 0
+        ):
+            raise ValueError("incumbent_user_playbook_id must be positive")
+        _require_digest("incumbent content digest", self.incumbent_content_digest)
+        _require_digest("incumbent semantic digest", self.incumbent_semantic_digest)
+        expected_semantic_digest = incumbent_user_playbook_semantic_digest(
+            content_digest=self.incumbent_content_digest,
+            trigger=self.incumbent_trigger,
+        )
+        if self.incumbent_semantic_digest != expected_semantic_digest:
+            raise ValueError("incumbent semantic digest does not match frozen fields")
+        if self.projection.preserved_trigger != self.incumbent_trigger:
+            raise ValueError("search projection must preserve incumbent trigger")
+        _require_text("revised_content", self.revised_content)
+        _require_text("publication request_id", self.request_id)
+        if self.decision_proof.optimizer_kind != self.optimizer_kind:
+            raise ValueError("decision proof optimizer_kind must match request")
+        if sha256(self.revised_content.encode("utf-8")).hexdigest() != (
+            self.projection.candidate_content_digest
+        ):
+            raise ValueError("revised content digest must match search projection")
+        _validate_subject_epochs_json(self.subject_epochs_json)
+
+
+@dataclass(frozen=True)
+class QualificationAuthorityRef:
+    epoch: int
+    authority_digest: str
+    discovery_component_identity_digest: str
+    discovery_qualification_suite_digest: str
+    discovery_qualification_result_digest: str
+    held_out_component_identity_digest: str
+    held_out_qualification_suite_digest: str
+    held_out_qualification_result_digest: str
+    candidate_generator_identity_digest: str
+    candidate_generator_authorization_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.epoch) is not int or self.epoch <= 0:
+            raise ValueError("qualification authority epoch must be positive")
+        for field in (
+            "authority_digest",
+            "discovery_component_identity_digest",
+            "discovery_qualification_suite_digest",
+            "discovery_qualification_result_digest",
+            "held_out_component_identity_digest",
+            "held_out_qualification_suite_digest",
+            "held_out_qualification_result_digest",
+            "candidate_generator_identity_digest",
+            "candidate_generator_authorization_digest",
+        ):
+            _require_digest(f"qualification authority {field}", getattr(self, field))
+
+
+def _validated_full_version_snapshot(
+    *,
+    incumbent_snapshot_json: str,
+    incumbent_full_version_fingerprint: str,
+    incumbent_user_playbook_id: int,
+) -> UserPlaybook:
+    _require_digest(
+        "incumbent full version fingerprint", incumbent_full_version_fingerprint
+    )
+    payload = _canonical_payload("incumbent_snapshot_json", incumbent_snapshot_json)
+    if sha256(incumbent_snapshot_json.encode("utf-8")).hexdigest() != (
+        incumbent_full_version_fingerprint
+    ):
+        raise ValueError("incumbent full version fingerprint does not match snapshot")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "user_playbook"}
+        or payload.get("schema_version") != _USER_PLAYBOOK_FULL_VERSION_SCHEMA
+        or not isinstance(payload.get("user_playbook"), dict)
+    ):
+        raise ValueError("incumbent snapshot is not a full user playbook version")
+    snapshot = UserPlaybook.model_validate(payload["user_playbook"])
+    expected_playbook = snapshot.model_dump(mode="json", exclude={"embedding"}) | {
+        "governance_subject_ref": snapshot.governance_subject_ref,
+        "retired_at": snapshot.retired_at,
+    }
+    if canonical_json_bytes(payload["user_playbook"]) != canonical_json_bytes(
+        expected_playbook
+    ):
+        raise ValueError("incumbent snapshot is not a full user playbook version")
+    if snapshot.user_playbook_id != incumbent_user_playbook_id:
+        raise ValueError("incumbent_user_playbook_id does not match snapshot")
+    return snapshot
+
+
+@dataclass(frozen=True)
+class ProvisionalPublicationRequest:
+    optimizer_kind: Literal["offline_tuner_open_world"]
+    job_id: int
+    attempt_key: str
+    publication_claim: PublicationClaim
+    worker_fence: int
+    incumbent_user_playbook_id: int
+    incumbent_full_version_fingerprint: str
+    incumbent_snapshot_json: str
+    revised_content: str
+    projection: PublicationSearchProjection
+    decision_proof: DecisionProofEnvelope
+    subject_epochs_json: str
+    qualification_authority: QualificationAuthorityRef
+    evidence_bundle_digest: str
+    candidate_digest: str
+
+    def __post_init__(self) -> None:
+        if self.optimizer_kind != "offline_tuner_open_world":
+            raise ValueError("optimizer_kind must be offline_tuner_open_world")
+        if type(self.publication_claim) is not PublicationClaim:
+            raise ValueError("publication_claim must be PublicationClaim")
+        if type(self.projection) is not PublicationSearchProjection:
+            raise ValueError("projection must be PublicationSearchProjection")
+        if type(self.decision_proof) is not DecisionProofEnvelope:
+            raise ValueError("decision_proof must be DecisionProofEnvelope")
+        if type(self.job_id) is not int or self.job_id <= 0:
+            raise ValueError("provisional publication job_id must be positive")
+        _require_text("provisional publication attempt_key", self.attempt_key)
+        if self.publication_claim.job_id != self.job_id:
+            raise ValueError("publication claim job_id must match request job_id")
+        if type(self.worker_fence) is not int or self.worker_fence <= 0:
+            raise ValueError("worker_fence must be positive")
+        if (
+            type(self.incumbent_user_playbook_id) is not int
+            or self.incumbent_user_playbook_id <= 0
+        ):
+            raise ValueError("incumbent_user_playbook_id must be positive")
+        snapshot = _validated_full_version_snapshot(
+            incumbent_snapshot_json=self.incumbent_snapshot_json,
+            incumbent_full_version_fingerprint=self.incumbent_full_version_fingerprint,
+            incumbent_user_playbook_id=self.incumbent_user_playbook_id,
+        )
+        _require_text("revised_content", self.revised_content)
+        if self.revised_content == snapshot.content:
+            raise ValueError("revised_content must differ from incumbent content")
+        if self.projection.preserved_trigger != snapshot.trigger:
+            raise ValueError("search projection must preserve incumbent trigger")
+        if self.decision_proof.optimizer_kind != self.optimizer_kind:
+            raise ValueError("decision proof optimizer_kind must match request")
+        if sha256(self.revised_content.encode("utf-8")).hexdigest() != (
+            self.projection.candidate_content_digest
+        ):
+            raise ValueError("revised content digest must match search projection")
+        _validate_subject_epochs_json(self.subject_epochs_json)
+        if type(self.qualification_authority) is not QualificationAuthorityRef:
+            raise ValueError(
+                "qualification authority must be QualificationAuthorityRef"
+            )
+        _require_digest("evidence bundle digest", self.evidence_bundle_digest)
+        _require_digest("candidate digest", self.candidate_digest)
+
+
+@dataclass(frozen=True)
+class ProvisionalPublicationResult:
+    job_id: int
+    outcome: Literal["provisional", "incumbent_changed"]
+    successor_user_playbook_id: int | None
+    deployment_lifecycle_id: int | None
+    observation_deadline: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.job_id) is not int or self.job_id <= 0:
+            raise ValueError("provisional publication result job_id must be positive")
+        if self.outcome not in {"provisional", "incumbent_changed"}:
+            raise ValueError("provisional publication result outcome is invalid")
+        if self.outcome == "provisional":
+            if (
+                type(self.successor_user_playbook_id) is not int
+                or self.successor_user_playbook_id <= 0
+                or type(self.deployment_lifecycle_id) is not int
+                or self.deployment_lifecycle_id <= 0
+                or type(self.observation_deadline) is not int
+                or self.observation_deadline <= 0
+            ):
+                raise ValueError(
+                    "provisional publication requires successor lifecycle and deadline"
+                )
+        elif any(
+            value is not None
+            for value in (
+                self.successor_user_playbook_id,
+                self.deployment_lifecycle_id,
+                self.observation_deadline,
+            )
+        ):
+            raise ValueError(
+                "incumbent_changed provisional publication cannot have successor state"
+            )
+
+
+@dataclass(frozen=True)
+class LifecycleTerminalResult:
+    """The durable terminal tuple of one provisional deployment lifecycle.
+
+    There is no separate results table: the lifecycle row itself is the result.
+    ``state``/``terminal_reason``/``terminal_at`` are already CHECK-coupled in
+    the tenant schema, so repeat delivery of a restoration or displacement
+    reads the same row back and returns the identical tuple.
+
+    Args:
+        lifecycle_id (int): ``deployment_lifecycle_id`` of the terminalized row.
+        state (str): One of the four non-provisional lifecycle states.
+        terminal_reason (str): The enumerated reason the successor was pulled.
+        terminal_at (int): Epoch second the transition committed.
+    """
+
+    lifecycle_id: int
+    state: str
+    terminal_reason: str
+    terminal_at: int
+
+    def __post_init__(self) -> None:
+        if type(self.lifecycle_id) is not int or self.lifecycle_id <= 0:
+            raise ValueError("lifecycle terminal result id must be positive")
+        if self.state not in LIFECYCLE_TERMINAL_STATES:
+            raise ValueError("lifecycle terminal result state is not terminal")
+        if self.terminal_reason not in LIFECYCLE_TERMINAL_REASONS:
+            raise ValueError("lifecycle terminal result reason is not enumerated")
+        if type(self.terminal_at) is not int or self.terminal_at <= 0:
+            raise ValueError("lifecycle terminal result timestamp must be positive")
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    job_id: int
+    outcome: PublicationOutcome
+    successor_user_playbook_id: int | None
+
+    def __post_init__(self) -> None:
+        if type(self.job_id) is not int or self.job_id <= 0:
+            raise ValueError("publication result job_id must be positive")
+        if self.outcome not in {"applied", "incumbent_changed"}:
+            raise ValueError("publication result outcome is invalid")
+        if self.outcome == "applied":
+            if (
+                type(self.successor_user_playbook_id) is not int
+                or self.successor_user_playbook_id <= 0
+            ):
+                raise ValueError("applied publication requires a successor id")
+        elif self.successor_user_playbook_id is not None:
+            raise ValueError("incumbent_changed publication cannot have a successor id")
+
+
+class PublicationDecisionVerifier(Protocol):
+    """Optimizer-specific proof verification performed before any storage write."""
+
+    def verify(self, request: PublicationRequest) -> None: ...
+
+
+class UserPlaybookPublicationStore(Protocol):
+    """Backend-neutral durable publication operations."""
+
+    def claim_user_playbook_publication(
+        self, *, job_id: int, owner: str, worker_fence: int
+    ) -> PublicationClaim: ...
+
+    def stage_user_playbook_publication(self, request: PublicationRequest) -> None: ...
+
+    def commit_user_playbook_publication(
+        self, request: PublicationRequest
+    ) -> PublicationResult: ...
+
+    def load_user_playbook_publication_result(
+        self, job_id: int
+    ) -> PublicationResult | None: ...
+
+
+class UserPlaybookProvisionalPublicationStore(UserPlaybookPublicationStore, Protocol):
+    """Durable Phase 4 provisional publication operations."""
+
+    def cleanup_user_playbook_provisional_stale_attempt(
+        self, *, job_id: int, owner: str, worker_fence: int
+    ) -> bool:
+        """Clean only matching uncommitted residue; false means ownership changed."""
+        ...
+
+    def claim_user_playbook_provisional_publication(
+        self,
+        *,
+        job_id: int,
+        owner: str,
+        worker_fence: int,
+        incumbent_user_playbook_id: int,
+        incumbent_full_version_fingerprint: str,
+        incumbent_snapshot_json: str,
+    ) -> PublicationClaim: ...
+
+    def stage_user_playbook_provisional_publication(
+        self, request: ProvisionalPublicationRequest
+    ) -> bool:
+        """Stage the request, or return false after cleaning stale-CAS residue."""
+        ...
+
+    def commit_user_playbook_provisional_publication(
+        self, request: ProvisionalPublicationRequest
+    ) -> ProvisionalPublicationResult: ...
+
+    def load_user_playbook_provisional_publication_result(
+        self, job_id: int
+    ) -> ProvisionalPublicationResult | None: ...
+
+
+class UserPlaybookLifecycleTerminationStore(Protocol):
+    """Durable Phase 5 termination of a provisional deployment lifecycle."""
+
+    def restore_user_playbook_provisional_publication(
+        self,
+        *,
+        lifecycle_id: int,
+        reason: str,
+        expected_fence: int,
+        expected_successor_fingerprint: str,
+    ) -> LifecycleTerminalResult:
+        """Reselect the retained predecessor and terminalize, under a fence."""
+        ...
+
+    # There is no ``confirm_...`` member. It was the third of a termination
+    # TRIPLE -- restore, confirm, displace -- and it is deleted rather than left
+    # declared: its only caller was a confirmation boundary that could never
+    # fire (no confirmation analyst was ever implementable, so the support tally
+    # was permanently zero), and a published successor is now KEPT until the
+    # tuner's own next evidence pass revises it. A declared-but-uncallable
+    # member of a Protocol obliges every backend to implement a transition
+    # nothing can ask for.
+    def displace_user_playbook_provisional_publication(
+        self, *, lifecycle_id: int
+    ) -> LifecycleTerminalResult:
+        """Terminalize as displaced/stale_incumbent; the manual version wins."""
+        ...
+
+
+class UserPlaybookPublicationService:
+    """Coordinates proof verification with durable staging and atomic commit."""
+
+    def __init__(
+        self,
+        storage: UserPlaybookPublicationStore,
+        verifier: PublicationDecisionVerifier,
+    ) -> None:
+        if not callable(getattr(verifier, "verify", None)):
+            raise TypeError("verifier must implement PublicationDecisionVerifier")
+        self._storage = storage
+        self._verifier = verifier
+
+    def claim(self, *, job_id: int, owner: str, worker_fence: int) -> PublicationClaim:
+        return self._storage.claim_user_playbook_publication(
+            job_id=job_id,
+            owner=owner,
+            worker_fence=worker_fence,
+        )
+
+    def stage(self, request: PublicationRequest) -> None:
+        self._verifier.verify(request)
+        self._storage.stage_user_playbook_publication(request)
+
+    def publish(self, request: PublicationRequest) -> PublicationResult:
+        self._verifier.verify(request)
+        self._storage.stage_user_playbook_publication(request)
+        return self._storage.commit_user_playbook_publication(request)
+
+    def load_committed(self, job_id: int) -> PublicationResult | None:
+        return self._storage.load_user_playbook_publication_result(job_id)
+
+
+def publish_user_playbook_successor(
+    service: UserPlaybookPublicationService,
+    request: PublicationRequest,
+) -> PublicationResult:
+    """Publish one revised user playbook through the shared service."""
+    return service.publish(request)
+
+
+__all__ = [
+    "DecisionProofEnvelope",
+    "PublicationClaim",
+    "PublicationDecisionVerifier",
+    "PublicationOutcome",
+    "PublicationRequest",
+    "PublicationResult",
+    "PublicationSearchProjection",
+    "ProvisionalPublicationRequest",
+    "ProvisionalPublicationResult",
+    "PublishableOptimizerKind",
+    "PUBLICATION_INCUMBENT_CONTENT_DIGEST_METADATA_KEY",
+    "PUBLICATION_INCUMBENT_SEMANTIC_DIGEST_METADATA_KEY",
+    "PUBLICATION_INCUMBENT_TRIGGER_METADATA_KEY",
+    "PUBLICATION_SUBJECT_EPOCHS_METADATA_KEY",
+    "QualificationAuthorityRef",
+    "UserPlaybookProvisionalPublicationStore",
+    "UserPlaybookPublicationService",
+    "UserPlaybookPublicationStore",
+    "canonical_json_bytes",
+    "incumbent_user_playbook_semantic_digest",
+    "publish_user_playbook_successor",
+]

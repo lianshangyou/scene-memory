@@ -1,0 +1,36 @@
+# Personal data and credentials
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*
+*.jsonl
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.bak
+*.tmp
+data/
+sessions/
+logs/
+backups/
+.claude-smart/
+.reflexio/
+.codex/
+.claude/
+.vscode/
+# Local environments and generated output
+node_modules/
+.venv/
+.next*/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db
